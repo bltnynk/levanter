@@ -82,51 +82,6 @@ class LowRankLinear(eqx.Module):
         return hax.dot(self.lora_A.weight, self.lora_B.weight, axis=LORA_R) * self.scale
 
 
-def loraize(
-    model: M, config: "SplitLlamaConfig", key: jax.random.PRNGKey, prefix: str = "", batch_dims: Tuple[Axis, ...] = ()
-) -> M:
-    """
-    This implementation is mostly straightforward, with one major wrinkle: scan layers like Stacked, which
-    add an extra batch dimension and thus require vmap, and thus require a vmap'ed LoRA transform.
-
-    As an example, the GPT-2 Model has a Stacked[Gpt2Block] member, which means that all members of the Gpt2Block
-    have an extra Layers dimension. E.g. the c_attn will have shape weight=NamedArray(['layers', 'embed', 'qkv', 'heads', 'head_size']
-    even though it's defined as just Linear(In=Embed, Out=(Qkv, Heads, HeadSize)). The Stacked adds the initial Layers dimension.
-
-    There are two ways we can approach scan layers: one is to ask implementors of lora layers to handle
-    this themselves, and the other is to handle it here. The former is more flexible, but the latter is
-    more convenient, even if it runs the risk of being a leaky abstraction. We choose the latter.
-    """
-    key_iter = key_iterator(key)
-
-    def _is_special_module(module):
-        return isinstance(module, hnn.Linear)
-
-    def _batchify_ctor(ctor):
-        # this is gross but it basically just vmaps the ctor over each batch dimension
-        return functools.reduce(lambda ctor, batch_axis: hax.vmap(ctor, batch_axis), reversed(batch_dims), ctor)
-
-    def _loraize_module(module, key_path):
-        # we don't want to loraize layers that are skipped
-        is_skipped_layer = any(f".{idx}." in key_path for idx in config.skip_indices)
-        if config.matches_target(key_path) and isinstance(module, hnn.Linear) and not is_skipped_layer:
-            my_key = next(key_iter)
-            batched_key = shaped_rng_split(my_key, [axis.size for axis in batch_dims])
-            alpha = config.alpha if config.alpha is not None else float(config.r)
-            return _batchify_ctor(SplitLoraLinear.init)(
-                module, config.r, config.skip_after_k_tokens, config.Pos, alpha=alpha, key=batched_key
-            )
-        else:
-            return module
-
-    return jax.tree_util.tree_map(
-        _loraize_module,
-        model,
-        leaf_key_paths(model, is_leaf=_is_special_module, prefix=prefix),
-        is_leaf=_is_special_module,
-    )
-
-
 class SplitLoraLinear(eqx.Module, StateDictSerializationMixin):
     """
     Linear layer with LoRA transform.
@@ -317,6 +272,72 @@ class SplitLlamaConfig(HFCompatConfig):
             vocab_size=vocab_size,
             glu=True,
         )
+
+    def loraize(self, model: M, key: jax.random.PRNGKey, prefix: str = "", batch_dims: Tuple[Axis, ...] = ()) -> M:
+        """
+        This implementation is mostly straightforward, with one major wrinkle: scan layers like Stacked, which
+        add an extra batch dimension and thus require vmap, and thus require a vmap'ed LoRA transform.
+
+        As an example, the GPT-2 Model has a Stacked[Gpt2Block] member, which means that all members of the Gpt2Block
+        have an extra Layers dimension. E.g. the c_attn will have shape weight=NamedArray(['layers', 'embed', 'qkv', 'heads', 'head_size']
+        even though it's defined as just Linear(In=Embed, Out=(Qkv, Heads, HeadSize)). The Stacked adds the initial Layers dimension.
+
+        There are two ways we can approach scan layers: one is to ask implementors of lora layers to handle
+        this themselves, and the other is to handle it here. The former is more flexible, but the latter is
+        more convenient, even if it runs the risk of being a leaky abstraction. We choose the latter.
+        """
+        key_iter = key_iterator(key)
+
+        def _is_special_module(module):
+            return isinstance(module, hnn.Linear)
+
+        def _batchify_ctor(ctor):
+            # this is gross but it basically just vmaps the ctor over each batch dimension
+            return functools.reduce(lambda ctor, batch_axis: hax.vmap(ctor, batch_axis), reversed(batch_dims), ctor)
+
+        def _loraize_module(module, key_path):
+            # we don't want to loraize layers that are skipped
+            is_skipped_layer = any(f".{idx}." in key_path for idx in self.skip_indices)
+            if self.matches_target(key_path) and isinstance(module, hnn.Linear) and not is_skipped_layer:
+                my_key = next(key_iter)
+                batched_key = shaped_rng_split(my_key, [axis.size for axis in batch_dims])
+                alpha = self.alpha if self.alpha is not None else float(self.r)
+                return _batchify_ctor(SplitLoraLinear.init)(
+                    module, self.r, self.skip_after_k_tokens, self.Pos, alpha=alpha, key=batched_key
+                )
+            else:
+                return module
+
+        return jax.tree_util.tree_map(
+            _loraize_module,
+            model,
+            leaf_key_paths(model, is_leaf=_is_special_module, prefix=prefix),
+            is_leaf=_is_special_module,
+        )
+
+    def is_trainable_filter(self, model: M) -> M:
+        """
+        Creates a filter tree suitable for passing to Trainer.is_trainable marking which parameters are trainable and which
+        are not.
+
+        Returns:
+        (PyTree) A filter tree marking which parameters are trainable and which are not. This filter is the same as the model,
+        except every LoRA param is replaced with True and every other leaf (really, every array) is replaced with False.
+        """
+
+        # We only want to train on the lora params. The way to do this in Equinox is generally with
+        # a filter tree (cf https://docs.kidger.site/equinox/examples/frozen_layer/),
+        # which is a tree with the same structure (or a "tree prefix" thereof) as the model, but with
+        # bools or Callable[..., bool] at the leaves. We can then pass this tree to the trainer and it
+        # will only train the parameters that are True in the tree.
+        # Levanter defines `is_lora_param` for this purpose, but we need to be careful about how we use it.
+        # Equinox's primitives don't really have a "match all tree nodes matching a predicate" function (just
+        # a "match all tree leaves matching a predicate" function), so we need to be just a bit careful.
+        # Basically, we want to halt recursion in the tree whenever we hit a node that is a lora param.
+        def is_lora_param(node):
+            return isinstance(node, LowRankLinear)
+
+        return jax.tree_util.tree_map(is_lora_param, model, is_leaf=is_lora_param)
 
 
 class LlamaMlp(eqx.Module, StateDictSerializationMixin):

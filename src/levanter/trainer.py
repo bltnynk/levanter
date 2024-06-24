@@ -530,7 +530,7 @@ class TrainerConfig:
     mp: jmp.Policy = jmp.get_policy("f32")  # mixed precision policy
     fp8: Optional[bool | Fp8Config] = None
 
-    wandb: Optional[tracker.wandb.WandbConfig] = None
+    wandb: Optional[levanter.tracker.wandb.WandbConfig] = None
     log_dir: Path = Path("logs/")
     run_base_dir: Path = Path("runs/")
     id: Optional[str] = None  # run id. if None, will be set to a random string
