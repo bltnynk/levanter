@@ -171,6 +171,7 @@ class SplitLlamaConfig(HFCompatConfig):
     use_bias: bool = False
     use_layer_norm_weight: bool = True
     rope_scaling: Optional[dict] = None
+    rope_base: float = 10000.0
 
     reference_checkpoint: str = "meta-llama/Llama-2-7b-hf"
     tokenizer: Optional[str] = None
@@ -458,7 +459,10 @@ class LlamaAttention(StateDictSerializationMixin, eqx.Module):
         v = self.v_proj(x, key=key_v).rearrange((..., "kv_heads", "position", "head_size"))
 
         cos, sin = llama_rotary_pos_emb(
-            self.config.HeadSize, x.resolve_axis("position"), scale=self._rope_scale_factor()
+            self.config.HeadSize,
+            x.resolve_axis("position"),
+            base=self.config.rope_base,
+            scale=self._rope_scale_factor(),
         )
         q, k = _apply_rotary_pos_emb(q, k, cos, sin)
 
