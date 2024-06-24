@@ -103,8 +103,10 @@ def main(config: TrainLmConfig):
 
         @hax.named_jit(axis_resources=parameter_axis_mapping, donate_args=(True))
         def loraize_hf_model(model):
-            return model_config.loraize(model, key=lora_key)
+            m1 = model_config.loraize(model, key=lora_key)
+            return model_config.splitize(m1)
 
+        logger.info("Loraizing and splitting model")
         model = loraize_hf_model(model)
         is_trainable = model_config.is_trainable_filter(model)
 

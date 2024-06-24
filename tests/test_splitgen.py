@@ -15,22 +15,46 @@ from levanter.models.attention import AttentionMask
 from levanter.tracker.wandb import WandbConfig
 
 
+# {
+#   "_name_or_path": "HuggingFaceM4/tiny-random-LlamaForCausalLM",
+#   "architectures": [
+#     "LlamaForCausalLM"
+#   ],
+#   "bos_token_id": 0,
+#   "eos_token_id": 1,
+#   "hidden_act": "silu",
+#   "hidden_size": 16,
+#   "initializer_range": 0.02,
+#   "intermediate_size": 64,
+#   "model_type": "llama",
+#   "num_attention_heads": 4,
+#   "num_hidden_layers": 2,
+#   "pad_token_id": -1,
+#   "rms_norm_eps": 1e-06,
+#   "tie_word_embeddings": false,
+#   "torch_dtype": "float32",
+#   "transformers_version": "4.28.0.dev0",
+#   "use_cache": true,
+#   "vocab_size": 32000
+# }
+
+
 def small_cfg():
     cfg = lsg.SplitLlamaConfig(
         seq_len=256,
-        hidden_dim=64,
-        intermediate_dim=128,
+        hidden_dim=16,
+        intermediate_dim=64,
         num_heads=4,
-        num_layers=4,
+        num_layers=2,
         num_kv_heads=4,
-        skip_indices=[2, 3],
+        skip_indices=[1],
         skip_after_k_tokens=32,
     )
     return cfg
 
 
 def test_loraize():
-    Vocab = Axis("Vocab", 1000)
+    Vocab = Axis("Vocab", 32000)
     cfg = small_cfg()
     key = jax.random.PRNGKey(0)
     model = lsg.LlamaLMHeadModel.init(Vocab, cfg, key=key)
@@ -51,12 +75,13 @@ def _get_random_inputs(config: lsg.SplitLlamaConfig, Vocab: Axis):
 
 
 def test_splitgen_forward():
-    Vocab = Axis("Vocab", 1000)
+    Vocab = Axis("Vocab", 32000)
     cfg = small_cfg()
     key = jax.random.PRNGKey(0)
     model = lsg.LlamaLMHeadModel.init(Vocab, cfg, key=key)
 
     model_lora = cfg.loraize(model, key=key)
+    model_lora = cfg.splitize(model_lora)
     inputs = _get_random_inputs(cfg, Vocab)
     out = model_lora(*inputs).array
 
@@ -76,7 +101,7 @@ def test_train_splitgen_lm():
         model_cfg = small_cfg()
         try:
             config = split_lora_lm.TrainLmConfig(
-                initialize_from_hf=None,
+                initialize_from_hf="trl-internal-testing/tiny-random-LlamaForCausalLM",
                 data=data_config,
                 model=model_cfg,
                 trainer=split_lora_lm.TrainerConfig(

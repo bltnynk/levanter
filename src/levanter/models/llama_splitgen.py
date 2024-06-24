@@ -316,6 +316,27 @@ class SplitLlamaConfig(HFCompatConfig):
             is_leaf=_is_special_module,
         )
 
+    def splitize(self, model: M) -> M:
+        """
+        Splits the decoder layer into two parts: one that is loraized and one that is not.
+        """
+
+        def _is_decoder_layer(module):
+            return isinstance(module, LlamaDecoderLayer)
+
+        def _split_decoder_layer(module, key_path):
+            if _is_decoder_layer(module) and any(f"layers.{idx}." in key_path for idx in self.skip_indices):
+                return SplitDecoderWrapper.init(module)
+            else:
+                return module
+
+        return jax.tree_util.tree_map(
+            _split_decoder_layer,
+            model,
+            leaf_key_paths(model, is_leaf=_is_decoder_layer),
+            is_leaf=_is_decoder_layer,
+        )
+
     def is_trainable_filter(self, model: M) -> M:
         """
         Creates a filter tree suitable for passing to Trainer.is_trainable marking which parameters are trainable and which
@@ -558,13 +579,29 @@ class LlamaRMSNorm(eqx.Module):
         return out.astype(in_dtype)
 
 
+class SplitDecoderWrapper(eqx.Module, StateDictSerializationMixin):
+    config: SplitLlamaConfig = eqx.static_field()
+    wrapped: "LlamaDecoderLayer"
+
+    @staticmethod
+    def init(wrapped: "LlamaDecoderLayer") -> "SplitDecoderWrapper":
+        return SplitDecoderWrapper(wrapped)
+
+    @named_call
+    def __call__(self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], *, key=None) -> NamedArray:
+        new_x_axis = Axis(self.config.Pos.name, self.config.skip_after_k_tokens)
+        skip_x_axis = Axis(self.config.Pos.name, self.config.Pos.size - new_x_axis.size)
+        x, holdout = x.split(self.config.Pos, (new_x_axis, skip_x_axis))
+        x = self.wrapped(x, mask, key=key)
+        return hax.concatenate(self.config.Pos, (x, holdout))
+
+
 class LlamaDecoderLayer(StateDictSerializationMixin, eqx.Module):
     config: SplitLlamaConfig = eqx.static_field()
     self_attn: LlamaAttention
     mlp: LlamaMlp
     input_layernorm: LlamaRMSNorm
     post_attention_layernorm: LlamaRMSNorm
-    skip_k: bool = eqx.field(static=True)
 
     @staticmethod
     def init(config: SplitLlamaConfig, *, key, layer_idx) -> "LlamaDecoderLayer":
@@ -581,15 +618,10 @@ class LlamaDecoderLayer(StateDictSerializationMixin, eqx.Module):
         ln_1 = config.mk_LayerNorm(config.Embed)
         ln_2 = config.mk_LayerNorm(config.Embed)
 
-        return LlamaDecoderLayer(config, attn, mlp, ln_1, ln_2, layer_idx in config.skip_indices)
+        return LlamaDecoderLayer(config, attn, mlp, ln_1, ln_2)
 
     @named_call
     def __call__(self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], *, key=None) -> NamedArray:
-        holdout = None
-        if self.skip_k:
-            new_x_axis = Axis(self.config.Pos.name, self.config.skip_after_k_tokens)
-            skip_x_axis = Axis(self.config.Pos.name, self.config.Pos.size - new_x_axis.size)
-            x, holdout = x.split(self.config.Pos, (new_x_axis, skip_x_axis))
         k_attn, k_mlp = maybe_rng_split(key, 2)
         # self attention and skip connection
         residual = x
@@ -602,8 +634,6 @@ class LlamaDecoderLayer(StateDictSerializationMixin, eqx.Module):
         x = self.post_attention_layernorm(x)
         mlp_output = self.mlp(x, key=k_mlp)
         output = residual + mlp_output
-        if self.skip_k:
-            output = hax.concatenate(self.config.Pos, (output, holdout))
         return output
 
 
