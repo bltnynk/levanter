@@ -325,7 +325,9 @@ class SplitLlamaConfig(HFCompatConfig):
             return isinstance(module, LlamaDecoderLayer)
 
         def _split_decoder_layer(module, key_path):
-            if _is_decoder_layer(module) and any(f"layers.{idx}." in key_path for idx in self.skip_indices):
+            if _is_decoder_layer(module) and any(
+                f"transformer.layers.blocks.{idx}" == key_path for idx in self.skip_indices
+            ):
                 return SplitDecoderWrapper.init(module)
             else:
                 return module
@@ -585,7 +587,7 @@ class SplitDecoderWrapper(eqx.Module, StateDictSerializationMixin):
 
     @staticmethod
     def init(wrapped: "LlamaDecoderLayer") -> "SplitDecoderWrapper":
-        return SplitDecoderWrapper(wrapped)
+        return SplitDecoderWrapper(wrapped.config, wrapped)
 
     @named_call
     def __call__(self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], *, key=None) -> NamedArray:
