@@ -28,6 +28,10 @@ from levanter.utils import jax_utils
 logger = logging.getLogger(__name__)
 
 
+def get_spec_ocdbt(path):
+    return array_ser.get_tensorstore_spec(path, ocdbt=True)
+
+
 def _is_named_or_none(x):
     return x is None or is_named_array(x)
 
@@ -73,7 +77,8 @@ def tree_serialize_leaves_tensorstore(
     if commit_callback is None:
         commit_callback = lambda: logger.info("Committed checkpoint to Tensorstore")  # noqa
 
-    manager.serialize_with_paths(arrays, paths, on_commit_callback=commit_callback)
+    tspecs = jax.tree.map(get_spec_ocdbt, paths)
+    manager.serialize(arrays, tspecs, on_commit_callback=commit_callback)
 
     if manager_was_none:
         manager.wait_until_finished()
@@ -81,7 +86,7 @@ def tree_serialize_leaves_tensorstore(
 
 def _tensorstore_spec_for(checkpoint_dir, key_path: str):
     checkpoint_path = os.path.join(checkpoint_dir, *key_path.split("."))
-    ts_spec = array_ser.get_tensorstore_spec(checkpoint_path)
+    ts_spec = get_spec_ocdbt(checkpoint_path)
     return ts_spec
 
 

@@ -32,7 +32,7 @@ from levanter.models.attention import AttentionBackend, AttentionMask, dot_produ
 from levanter.models.gpt2 import ACT2FN
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.utils.flop_utils import lm_flops_per_token
-from levanter.utils.jax_utils import key_iterator, leaf_key_paths
+from levanter.utils.jax_utils import join_key, key_iterator, leaf_key_paths
 
 
 silence_transformer_nag()
@@ -89,35 +89,38 @@ class SplitLoraLinear(eqx.Module, StateDictSerializationMixin):
 
     wrapped: hnn.Linear
     lora: LowRankLinear
-    seq_axis: Axis = eqx.static_field()
-    weight_axis: Axis = eqx.static_field()
-    weight_lora_axis: Axis = eqx.static_field()
-
-    def __call__(self, x: NamedArray, key=None):
-        x1, x2 = x.split(self.seq_axis, (self.weight_axis, self.weight_lora_axis))
-        if key is not None:
-            k1, k2, k3 = jax.random.split(key, 3)
-            p1 = self.wrapped(x1, key=k1)
-            p2 = self.lora(x2, key=k2) + self.wrapped(x2, key=k3)
-            return hax.concatenate(self.seq_axis, (p1, p2))
-        else:
-            p1 = self.wrapped(x1)
-            p2 = self.lora(x2) + self.wrapped(x2)
-            return hax.concatenate(self.seq_axis, (p1, p2))
-
-    def merge(self):
-        weight = self.lora.merge() + self.wrapped.weight
-        return dataclasses.replace(self.wrapped, weight=weight)
+    n_split: int = eqx.field(static=True)
+    axname: str = eqx.field(static=True)
 
     @staticmethod
     def init(wrapped: hnn.Linear, r: int, n_split: int, seq_axis: Axis, alpha: float, *, key):
         """
         Initializes a LoraLinear module.
         """
-        weight_axis = Axis(seq_axis.name, n_split)
-        weight_lora_axis = Axis(seq_axis.name, seq_axis.size - n_split)
         lora = LowRankLinear.init(wrapped.In, wrapped.Out, r, alpha=alpha, key=key)
-        return SplitLoraLinear(wrapped, lora, seq_axis, weight_axis, weight_lora_axis)
+        return SplitLoraLinear(wrapped, lora, n_split=n_split, axname=seq_axis.name)
+
+    def __call__(self, x: NamedArray, key):
+        x1 = x[self.axname, : self.n_split]
+        x2 = x[self.axname, self.n_split :]
+        if key is not None:
+            k1, k2, k3 = jax.random.split(key, 3)
+            p1 = self.wrapped(x1, key=k1)
+            p2 = self.lora(x2, key=k2) + self.wrapped(x2, key=k3)
+        else:
+            p1 = self.wrapped(x1)
+            p2 = self.lora(x2) + self.wrapped(x2)
+
+        # This is a little messy, but we have to accept variable size axes
+        pos_idx = p1._lookup_indices(self.axname)
+        concat = jax.numpy.concatenate([p.array for p in [p1, p2]], axis=pos_idx)
+        og_pos_ax = x.resolve_axis(self.axname)
+        axes = p1.axes[:pos_idx] + (og_pos_ax,) + p1.axes[pos_idx + 1 :]
+        return NamedArray(concat, axes)
+
+    def merge(self):
+        weight = self.lora.merge() + self.wrapped.weight
+        return dataclasses.replace(self.wrapped, weight=weight)
 
     def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
         return {"wrapped": None, "lora": None}
@@ -156,6 +159,7 @@ class SplitLlamaConfig(HFCompatConfig):
     alpha: Optional[float] = None  # scaling factor for LoRA transform
 
     skip_indices: Sequence[int] = (24, 25, 26, 27, 28, 29)
+    skip_flags = property(lambda self: jnp.array([idx in self.skip_indices for idx in range(self.num_layers)]))
     skip_after_k_tokens: int = 256
 
     # Attention-related config
@@ -290,7 +294,7 @@ class SplitLlamaConfig(HFCompatConfig):
         key_iter = key_iterator(key)
 
         def _is_special_module(module):
-            return isinstance(module, hnn.Linear)
+            return isinstance(module, hnn.Linear) or isinstance(module, hnn.Stacked)
 
         def _batchify_ctor(ctor):
             # this is gross but it basically just vmaps the ctor over each batch dimension
@@ -298,6 +302,14 @@ class SplitLlamaConfig(HFCompatConfig):
 
         def _loraize_module(module, key_path):
             # we don't want to loraize layers that are skipped
+            if isinstance(module, Stacked):
+                new_inner = self.loraize(
+                    module.stacked,
+                    next(key_iter),
+                    prefix=join_key(key_path, "stacked"),
+                    batch_dims=batch_dims + (module.Block,),
+                )
+                return dataclasses.replace(module, stacked=new_inner)
             is_skipped_layer = any(f".{idx}." in key_path for idx in self.skip_indices)
             if self.matches_target(key_path) and isinstance(module, hnn.Linear) and not is_skipped_layer:
                 my_key = next(key_iter)
@@ -314,29 +326,6 @@ class SplitLlamaConfig(HFCompatConfig):
             model,
             leaf_key_paths(model, is_leaf=_is_special_module, prefix=prefix),
             is_leaf=_is_special_module,
-        )
-
-    def splitize(self, model: M) -> M:
-        """
-        Splits the decoder layer into two parts: one that is loraized and one that is not.
-        """
-
-        def _is_decoder_layer(module):
-            return isinstance(module, LlamaDecoderLayer)
-
-        def _split_decoder_layer(module, key_path):
-            if _is_decoder_layer(module) and any(
-                f"transformer.layers.blocks.{idx}" == key_path for idx in self.skip_indices
-            ):
-                return SplitDecoderWrapper.init(module)
-            else:
-                return module
-
-        return jax.tree_util.tree_map(
-            _split_decoder_layer,
-            model,
-            leaf_key_paths(model, is_leaf=_is_decoder_layer),
-            is_leaf=_is_decoder_layer,
         )
 
     def is_trainable_filter(self, model: M) -> M:
@@ -606,7 +595,7 @@ class LlamaDecoderLayer(StateDictSerializationMixin, eqx.Module):
     post_attention_layernorm: LlamaRMSNorm
 
     @staticmethod
-    def init(config: SplitLlamaConfig, *, key, layer_idx) -> "LlamaDecoderLayer":
+    def init(config: SplitLlamaConfig, *, key) -> "LlamaDecoderLayer":
         k_attn, k_mlp = jrandom.split(key, 2)
 
         attn = LlamaAttention.init(config, key=k_attn)
@@ -622,8 +611,7 @@ class LlamaDecoderLayer(StateDictSerializationMixin, eqx.Module):
 
         return LlamaDecoderLayer(config, attn, mlp, ln_1, ln_2)
 
-    @named_call
-    def __call__(self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], *, key=None) -> NamedArray:
+    def full_forward(self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], key=None):
         k_attn, k_mlp = maybe_rng_split(key, 2)
         # self attention and skip connection
         residual = x
@@ -638,20 +626,39 @@ class LlamaDecoderLayer(StateDictSerializationMixin, eqx.Module):
         output = residual + mlp_output
         return output
 
+    def split_forward(self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], key=None):
+        new_x_axis = Axis(self.config.Pos.name, self.config.skip_after_k_tokens)
+        skip_x_axis = Axis(self.config.Pos.name, self.config.Pos.size - new_x_axis.size)
+        x, holdout = x.split(self.config.Pos, (new_x_axis, skip_x_axis))
+        x = self.full_forward(x, mask, key=key)
+        return hax.concatenate(self.config.Pos, (x, holdout))
+
+    @named_call
+    def __call__(
+        self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], skip_flag: bool, key=None
+    ) -> NamedArray:
+        return jax.lax.cond(
+            skip_flag,
+            self.split_forward,
+            self.full_forward,
+            x,
+            mask,
+            key,
+        )
+
 
 class LlamaTransformer(StateDictSerializationMixin, eqx.Module):
     config: SplitLlamaConfig = eqx.static_field()
-    layers: hnn.BlockSeq[LlamaDecoderLayer]
+    layers: hnn.Stacked[LlamaDecoderLayer]
     norm: LlamaRMSNorm
 
     @staticmethod
     def init(config: SplitLlamaConfig, *, key) -> "LlamaTransformer":
-        layers = hnn.BlockSeq.init(
+        layers = hnn.Stacked.init(
             config.Layers, LlamaDecoderLayer, gradient_checkpointing=config.gradient_checkpointing
         )(
             config,
             key=shaped_rng_split(key, config.num_layers),
-            layer_idx=hax.arange(config.Layers),
         )
         ln_f = config.mk_LayerNorm(config.Embed)
 
@@ -660,7 +667,7 @@ class LlamaTransformer(StateDictSerializationMixin, eqx.Module):
     @named_call
     def __call__(self, x: NamedArray, attn_mask: Optional[NamedArray | AttentionMask], *, key) -> NamedArray:
         keys = maybe_rng_split(key, self.config.num_layers) if key is not None else None
-        x = self.layers.fold(x, mask=attn_mask, key=keys)
+        x = self.layers.fold(x, mask=attn_mask, skip_flag=self.config.skip_flags, key=keys)
         x = self.norm(x)
 
         return x

@@ -9,35 +9,12 @@ import haliax as hax
 from haliax import Axis
 
 import tiny_test_corpus
+from levanter.checkpoint import CheckpointerConfig
 from levanter.distributed import RayConfig
 from levanter.main import split_lora_lm
 from levanter.models import llama_splitgen as lsg
 from levanter.models.attention import AttentionMask
 from levanter.tracker.wandb import WandbConfig
-
-
-# {
-#   "_name_or_path": "HuggingFaceM4/tiny-random-LlamaForCausalLM",
-#   "architectures": [
-#     "LlamaForCausalLM"
-#   ],
-#   "bos_token_id": 0,
-#   "eos_token_id": 1,
-#   "hidden_act": "silu",
-#   "hidden_size": 16,
-#   "initializer_range": 0.02,
-#   "intermediate_size": 64,
-#   "model_type": "llama",
-#   "num_attention_heads": 4,
-#   "num_hidden_layers": 2,
-#   "pad_token_id": -1,
-#   "rms_norm_eps": 1e-06,
-#   "tie_word_embeddings": false,
-#   "torch_dtype": "float32",
-#   "transformers_version": "4.28.0.dev0",
-#   "use_cache": true,
-#   "vocab_size": 32000
-# }
 
 
 def small_cfg():
@@ -62,16 +39,12 @@ def test_loraize():
     model = lsg.LlamaLMHeadModel.init(Vocab, cfg, key=key)
 
     model_lora = cfg.loraize(model, key=key)
+    unstacked = model_lora.transformer.layers.unstacked()
     for layer_idx in range(cfg.Layers.size):
         if layer_idx not in cfg.skip_indices:
-            sa = model_lora.transformer.layers.blocks[layer_idx].self_attn
+            sa = unstacked[layer_idx].self_attn
             for proj in [sa.q_proj, sa.k_proj, sa.v_proj]:
                 assert isinstance(proj, lsg.SplitLoraLinear)
-
-    model_splitize = cfg.splitize(model_lora)
-    for layer_idx in range(cfg.Layers.size):
-        sa = model_splitize.transformer.layers.blocks[layer_idx]
-        assert isinstance(sa, lsg.LlamaDecoderLayer if layer_idx not in cfg.skip_indices else lsg.SplitDecoderWrapper)
 
 
 def _get_random_inputs(config: lsg.SplitLlamaConfig, Vocab: Axis):
@@ -93,7 +66,6 @@ def test_splitgen_forward():
     out_refr = model(*inputs).array
     assert jax.numpy.allclose(out_lora, out_refr, atol=1e-5).item()
 
-    model_lora = cfg.splitize(model_lora)
     out = model_lora(*inputs).array
 
     @hax.named_jit
@@ -107,18 +79,22 @@ def test_splitgen_forward():
 
 
 @pytest.mark.entry
-def test_train_splitgen_lm():
+@pytest.mark.parametrize("init", [None, "trl-internal-testing/tiny-random-LlamaForCausalLM"])
+def test_train_splitgen_lm(init):
     with tempfile.TemporaryDirectory() as tmpdir:
         data_config, _ = tiny_test_corpus.construct_small_data_cache(tmpdir)
         model_cfg = small_cfg()
         print(f"Have {jax.device_count()} devices")
         try:
             config = split_lora_lm.TrainLmConfig(
-                initialize_from_hf="trl-internal-testing/tiny-random-LlamaForCausalLM",
+                initialize_from_hf=init,
                 data=data_config,
                 model=model_cfg,
                 trainer=split_lora_lm.TrainerConfig(
                     mp=jmp.get_policy("p=f32,c=bfloat16"),
+                    checkpointer=CheckpointerConfig(
+                        base_path=tmpdir,
+                    ),
                     num_train_steps=10,
                     train_batch_size=2 * len(jax.devices()),
                     max_eval_batches=2,

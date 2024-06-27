@@ -103,8 +103,7 @@ def main(config: TrainLmConfig):
 
         @hax.named_jit(axis_resources=parameter_axis_mapping, donate_args=(True))
         def loraize_hf_model(model):
-            m1 = model_config.loraize(model, key=lora_key)
-            return model_config.splitize(m1)
+            return model_config.loraize(model, key=lora_key)
 
         logger.info("Loraizing and splitting model")
         model = loraize_hf_model(model)
@@ -169,7 +168,9 @@ def main(config: TrainLmConfig):
                 next(train_loader)
 
         ## OK, actually run training!
-        trainer.train(state, train_loader)
+        info = trainer.train(state, train_loader)
+        ckpt = trainer.config.checkpointer.create(trainer.run_id)
+        ckpt.on_step(info, force=True)
         # checkpointer.on_step(last_step, force=True)
 
 
