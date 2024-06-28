@@ -2,6 +2,7 @@ data:
   id: "DKYoon/SlimPajama-6B"
   cache_dir: "gs://levanter-will-data/tokenized/llama2-slimpj/"
   tokenizer: "meta-llama/Llama-2-7b-hf"
+# Baseline loss is 1.780719581246376
 model:
   r: 64
   attn_backend: jax_flash
@@ -27,4 +28,4 @@ trainer:
 optimizer:
   learning_rate: 2E-4 # set low for fine-tuning
   weight_decay: 0.1
-  min_lr_ratio: 0.1
+  lr_schedule: "constant"

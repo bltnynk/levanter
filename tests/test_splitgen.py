@@ -17,24 +17,39 @@ from levanter.models.attention import AttentionMask
 from levanter.tracker.wandb import WandbConfig
 
 
-def small_cfg():
-    cfg = lsg.SplitLlamaConfig(
-        seq_len=256,
-        hidden_dim=16,
-        intermediate_dim=64,
-        num_heads=4,
-        num_layers=2,
-        num_kv_heads=4,
-        skip_indices=[1],
-        skip_after_k_tokens=32,
-        attn_backend="jax_flash",
-    )
-    return cfg
+def small_cfg(hf_test=True):
+    if hf_test:
+        cfg = lsg.SplitLlamaConfig(
+            seq_len=256,
+            hidden_dim=16,
+            intermediate_dim=64,
+            num_heads=4,
+            num_layers=2,
+            num_kv_heads=4,
+            skip_indices=[1],
+            skip_after_k_tokens=32,
+            attn_backend="jax_flash",
+        )
+        hf_url = "trl-internal-testing/tiny-random-LlamaForCausalLM"
+        return cfg, hf_url
+    else:
+        cfg = lsg.SplitLlamaConfig(
+            seq_len=64,
+            hidden_dim=16,
+            intermediate_dim=64,
+            num_heads=4,
+            num_layers=32,
+            num_kv_heads=4,
+            skip_indices=[1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31],
+            skip_after_k_tokens=32,
+            attn_backend="jax_flash",
+        )
+        return cfg, None
 
 
 def test_loraize():
     Vocab = Axis("Vocab", 32000)
-    cfg = small_cfg()
+    cfg, _ = small_cfg(False)
     key = jax.random.PRNGKey(0)
     model = lsg.LlamaLMHeadModel.init(Vocab, cfg, key=key)
 
@@ -56,7 +71,7 @@ def _get_random_inputs(config: lsg.SplitLlamaConfig, Vocab: Axis):
 
 def test_splitgen_forward():
     Vocab = Axis("Vocab", 32000)
-    cfg = small_cfg()
+    cfg, _ = small_cfg(False)
     key = jax.random.PRNGKey(0)
     model = lsg.LlamaLMHeadModel.init(Vocab, cfg, key=key)
     inputs = _get_random_inputs(cfg, Vocab)
@@ -79,15 +94,15 @@ def test_splitgen_forward():
 
 
 @pytest.mark.entry
-@pytest.mark.parametrize("init", [None, "trl-internal-testing/tiny-random-LlamaForCausalLM"])
-def test_train_splitgen_lm(init):
+@pytest.mark.parametrize("hf_test", [True, False])
+def test_train_splitgen_lm(hf_test):
     with tempfile.TemporaryDirectory() as tmpdir:
         data_config, _ = tiny_test_corpus.construct_small_data_cache(tmpdir)
-        model_cfg = small_cfg()
+        model_cfg, hf_url = small_cfg(hf_test)
         print(f"Have {jax.device_count()} devices")
         try:
             config = split_lora_lm.TrainLmConfig(
-                initialize_from_hf=init,
+                initialize_from_hf=hf_url,
                 data=data_config,
                 model=model_cfg,
                 trainer=split_lora_lm.TrainerConfig(

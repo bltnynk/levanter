@@ -87,7 +87,6 @@ def main(config: TrainLmConfig):
         if vocab_size != Vocab.size:
             logger.info(f"Rounding vocab size from {vocab_size} to {Vocab.size} for partitioning")
 
-        model = None
         if config.initialize_from_hf:
             logger.info(f"Loading pretrained model from {converter.reference_checkpoint}")
             model = converter.load_pretrained(
@@ -99,7 +98,9 @@ def main(config: TrainLmConfig):
         else:
             # TODO: how does this interact with sharding?
             # I need the is_trainable tree before passing the init fn so...
-            model = model_config.build(Vocab, key=model_key)
+            model = hax.named_jit(
+                lambda: model_config.build(Vocab, key=model_key), axis_resources=parameter_axis_mapping
+            )()
 
         @hax.named_jit(axis_resources=parameter_axis_mapping, donate_args=(True))
         def loraize_hf_model(model):

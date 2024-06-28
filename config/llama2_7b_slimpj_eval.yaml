@@ -1,32 +1,25 @@
 data:
   id: "DKYoon/SlimPajama-6B"
-  cache_dir: "gs://levanter-will-data/tokenized/llama3-slimpj/"
-  tokenizer: "meta-llama/Meta-Llama-3-8B"
+  cache_dir: "gs://levanter-will-data/tokenized/llama2-slimpj/"
+  tokenizer: "meta-llama/Llama-2-7b-hf"
 model:
-  seq_len: 8192
-  num_kv_heads: 8
-  rope_base: 50000.0
-  intermediate_dim: 14336
-
+  type: "llama"
+  tokenizer: "meta-llama/Llama-2-7b-hf"
 # TODO: uncomment this once we resolve the resource exhaustion issue
 # initialize_from_hf: "meta-llama/Llama-2-7b-hf"
 # use_hf_model_config: true
-initialize_from_hf: "meta-llama/Meta-Llama-3-8B"
+hf_checkpoint: "meta-llama/Llama-2-7b-hf"
 trainer:
   tracker:
     type: wandb
     project: "levanter"
-    tags: ["slimpj", "llamasg"]
+    tags: ["slimpj", "llama2-7b", "eval"]
 
   mp: p=f32,c=bfloat16
   train_batch_size: 256
-  per_device_parallelism: 2
+  per_device_parallelism: 4
   num_train_steps: 3000
   steps_per_eval: 20
   tensor_parallel_axes: ["mlp", "heads"]
   fsdp_axis: "embed"
   batch_axis: "batch"
-optimizer:
-  learning_rate: 2E-4 # set low for fine-tuning
-  weight_decay: 0.1
-  min_lr_ratio: 0.1

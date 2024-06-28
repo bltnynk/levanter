@@ -30,7 +30,7 @@ from levanter.compat.torch_serialization import (
 from levanter.logging import silence_transformer_nag
 from levanter.models.attention import AttentionBackend, AttentionMask, dot_product_attention
 from levanter.models.gpt2 import ACT2FN
-from levanter.models.lm_model import LmConfig, LmHeadModel
+from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel
 from levanter.utils.flop_utils import lm_flops_per_token
 from levanter.utils.jax_utils import join_key, key_iterator, leaf_key_paths
 
@@ -800,6 +800,40 @@ class LlamaLMHeadModel(eqx.Module, LmHeadModel[SplitLlamaConfig], StateDictSeria
 
         state_dict.update(my_dict)
         return state_dict
+
+    def compute_loss(
+        self,
+        example: LmExample,
+        *,
+        key=None,
+        reduction: Optional[hax.ReductionFunction] = hax.mean,
+        reduction_axis: Optional[hax.AxisSelection] = None,
+    ) -> jnp.ndarray | NamedArray:
+        """
+        Computes the cross-entropy loss for a language modeling example. If reduction is not None, the loss is reduced
+        across the reduction axis (with reduction_axis=None meaning all axes). If reduction is None, the loss is not
+        reduced, and the result is a named array with axes (*batch axes, sequence_length).
+        """
+        logits = self(example.tokens, example.attn_mask, key=key)
+        # TODO: would be nice if we made the dtype configurable
+        logits = logits.astype(jnp.float32)
+        targets = hax.roll(example.tokens, -1, axis=self.Pos.name)
+        target_y = hax.nn.one_hot(targets, self.Vocab, dtype=logits.dtype)
+        loss_mask = example.loss_mask
+        skip_axis = Axis(self.Pos.name, self.config.skip_after_k_tokens)
+        remain_axis = Axis(self.Pos.name, self.Pos.size - self.config.skip_after_k_tokens)
+
+        if loss_mask is None:
+            loss_mask = hax.ones_like(target_y, dtype=bool)
+
+        loss_mask_skip, loss_mask_remain = loss_mask.split(self.Pos, (skip_axis, remain_axis))
+        loss_mask = hax.concatenate(self.Pos, (hax.zeros_like(loss_mask_skip, dtype=bool), loss_mask_remain))
+
+        loss = hnn.cross_entropy_loss(
+            logits, self.Vocab, target_y, reduction, reduction_axis=reduction_axis, where=loss_mask
+        )
+
+        return loss
 
 
 def _rotate_half(x: NamedArray) -> NamedArray:

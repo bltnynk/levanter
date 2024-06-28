@@ -3,6 +3,7 @@ data:
   cache_dir: "gs://levanter-will-data/tokenized/llama3-slimpj/"
   tokenizer: "meta-llama/Meta-Llama-3-8B"
 model:
+  type: "llama"
   seq_len: 8192
   num_kv_heads: 8
   rope_base: 50000.0
@@ -11,22 +12,19 @@ model:
 # TODO: uncomment this once we resolve the resource exhaustion issue
 # initialize_from_hf: "meta-llama/Llama-2-7b-hf"
 # use_hf_model_config: true
-initialize_from_hf: "meta-llama/Meta-Llama-3-8B"
+hf_checkpoint: "meta-llama/Meta-Llama-3-8B"
 trainer:
   tracker:
     type: wandb
     project: "levanter"
-    tags: ["slimpj", "llamasg"]
+    tags: ["slimpj", "llama", "eval"]
 
   mp: p=f32,c=bfloat16
   train_batch_size: 256
   per_device_parallelism: 2
+
   num_train_steps: 3000
   steps_per_eval: 20
   tensor_parallel_axes: ["mlp", "heads"]
   fsdp_axis: "embed"
   batch_axis: "batch"
-optimizer:
-  learning_rate: 2E-4 # set low for fine-tuning
-  weight_decay: 0.1
-  min_lr_ratio: 0.1
