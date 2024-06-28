@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 from dataclasses import dataclass, field
 from typing import Optional, Union
@@ -10,8 +11,10 @@ from haliax.partitioning import round_axis_for_partitioning
 
 import levanter
 from levanter import callbacks
+from levanter.data.dataset import Dataset
 from levanter.data.text import CausalLmDataset, LMDatasetConfig, LMMixtureDatasetConfig
 from levanter.models.llama_splitgen import SplitLlamaConfig
+from levanter.models.lm_model import LmExample
 from levanter.optim import AdamConfig, OptimizerConfig
 from levanter.trainer import Trainer, TrainerConfig
 from levanter.utils.jax_utils import parameter_count
@@ -34,6 +37,22 @@ class TrainLmConfig:
 
     data_seed: Optional[int] = None  # if provided, will override the data seed from the trainer
     trust_remote_code: bool = False
+
+
+def mask_skipped_tokens(config: TrainLmConfig, dset: CausalLmDataset) -> Dataset[LmExample]:
+    class skipper(Dataset[LmExample]):
+        def __iter__(self):
+            Pos = config.model.Pos
+            skip_axis = Axis(Pos.name, config.model.skip_after_k_tokens)
+            remain_axis = Axis(Pos.name, Pos.size - config.model.skip_after_k_tokens)
+            for x in dset:
+                loss_mask = x.loss_mask
+                loss_mask_skip, loss_mask_remain = loss_mask.split(Pos, (skip_axis, remain_axis))
+                loss_mask = hax.concatenate(Pos, (hax.zeros_like(loss_mask_skip, dtype=bool), loss_mask_remain))
+                x = dataclasses.replace(x, loss_mask=loss_mask)
+                yield x
+
+    return skipper()
 
 
 def main(config: TrainLmConfig):
@@ -132,7 +151,12 @@ def main(config: TrainLmConfig):
             logger.warning("No evaluation datasets provided.")
         else:
             causal_datasets = [
-                (CausalLmDataset(ds, Pos, KeyPos, ignore_index=config.data.ignore_token_id), tags)
+                (
+                    mask_skipped_tokens(
+                        config, CausalLmDataset(ds, Pos, KeyPos, ignore_index=config.data.ignore_token_id)
+                    ),
+                    tags,
+                )
                 for ds, tags in tagged_eval_datasets
             ]
             max_eval_examples_per_ds = config.trainer.max_eval_batches
@@ -158,7 +182,7 @@ def main(config: TrainLmConfig):
         )
 
         # data loader. may need to seek to the right place if we're resuming
-        train_loader = iter(trainer.sharded_loader(train_dataset, Batch))
+        train_loader = iter(mask_skipped_tokens(config, trainer.sharded_loader(train_dataset, Batch)))
 
         if int(state.step) > 0:
             # step is after the batch, so we need to seek to step
@@ -170,9 +194,10 @@ def main(config: TrainLmConfig):
 
         ## OK, actually run training!
         info = trainer.train(state, train_loader)
+        # Checkpoint
         ckpt = trainer.config.checkpointer.create(trainer.run_id)
         ckpt.on_step(info, force=True)
-        # checkpointer.on_step(last_step, force=True)
+        ckpt.wait_until_finished()
 
 
 if __name__ == "__main__":
