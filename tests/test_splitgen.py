@@ -10,6 +10,7 @@ from haliax import Axis
 
 import tiny_test_corpus
 from levanter.checkpoint import CheckpointerConfig
+from levanter.data.text import LMDatasetConfig
 from levanter.distributed import RayConfig
 from levanter.main import split_lora_lm
 from levanter.models import llama_splitgen as lsg
@@ -98,6 +99,47 @@ def test_splitgen_forward():
 def test_train_splitgen_lm(hf_test):
     with tempfile.TemporaryDirectory() as tmpdir:
         data_config, _ = tiny_test_corpus.construct_small_data_cache(tmpdir)
+        model_cfg, hf_url = small_cfg(hf_test)
+        print(f"Have {jax.device_count()} devices")
+        try:
+            config = split_lora_lm.TrainLmConfig(
+                initialize_from_hf=hf_url,
+                data=data_config,
+                model=model_cfg,
+                trainer=split_lora_lm.TrainerConfig(
+                    mp=jmp.get_policy("p=f32,c=bfloat16"),
+                    checkpointer=CheckpointerConfig(
+                        base_path=tmpdir,
+                    ),
+                    num_train_steps=10,
+                    train_batch_size=2 * len(jax.devices()),
+                    max_eval_batches=2,
+                    steps_per_eval=100,
+                    wandb=WandbConfig(mode="disabled"),
+                    require_accelerator=False,
+                    ray=RayConfig(auto_start_cluster=False),
+                    fsdp_axis="embed",
+                    per_device_parallelism=1,
+                ),
+            )
+            split_lora_lm.main(config)
+        finally:
+            try:
+                os.unlink("wandb")
+            except Exception:
+                pass
+
+
+@pytest.mark.entry
+@pytest.mark.parametrize("hf_test", [True])  # False])
+def test_train_splitgen_hfdata(hf_test):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_config = LMDatasetConfig(
+            id="stas/c4-en-10k",
+            tokenizer="meta-llama/Llama-2-7b-hf",
+            cache_dir=f"{tmpdir}/data_dir",
+            stream=True,
+        )
         model_cfg, hf_url = small_cfg(hf_test)
         print(f"Have {jax.device_count()} devices")
         try:
