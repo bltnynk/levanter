@@ -5,9 +5,14 @@ data:
 model:
   type: "llama"
   seq_len: 8192
+  hidden_dim: 4096
+  num_layers: 32
+  num_heads: 32
   num_kv_heads: 8
-  rope_base: 50000.0
+  rope_base: 500000.0
   intermediate_dim: 14336
+  reference_checkpoint: "meta-llama/Meta-Llama-3-8B"
+  tokenizer: "meta-llama/Meta-Llama-3-8B"
 
 # TODO: uncomment this once we resolve the resource exhaustion issue
 # initialize_from_hf: "meta-llama/Llama-2-7b-hf"
