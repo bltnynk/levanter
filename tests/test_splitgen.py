@@ -138,7 +138,7 @@ def test_train_splitgen_hfdata(hf_test):
             id="stas/c4-en-10k",
             tokenizer="meta-llama/Llama-2-7b-hf",
             cache_dir=f"{tmpdir}/data_dir",
-            stream=True,
+            stream=False,
         )
         model_cfg, hf_url = small_cfg(hf_test)
         print(f"Have {jax.device_count()} devices")
