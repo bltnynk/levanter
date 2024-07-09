@@ -1,5 +1,5 @@
 import functools
-from typing import Iterator, List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple, Union
 
 import equinox as eqx
 import jax
@@ -8,7 +8,8 @@ import numpy as np
 import haliax as hax
 
 from levanter.data.dataset import ShardableDataset
-from levanter.data.text import TokenizedDocumentCache
+from levanter.data.shard_cache import MetricsMonitor
+from levanter.data.text import LMDatasetConfig, LMMixtureDatasetConfig, TokenizedDocumentCache
 from levanter.models.lm_model import LmExample
 from levanter.utils.jax_utils import use_cpu_device
 
@@ -104,7 +105,7 @@ class TokenSeqWithDocBoundsDataset(ShardableDataset[Tuple[np.ndarray, np.ndarray
         return TokenSeqWithDocBoundsDataset(doc_cache, seq_len, stride, min_doc_len=min_doc_len, keep_tail=keep_tail)
 
 
-def make_skip_mask(start_inds: np.ndarray, seq_len: int, skip_after_k_tokens: int) -> np.ndarray:
+def make_split_mask(start_inds: np.ndarray, seq_len: int, skip_after_k_tokens: int) -> np.ndarray:
     split_mask = np.ones((seq_len,), dtype=bool)
     for ind in start_inds:
         end = ind + skip_after_k_tokens
@@ -118,20 +119,23 @@ class SplitLmExample(eqx.Module):
 
     @staticmethod
     def new(
-        skip_mask: hax.NamedArray,
+        split_mask: hax.NamedArray,
         tokens: hax.NamedArray,
         *,
-        loss_mask: Optional[hax.NamedArray] = None,
         ignore_id: Optional[int] = None,
     ) -> "SplitLmExample":
         if tokens.ndim != 1:
             raise ValueError(f"tokens must be a 1D array: {tokens.shape}")
-        if skip_mask.ndim != 1:
-            raise ValueError(f"skip mask must be a 1D array: {skip_mask.shape}")
-        if skip_mask.shape != tokens.shape:
-            raise ValueError(f"skip mask and tokens must have the same shape: {skip_mask.shape} != {tokens.shape}")
+        if split_mask.ndim != 1:
+            raise ValueError(f"skip mask must be a 1D array: {split_mask.shape}")
+        if split_mask.shape != tokens.shape:
+            raise ValueError(f"skip mask and tokens must have the same shape: {split_mask.shape} != {tokens.shape}")
+        # Don't predict the last token
+        loss_mask = ~hax.nn.one_hot(-1, tokens.axes[0], dtype=bool)
+        # Only predict the tokens that are in the skip mask
+        loss_mask = loss_mask & split_mask
         lm_example = LmExample.causal(tokens=tokens, loss_mask=loss_mask, ignore_id=ignore_id)
-        return SplitLmExample(lm_example, skip_mask)
+        return SplitLmExample(lm_example, split_mask)
 
 
 class SplitGenDataset(ShardableDataset[LmExample]):
@@ -164,17 +168,43 @@ class SplitGenDataset(ShardableDataset[LmExample]):
         with use_cpu_device():
 
             @functools.partial(eqx.filter_jit, out_shardings=sharding)
-            def _create_lm_example(skip_mask, tokens):
+            def _create_lm_example(split_mask, tokens):
                 tokens = hax.named(tokens, self.QPos)
-                skip_mask = hax.named(skip_mask, self.QPos)
+                split_mask = hax.named(split_mask, self.QPos)
                 example = SplitLmExample.new(
-                    skip_mask,
+                    split_mask,
                     tokens,
                     ignore_id=self.ignore_id,
                 )
                 return example
 
             for start_inds, tokens in self.dataset:
-                skip_mask = make_skip_mask(start_inds, self.QPos.size, self.skip_after_k_tokens)
-                example = _create_lm_example(skip_mask, tokens)
+                split_mask = make_split_mask(start_inds, self.QPos.size, self.skip_after_k_tokens)
+                example = _create_lm_example(split_mask, tokens)
                 yield example
+
+
+def dset_from_config(
+    config: Union[LMDatasetConfig, LMMixtureDatasetConfig],
+    split: str,
+    Pos: hax.Axis,
+    QPos: hax.Axis,
+    *,
+    skip_after_k_tokens: int,
+    monitors: Union[bool, List[MetricsMonitor]] = True,
+    ignore_index: Optional[int] = None,
+    keep_tail: bool = False,
+):
+    assert isinstance(config, LMDatasetConfig)
+    cache = config.build_or_load_cache(split, monitors=monitors)
+    if cache is None:
+        return None
+
+    dset = TokenSeqWithDocBoundsDataset(cache, Pos.size, min_doc_len=skip_after_k_tokens, keep_tail=keep_tail)
+    return SplitGenDataset(
+        dset,
+        Pos,
+        QPos,
+        skip_after_k_tokens=skip_after_k_tokens,
+        ignore_index=ignore_index,
+    )
