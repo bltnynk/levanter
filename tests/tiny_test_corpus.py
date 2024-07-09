@@ -65,3 +65,39 @@ def construct_small_data_cache(
     )
 
     return config, caches
+
+
+def construct_realistic_data_cache(
+    path,
+    num_shards=8,
+    chunk_size=512,
+    doc_len_min=8,
+    doc_len_max=256,
+    vocab_size=1024,
+    bos_token_id=0,
+) -> tuple[LMDatasetConfig, dict[str, ShardCache]]:
+    from levanter.data.shard_cache import SerialCacheWriter
+
+    rng = numpy.random.default_rng(0)
+
+    caches = {}
+
+    for split in ["train", "validation"]:
+        with SerialCacheWriter(f"{path}/cache/{split}", chunk_size) as writer:
+            for shard in range(num_shards):
+                lens = rng.integers(doc_len_min, doc_len_max, size=chunk_size)
+                docs = [rng.integers(1, vocab_size, size=lens[i]) for i in range(chunk_size)]
+                for doc in docs:
+                    doc[0] = bos_token_id
+                writer.write_batch({"input_ids": docs})
+        caches[split] = writer.result()
+
+    config = LMDatasetConfig(
+        train_urls=[f"file://{path}/train/docs.jsonl"],
+        validation_urls=[f"file://{path}/validation/docs.jsonl"],
+        cache_dir=f"{path}/cache",
+        vocab_size=vocab_size,
+        tokenizer="passthrough",
+    )
+
+    return config, caches
