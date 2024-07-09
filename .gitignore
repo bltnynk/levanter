@@ -155,3 +155,4 @@ local_*.sh
 
 trace/
 tests/wandb/
+.DS_Store
