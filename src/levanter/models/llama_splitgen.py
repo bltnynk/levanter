@@ -38,7 +38,6 @@ from levanter.utils.jax_utils import join_key, key_iterator, leaf_key_paths
 
 silence_transformer_nag()
 from transformers import LlamaConfig as HfLlamaConfig  # noqa: E402
-from transformers import PretrainedConfig as HfConfig  # noqa: E402
 
 
 M = TypeVar("M", bound=PyTree)
@@ -172,7 +171,7 @@ class SplitLlamaConfig(HFCompatConfig):
     use_bias: bool = False
     use_layer_norm_weight: bool = True
     rope_scaling: Optional[dict] = None
-    rope_base: float = 10000.0
+    rope_theta: float = 10000.0
 
     reference_checkpoint: str = "meta-llama/Llama-2-7b-hf"
     tokenizer: Optional[str] = None
@@ -211,7 +210,7 @@ class SplitLlamaConfig(HFCompatConfig):
         )
 
     @classmethod
-    def from_hf_config(cls, hf_config: HfConfig):
+    def from_hf_config(cls, hf_config: HfLlamaConfig):
         return SplitLlamaConfig(
             seq_len=hf_config.max_position_embeddings,
             hidden_dim=hf_config.hidden_size,
@@ -223,6 +222,7 @@ class SplitLlamaConfig(HFCompatConfig):
             initializer_range=hf_config.initializer_range,
             layer_norm_epsilon=hf_config.rms_norm_eps,
             rope_scaling=hf_config.rope_scaling,
+            rope_theta=hf_config.rope_theta,
         )
 
     def to_hf_config(self, vocab_size: int, config_overrides: Optional[Dict] = None) -> HfLlamaConfig:
@@ -249,6 +249,7 @@ class SplitLlamaConfig(HFCompatConfig):
             initializer_range=self.initializer_range,
             rms_norm_eps=self.layer_norm_epsilon,
             rope_scaling=self.rope_scaling,
+            rope_theta=self.rope_theta,
             vocab_size=vocab_size,
             **config_overrides,
         )
@@ -475,7 +476,7 @@ class LlamaAttention(StateDictSerializationMixin, eqx.Module):
         cos, sin = llama_rotary_pos_emb(
             self.config.HeadSize,
             x.resolve_axis("position"),
-            base=self.config.rope_base,
+            base=self.config.rope_theta,
             scale=self._rope_scale_factor(),
         )
         q, k = _apply_rotary_pos_emb(q, k, cos, sin)
