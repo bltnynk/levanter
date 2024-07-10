@@ -1,4 +1,3 @@
-import dataclasses
 import logging
 from dataclasses import dataclass, field
 from typing import Optional, Union
@@ -11,10 +10,9 @@ from haliax.partitioning import round_axis_for_partitioning
 
 import levanter
 from levanter import callbacks
-from levanter.data.dataset import Dataset
-from levanter.data.text import CausalLmDataset, LMDatasetConfig, LMMixtureDatasetConfig
+from levanter.data.docbound_text import dset_from_config
+from levanter.data.text import LMDatasetConfig, LMMixtureDatasetConfig
 from levanter.models.llama_splitgen import SplitLlamaConfig
-from levanter.models.lm_model import LmExample
 from levanter.optim import AdamConfig, OptimizerConfig
 from levanter.trainer import Trainer, TrainerConfig
 from levanter.utils.jax_utils import parameter_count
@@ -32,27 +30,13 @@ class TrainLmConfig:
 
     # config related to continued pretraining
     initialize_from_hf: Optional[str] = "meta-llama/Llama-2-7b-hf"
-
-    fcm_prob: float = 0.0  # forgetful context masking prob. recommended 0.15
+    skip_after_k_tokens: int = 32
 
     data_seed: Optional[int] = None  # if provided, will override the data seed from the trainer
     trust_remote_code: bool = False
 
-
-def mask_skipped_tokens(config: TrainLmConfig, dset: CausalLmDataset) -> Dataset[LmExample]:
-    class skipper(Dataset[LmExample]):
-        def __iter__(self):
-            Pos = config.model.Pos
-            skip_axis = Axis(Pos.name, config.model.skip_after_k_tokens)
-            remain_axis = Axis(Pos.name, Pos.size - config.model.skip_after_k_tokens)
-            for x in dset:
-                loss_mask = x.loss_mask
-                loss_mask_skip, loss_mask_remain = loss_mask.split(Pos, (skip_axis, remain_axis))
-                loss_mask = hax.concatenate(Pos, (hax.zeros_like(loss_mask_skip, dtype=bool), loss_mask_remain))
-                x = dataclasses.replace(x, loss_mask=loss_mask)
-                yield x
-
-    return skipper()
+    def __post_init__(self):
+        assert self.model.seq_len > self.skip_after_k_tokens, "skip_after_k_tokens must be less than seq_len"
 
 
 def main(config: TrainLmConfig):
@@ -93,9 +77,17 @@ def main(config: TrainLmConfig):
         Pos = config.model.Pos
         KeyPos = config.model.KeyPos
 
-        tagged_eval_datasets = config.data.tagged_eval_sets(Pos.size)
-        train_dataset = CausalLmDataset(
-            config.data.train_set(Pos.size, key=data_key), Pos, KeyPos, ignore_index=config.data.ignore_token_id
+        valid_dset = dset_from_config(
+            config.data, "validation", Pos, KeyPos, skip_after_k_tokens=config.skip_after_k_tokens
+        )
+        train_dset = dset_from_config(
+            config.data,
+            "train",
+            Pos,
+            KeyPos,
+            skip_after_k_tokens=config.skip_after_k_tokens,
+            dset_key=data_key,
+            shuffle=True,
         )
 
         # to do partitioning, our dimensions have to be divisible by the size of the physical axes they're mapped to
@@ -147,25 +139,14 @@ def main(config: TrainLmConfig):
         logger.info(f"Trainable parameter count: {just_lora_params}")
         logger.info(f"Fraction of parameters that are trainable: {just_lora_params * 1.0 / all_param_count:.3e}")
 
-        if len(tagged_eval_datasets) == 0:
-            logger.warning("No evaluation datasets provided.")
-        else:
-            causal_datasets = [
-                (
-                    mask_skipped_tokens(
-                        config, CausalLmDataset(ds, Pos, KeyPos, ignore_index=config.data.ignore_token_id)
-                    ),
-                    tags,
-                )
-                for ds, tags in tagged_eval_datasets
-            ]
+        if valid_dset is not None:
             max_eval_examples_per_ds = config.trainer.max_eval_batches
             if max_eval_examples_per_ds is not None:
                 max_eval_examples_per_ds *= config.trainer.eval_batch_size
 
             cb = levanter.eval.cb_tagged_lm_evaluate(
                 EvalBatch,
-                causal_datasets,
+                [(valid_dset, ["valid"])],
                 trainer.device_mesh,
                 compute_axis_mapping,
                 max_eval_examples_per_ds,
@@ -182,7 +163,7 @@ def main(config: TrainLmConfig):
         )
 
         # data loader. may need to seek to the right place if we're resuming
-        train_loader = iter(mask_skipped_tokens(config, trainer.sharded_loader(train_dataset, Batch)))
+        train_loader = iter(trainer.sharded_loader(train_dset, Batch))
 
         if int(state.step) > 0:
             # step is after the batch, so we need to seek to step

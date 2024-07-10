@@ -27,6 +27,7 @@ from levanter.compat.torch_serialization import (
     unflatten_linear_layers,
     unstack_state_dict,
 )
+from levanter.data.docbound_text import SplitLmExample
 from levanter.logging import silence_transformer_nag
 from levanter.models.attention import AttentionBackend, AttentionMask, dot_product_attention
 from levanter.models.gpt2 import ACT2FN
@@ -82,6 +83,13 @@ class LowRankLinear(eqx.Module):
         return hax.dot(self.lora_A.weight, self.lora_B.weight, axis=LORA_R) * self.scale
 
 
+def call_lin(proj, x, split_mask, key):
+    if isinstance(proj, SplitLoraLinear):
+        return proj(x, split_mask=split_mask, key=key)
+    else:
+        return proj(x, key=key)
+
+
 class SplitLoraLinear(eqx.Module, StateDictSerializationMixin):
     """
     Linear layer with LoRA transform.
@@ -89,34 +97,24 @@ class SplitLoraLinear(eqx.Module, StateDictSerializationMixin):
 
     wrapped: hnn.Linear
     lora: LowRankLinear
-    n_split: int = eqx.field(static=True)
-    axname: str = eqx.field(static=True)
 
     @staticmethod
-    def init(wrapped: hnn.Linear, r: int, n_split: int, seq_axis: Axis, alpha: float, *, key):
+    def init(wrapped: hnn.Linear, r: int, seq_axis: Axis, alpha: float, *, key):
         """
         Initializes a LoraLinear module.
         """
         lora = LowRankLinear.init(wrapped.In, wrapped.Out, r, alpha=alpha, key=key)
-        return SplitLoraLinear(wrapped, lora, n_split=n_split, axname=seq_axis.name)
+        return SplitLoraLinear(wrapped, lora)
 
-    def __call__(self, x: NamedArray, key):
-        x1 = x[self.axname, : self.n_split]
-        x2 = x[self.axname, self.n_split :]
+    def __call__(self, x: NamedArray, split_mask: NamedArray, key):
         if key is not None:
-            k1, k2, k3 = jax.random.split(key, 3)
-            p1 = self.wrapped(x1, key=k1)
-            p2 = self.lora(x2, key=k2) + self.wrapped(x2, key=k3)
+            k1, k2 = jax.random.split(key, 2)
+            x1 = self.wrapped(x, key=k1)
+            x2 = self.lora(x, key=k2) * split_mask
         else:
-            p1 = self.wrapped(x1)
-            p2 = self.lora(x2) + self.wrapped(x2)
-
-        # This is a little messy, but we have to accept variable size axes
-        pos_idx = p1._lookup_indices(self.axname)
-        concat = jax.numpy.concatenate([p.array for p in [p1, p2]], axis=pos_idx)
-        og_pos_ax = x.resolve_axis(self.axname)
-        axes = p1.axes[:pos_idx] + (og_pos_ax,) + p1.axes[pos_idx + 1 :]
-        return NamedArray(concat, axes)
+            x1 = self.wrapped(x)
+            x2 = self.lora(x) * split_mask
+        return x1 + x2
 
     def merge(self):
         weight = self.lora.merge() + self.wrapped.weight
@@ -160,7 +158,6 @@ class SplitLlamaConfig(HFCompatConfig):
 
     skip_indices: Sequence[int] = (24, 25, 26, 27, 28, 29)
     skip_flags = property(lambda self: jnp.array([idx in self.skip_indices for idx in range(self.num_layers)]))
-    skip_after_k_tokens: int = 256
 
     # Attention-related config
     upcast_attn: bool = False
@@ -194,7 +191,6 @@ class SplitLlamaConfig(HFCompatConfig):
         assert (
             self.num_heads % self.num_kv_heads == 0
         ), f"num_heads={self.num_heads} not divisible by num_kv_heads={self.num_kv_heads}."
-        assert self.skip_after_k_tokens < self.seq_len, "skip_after_k_tokens must be less than seq_len."
 
     def matches_target(self, key_path):
         if isinstance(self.target_modules, str):
@@ -315,9 +311,7 @@ class SplitLlamaConfig(HFCompatConfig):
                 my_key = next(key_iter)
                 batched_key = shaped_rng_split(my_key, [axis.size for axis in batch_dims])
                 alpha = self.alpha if self.alpha is not None else float(self.r)
-                return _batchify_ctor(SplitLoraLinear.init)(
-                    module, self.r, self.skip_after_k_tokens, self.Pos, alpha=alpha, key=batched_key
-                )
+                return _batchify_ctor(SplitLoraLinear.init)(module, self.r, self.Pos, alpha=alpha, key=batched_key)
             else:
                 return module
 
@@ -378,12 +372,12 @@ class LlamaMlp(eqx.Module, StateDictSerializationMixin):
         return LlamaMlp(gate_proj, up_proj, down_proj, act)
 
     @named_call
-    def __call__(self, x: NamedArray, *, key=None) -> NamedArray:
+    def __call__(self, x: NamedArray, split_mask: NamedArray, *, key=None) -> NamedArray:
         k_gate, k_up, k_down = maybe_rng_split(key, 3)
-        hidden_states = self.gate_proj(x, key=k_gate)
+        hidden_states = call_lin(self.gate_proj, x, split_mask=split_mask, key=k_gate)
         hidden_states = self.act(hidden_states)
-        hidden_states = hidden_states * self.up_proj(x, key=k_up)
-        outputs = self.down_proj(hidden_states, key=k_down)
+        hidden_states = hidden_states * call_lin(self.up_proj, x, split_mask=split_mask, key=k_up)
+        outputs = call_lin(self.down_proj, hidden_states, split_mask=split_mask, key=k_down)
         return outputs
 
     def from_state_dict(self, state_dict: StateDict, prefix: Optional[str] = None):
@@ -462,13 +456,21 @@ class LlamaAttention(StateDictSerializationMixin, eqx.Module):
         return 1.0
 
     @named_call
-    def __call__(self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], *, key=None) -> NamedArray:
+    def __call__(
+        self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], split_mask: NamedArray, *, key=None
+    ) -> NamedArray:
         key_q, key_k, key_v, key_o = maybe_rng_split(key, 4)
 
         # reorder heads and position for better training throughput
-        q = self.q_proj(x, key=key_q).rearrange((..., "kv_heads", "q_heads_per_group", "position", "head_size"))
-        k = self.k_proj(x, key=key_k).rearrange((..., "kv_heads", "position", "head_size"))
-        v = self.v_proj(x, key=key_v).rearrange((..., "kv_heads", "position", "head_size"))
+        q = call_lin(self.q_proj, x, split_mask=split_mask, key=key_q).rearrange(
+            (..., "kv_heads", "q_heads_per_group", "position", "head_size")
+        )
+        k = call_lin(self.k_proj, x, split_mask=split_mask, key=key_k).rearrange(
+            (..., "kv_heads", "position", "head_size")
+        )
+        v = call_lin(self.v_proj, x, split_mask=split_mask, key=key_v).rearrange(
+            (..., "kv_heads", "position", "head_size")
+        )
 
         cos, sin = llama_rotary_pos_emb(
             self.config.HeadSize,
@@ -499,7 +501,7 @@ class LlamaAttention(StateDictSerializationMixin, eqx.Module):
         attn_output = attn_output.flatten_axes(("kv_heads", "q_heads_per_group"), "heads")
         attn_output = attn_output.astype(x.dtype)
 
-        attn_output = self.o_proj(attn_output, key=key_o)
+        attn_output = call_lin(self.o_proj, attn_output, split_mask=split_mask, key=key_o)
         return attn_output
 
     def from_state_dict(self, state_dict: StateDict, prefix: Optional[str] = None):
@@ -570,23 +572,6 @@ class LlamaRMSNorm(eqx.Module):
         return out.astype(in_dtype)
 
 
-class SplitDecoderWrapper(eqx.Module, StateDictSerializationMixin):
-    config: SplitLlamaConfig = eqx.static_field()
-    wrapped: "LlamaDecoderLayer"
-
-    @staticmethod
-    def init(wrapped: "LlamaDecoderLayer") -> "SplitDecoderWrapper":
-        return SplitDecoderWrapper(wrapped.config, wrapped)
-
-    @named_call
-    def __call__(self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], *, key=None) -> NamedArray:
-        new_x_axis = Axis(self.config.Pos.name, self.config.skip_after_k_tokens)
-        skip_x_axis = Axis(self.config.Pos.name, self.config.Pos.size - new_x_axis.size)
-        x, holdout = x.split(self.config.Pos, (new_x_axis, skip_x_axis))
-        x = self.wrapped(x, mask, key=key)
-        return hax.concatenate(self.config.Pos, (x, holdout))
-
-
 class LlamaDecoderLayer(StateDictSerializationMixin, eqx.Module):
     config: SplitLlamaConfig = eqx.static_field()
     self_attn: LlamaAttention
@@ -611,40 +596,34 @@ class LlamaDecoderLayer(StateDictSerializationMixin, eqx.Module):
 
         return LlamaDecoderLayer(config, attn, mlp, ln_1, ln_2)
 
-    def full_forward(self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], key=None):
+    @named_call
+    def __call__(
+        self,
+        x: NamedArray,
+        mask: Optional[NamedArray | AttentionMask],
+        split_mask: NamedArray,
+        skip_flag: bool,
+        key=None,
+    ) -> NamedArray:
         k_attn, k_mlp = maybe_rng_split(key, 2)
+        # If this layer should be skipped for indices where split_mask==True,
+        # then we should mask out writes to the residual stream when split_mask==True.
+        # Otherwise we pass both through.
+        residual_mask = jax.lax.select(skip_flag, ~split_mask.array, hax.ones_like(split_mask).array)
+        residual_mask = hax.NamedArray(residual_mask, split_mask.axes)
+
         # self attention and skip connection
         residual = x
         x = self.input_layernorm(x)
-        attn_output = self.self_attn(x=x, mask=mask, key=k_attn)
-        x = residual + attn_output
+        attn_output = self.self_attn(x=x, mask=mask, split_mask=split_mask, key=k_attn)
+        x = residual + (attn_output * residual_mask)
 
         # MLP and skip connection
         residual = x
         x = self.post_attention_layernorm(x)
-        mlp_output = self.mlp(x, key=k_mlp)
-        output = residual + mlp_output
+        mlp_output = self.mlp(x, split_mask=split_mask, key=k_mlp)
+        output = residual + (mlp_output * residual_mask)
         return output
-
-    def split_forward(self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], key=None):
-        new_x_axis = Axis(self.config.Pos.name, self.config.skip_after_k_tokens)
-        skip_x_axis = Axis(self.config.Pos.name, self.config.Pos.size - new_x_axis.size)
-        x, holdout = x.split(self.config.Pos, (new_x_axis, skip_x_axis))
-        x = self.full_forward(x, mask, key=key)
-        return hax.concatenate(self.config.Pos, (x, holdout))
-
-    @named_call
-    def __call__(
-        self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], skip_flag: bool, key=None
-    ) -> NamedArray:
-        return jax.lax.cond(
-            skip_flag,
-            self.split_forward,
-            self.full_forward,
-            x,
-            mask,
-            key,
-        )
 
 
 class LlamaTransformer(StateDictSerializationMixin, eqx.Module):
@@ -665,9 +644,11 @@ class LlamaTransformer(StateDictSerializationMixin, eqx.Module):
         return LlamaTransformer(config, layers, ln_f)
 
     @named_call
-    def __call__(self, x: NamedArray, attn_mask: Optional[NamedArray | AttentionMask], *, key) -> NamedArray:
+    def __call__(
+        self, x: NamedArray, attn_mask: Optional[NamedArray | AttentionMask], split_mask: NamedArray, *, key
+    ) -> NamedArray:
         keys = maybe_rng_split(key, self.config.num_layers) if key is not None else None
-        x = self.layers.fold(x, mask=attn_mask, skip_flag=self.config.skip_flags, key=keys)
+        x = self.layers.fold(x, mask=attn_mask, split_mask=split_mask, skip_flag=self.config.skip_flags, key=keys)
         x = self.norm(x)
 
         return x
@@ -754,6 +735,16 @@ class LlamaLMHeadModel(eqx.Module, LmHeadModel[SplitLlamaConfig], StateDictSeria
         *,
         key=None,
     ) -> NamedArray:
+        raise NotImplementedError("LlamaLMHeadModel splitgen does not support __call__")
+
+    def custom_fwd(
+        self,
+        input_ids: NamedArray,
+        split_mask: NamedArray,
+        attn_mask: Optional[Union[NamedArray, AttentionMask]] = None,
+        *,
+        key=None,
+    ) -> NamedArray:
         """
         Args:
             input_ids (NamedArray): [batch, position]
@@ -764,7 +755,7 @@ class LlamaLMHeadModel(eqx.Module, LmHeadModel[SplitLlamaConfig], StateDictSeria
         """
         k_t, k_head = maybe_rng_split(key, 2)
         x = self.embeddings.embed(input_ids)
-        x = self.transformer(x, attn_mask=attn_mask, key=k_t)
+        x = self.transformer(x, split_mask=split_mask, attn_mask=attn_mask, key=k_t)
         lm_logits = self.lm_head(x, key=k_head)
         return lm_logits
 
@@ -800,6 +791,37 @@ class LlamaLMHeadModel(eqx.Module, LmHeadModel[SplitLlamaConfig], StateDictSeria
 
         state_dict.update(my_dict)
         return state_dict
+
+    def compute_loss(
+        self,
+        example: SplitLmExample,
+        *,
+        key=None,
+        reduction: Optional[hax.ReductionFunction] = hax.mean,
+        reduction_axis: Optional[hax.AxisSelection] = None,
+    ) -> jnp.ndarray | NamedArray:
+        """
+        Computes the cross-entropy loss for a language modeling example. If reduction is not None, the loss is reduced
+        across the reduction axis (with reduction_axis=None meaning all axes). If reduction is None, the loss is not
+        reduced, and the result is a named array with axes (*batch axes, sequence_length).
+        """
+        logits = self.custom_fwd(
+            input_ids=example.tokens, split_mask=example.split_mask, attn_mask=example.attn_mask, key=key
+        )
+        # TODO: would be nice if we made the dtype configurable
+        logits = logits.astype(jnp.float32)
+        targets = hax.roll(example.tokens, -1, axis=self.Pos.name)
+        target_y = hax.nn.one_hot(targets, self.Vocab, dtype=logits.dtype)
+        loss = hax.nn.cross_entropy_loss(
+            logits,
+            self.Vocab,
+            target_y,
+            reduction,
+            reduction_axis=reduction_axis,
+            where=example.loss_mask,
+        )
+
+        return loss
 
 
 def _rotate_half(x: NamedArray) -> NamedArray:

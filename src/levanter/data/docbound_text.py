@@ -1,13 +1,16 @@
 import functools
+import warnings
 from typing import Iterator, List, Optional, Tuple, Union
 
 import equinox as eqx
 import jax
 import numpy as np
+from pyarrow import RecordBatch
+from transformers import BatchEncoding
 
 import haliax as hax
 
-from levanter.data.dataset import ShardableDataset
+from levanter.data.dataset import ShardableDataset, ShuffleDataset
 from levanter.data.shard_cache import MetricsMonitor
 from levanter.data.text import LMDatasetConfig, LMMixtureDatasetConfig, TokenizedDocumentCache
 from levanter.models.lm_model import LmExample
@@ -79,12 +82,21 @@ class TokenSeqWithDocBoundsDataset(ShardableDataset[Tuple[np.ndarray, np.ndarray
         )
 
     def __iter__(self) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
-        extra_tokens = None  # BatchEncoding of the last tokens from the previous doc
+        extra_tokens = None
         for doc in self.doc_cache:
             # TODO: we could be cleverer here, and avoid these expensive copies etc
             # should run some benchmarks to see if it's worth it
 
-            doc = doc.to_pydict()
+            if isinstance(doc, RecordBatch):
+                doc = doc.to_pydict()
+            elif isinstance(doc, BatchEncoding):
+                doc = dict(doc)
+                for k, v in doc.items():
+                    if isinstance(v, np.ndarray):
+                        doc[k] = v.tolist()
+            else:
+                raise ValueError(f"Unexpected type: {type(doc)}")
+
             if extra_tokens is not None:
                 for k in extra_tokens:
                     doc[k] = extra_tokens[k] + doc[k]
@@ -116,6 +128,18 @@ def make_split_mask(start_inds: np.ndarray, seq_len: int, skip_after_k_tokens: i
 class SplitLmExample(eqx.Module):
     lm_example: LmExample
     split_mask: hax.NamedArray
+
+    @property
+    def loss_mask(self) -> hax.NamedArray:
+        return self.lm_example.loss_mask
+
+    @property
+    def tokens(self) -> hax.NamedArray:
+        return self.lm_example.tokens
+
+    @property
+    def attn_mask(self) -> hax.NamedArray:
+        return self.lm_example.attn_mask
 
     @staticmethod
     def new(
@@ -194,13 +218,24 @@ def dset_from_config(
     monitors: Union[bool, List[MetricsMonitor]] = True,
     ignore_index: Optional[int] = None,
     keep_tail: bool = False,
+    shuffle: bool = False,
+    dset_key: Optional[jax.random.PRNGKey] = None,
 ):
     assert isinstance(config, LMDatasetConfig)
-    cache = config.build_or_load_cache(split, monitors=monitors)
+    cache = config.build_or_load_cache(split, monitors=monitors, flatten_docs=False)
     if cache is None:
         return None
 
-    dset = TokenSeqWithDocBoundsDataset(cache, Pos.size, min_doc_len=skip_after_k_tokens, keep_tail=keep_tail)
+    dset: ShardableDataset[Tuple[np.ndarray, np.ndarray]] = TokenSeqWithDocBoundsDataset(
+        cache, Pos.size, min_doc_len=skip_after_k_tokens, keep_tail=keep_tail
+    )
+    if shuffle:
+        if config.shuffle_buffer_size is None:
+            warnings.warn("Not shuffling: shuffle was true but shuffle_buffer_size was not set")
+        else:
+            if dset_key is None:
+                dset_key = jax.random.PRNGKey(0)
+            dset = ShuffleDataset(dset, dset_key, config.shuffle_buffer_size)
     return SplitGenDataset(
         dset,
         Pos,

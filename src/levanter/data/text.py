@@ -523,7 +523,7 @@ class LMDatasetSourceConfig:
                 ds = WrappedHFDataset(self.id, split=split, name=self.name, streaming=self.stream)
             except ValueError as e:
                 # if the message starts with Bad split, then just return None
-                if str(e).startswith("Bad split"):
+                if str(e).startswith("Bad split") or str(e).startswith("Unknown split"):
                     logger.warning(f"Splits {split} not found for {self.id} {self.name}")
                     return None
                 else:
@@ -680,13 +680,17 @@ class LMDatasetConfig(LMDatasetSourceConfig, LMTaskConfig):
         return TokenSeqDataset(cache, seq_len)
 
     def build_or_load_cache(
-        self, split: str, monitors: Union[bool, List[MetricsMonitor]] = True, logger_name: Optional[str] = None
+        self,
+        split: str,
+        monitors: Union[bool, List[MetricsMonitor]] = True,
+        logger_name: Optional[str] = None,
+        flatten_docs: bool = True,
     ) -> Optional[TokenizedDocumentCache]:
         split_cache_dir = os.path.join(self.cache_dir, split)
         name = logger_name or os.path.basename(self.cache_dir)
 
         try:
-            return TokenizedDocumentCache.load(split_cache_dir, flatten_docs=True)
+            return TokenizedDocumentCache.load(split_cache_dir, flatten_docs=flatten_docs)
         except FileNotFoundError:
             pass
 
@@ -710,7 +714,7 @@ class LMDatasetConfig(LMDatasetSourceConfig, LMTaskConfig):
             source,
             self.the_tokenizer,
             enforce_eos=self.enforce_eos,
-            flatten_docs=True,
+            flatten_docs=flatten_docs,
             rows_per_chunk=self.rows_per_chunk,
             monitors=monitors,
             # TODO: it would be better if we could just prioritize validation higher (we typically want it after the first grad step)

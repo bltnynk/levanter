@@ -28,7 +28,6 @@ def small_cfg(hf_test=True):
             num_layers=2,
             num_kv_heads=4,
             skip_indices=[1],
-            skip_after_k_tokens=32,
             attn_backend="jax_flash",
         )
         hf_url = "trl-internal-testing/tiny-random-LlamaForCausalLM"
@@ -42,7 +41,6 @@ def small_cfg(hf_test=True):
             num_layers=32,
             num_kv_heads=4,
             skip_indices=[1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31],
-            skip_after_k_tokens=32,
             attn_backend="jax_flash",
         )
         return cfg, None
@@ -66,8 +64,9 @@ def test_loraize():
 def _get_random_inputs(config: lsg.SplitLlamaConfig, Vocab: Axis):
     Batch = hax.Axis("batch", 2)
     x = hax.random.randint(jax.random.PRNGKey(0), (Batch, config.Pos), 0, Vocab.size)
+    split_mask = hax.random.randint(jax.random.PRNGKey(1), (Batch, config.Pos), 0, 1).astype(bool)
     mask = AttentionMask.causal()
-    return x, mask
+    return x, split_mask, mask
 
 
 def test_splitgen_forward():
@@ -78,15 +77,15 @@ def test_splitgen_forward():
     inputs = _get_random_inputs(cfg, Vocab)
 
     model_lora = cfg.loraize(model, key=key)
-    out_lora = model_lora(*inputs).array
-    out_refr = model(*inputs).array
+    out_lora = model_lora.custom_fwd(*inputs).array
+    out_refr = model.custom_fwd(*inputs).array
     assert jax.numpy.allclose(out_lora, out_refr, atol=1e-5).item()
 
-    out = model_lora(*inputs).array
+    out = model_lora.custom_fwd(*inputs).array
 
     @hax.named_jit
-    def jitted_fwd(x, mask):
-        return model_lora(x, mask)
+    def jitted_fwd(x, split_mask, mask):
+        return model_lora.custom_fwd(x, split_mask, mask)
 
     out2 = jitted_fwd(*inputs).array
 
@@ -104,6 +103,7 @@ def test_train_splitgen_lm(hf_test):
         try:
             config = split_lora_lm.TrainLmConfig(
                 initialize_from_hf=hf_url,
+                skip_after_k_tokens=32,
                 data=data_config,
                 model=model_cfg,
                 trainer=split_lora_lm.TrainerConfig(
