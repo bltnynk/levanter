@@ -58,7 +58,7 @@ def list_tpus(zone):
     return tpus
 
 
-def start_tpu_vm(tpu_name, *, tpu_type, preemptible, version, zone, autodelete):
+def start_tpu_vm(tpu_name, *, tpu_type, capacity_type, version, zone, autodelete):
     tpu_exists = any([tpu["NAME"] == tpu_name for tpu in list_tpus(zone)])
     if tpu_exists:
         if not autodelete:
@@ -92,8 +92,16 @@ def start_tpu_vm(tpu_name, *, tpu_type, preemptible, version, zone, autodelete):
         "--zone=" + zone,
         "--quiet",
     ]
-    if preemptible:
+    if capacity_type == "preemptible":
         command.append("--preemptible")
+    elif capacity_type == "reserved":
+        command.append("--reserved")
+    elif capacity_type == "spot":
+        command.append("--spot")
+    elif capacity_type == "on-demand" or capacity_type is None:
+        pass
+    else:
+        raise ValueError(f"Unknown capacity type: {capacity_type}")
     cli.run_command(*command)
 
 
@@ -115,12 +123,29 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     config = cli.load_config()
 
-    cli.add_arg(parser, config, ["--autodelete"], default=False, action="store_true")
+    cli.add_arg(
+        parser, config, ["--autodelete"], default=False, action="store_true", help="Delete TPU if it already exists."
+    )
     cli.add_arg(parser, config, ["--docker_base_image"], default="ghcr.io/rjpower/levanter:latest")
     cli.add_arg(parser, config, ["--docker_repository"], default="levanter")
     cli.add_arg(parser, config, ["--foreground"], default=False, action="store_true")
     cli.add_arg(parser, config, ["--image_name"], default=f"levanter-{getpass.getuser()}")
-    cli.add_arg(parser, config, ["--preemptible"], default=False, action="store_true")
+    cli.add_arg(
+        parser, config, ["--capacity_type"], default=None, choices=["preemptible", "spot", "reserved", "on-demand"]
+    )
+    cli.add_arg(
+        parser,
+        config,
+        ["--preemptible"],
+        required=False,
+        action="store_const",
+        const="preemptible",
+        dest="capacity_type",
+    )
+    cli.add_arg(parser, config, ["--spot"], required=False, action="store_const", const="spot", dest="capacity_type")
+    cli.add_arg(
+        parser, config, ["--reserved"], required=False, action="store_const", const="reserved", dest="capacity_type"
+    )
     cli.add_arg(parser, config, ["--project"], default=cli.gcloud_config()["project"])
     cli.add_arg(parser, config, ["--tpu_name"], required=True)
     cli.add_arg(parser, config, ["--tpu_type"], required=True)
@@ -128,6 +153,9 @@ if __name__ == "__main__":
     cli.add_arg(parser, config, ["--zone"], required=True)
     cli.add_arg(parser, config, ["--retries"], default=0, type=int)
     cli.add_arg(parser, config, ["--run_id"], default=_default_run_id(), type=str)
+    cli.add_arg(parser, config, ["--docker_registry"], default="gcp", choices=["gcp", "ghcr"])
+    cli.add_arg(parser, config, ["--github_user"], type=str)
+    cli.add_arg(parser, config, ["--github_token"], type=str)
 
     parser.add_argument(
         "-e", "--env", action="append", nargs=2, metavar=("KEY", "VALUE"), default=config.get("env", {}).items()
@@ -142,7 +170,7 @@ if __name__ == "__main__":
     docker_repository = args.docker_repository
     foreground = args.foreground
     image_id = args.image_name
-    preemptible = args.preemptible
+    capacity_type = args.capacity_type
     project = args.project
     if args.retries < 0:
         retries = 10000000
@@ -153,6 +181,9 @@ if __name__ == "__main__":
     version = args.version
     zone = args.zone
     run_id = args.run_id
+    registry = args.docker_registry
+    github_user = args.github_user
+    github_token = args.github_token
 
     region = "-".join(zone.split("-")[:-1])
     env = {k: v for k, v in args.env}
@@ -163,12 +194,24 @@ if __name__ == "__main__":
     if command[0] == "--":
         command = command[1:]
 
+    # make an image tag based on the unix timestamp to ensure we always pull the latest image
+    tag = int(time.time())
+
+    full_image_id = push_docker.push_to_gcp(
+        project_id=project,
+        region=region,
+        repository=docker_repository,
+        image_name=image_id,
+        tag=tag,
+        docker_file="docker/tpu/Dockerfile.incremental",
+    )
+
     for i in range(retries + 1):
         try:
             start_tpu_vm(
                 tpu_name=tpu_name,
                 tpu_type=tpu_type,
-                preemptible=preemptible,
+                capacity_type=capacity_type,
                 version=version,
                 zone=zone,
                 autodelete=autodelete,
@@ -185,14 +228,25 @@ if __name__ == "__main__":
             # make an image tag based on the unix timestamp to ensure we always pull the latest image
             tag = int(time.time())
 
-            full_image_id = push_docker.push_to_gcp(
-                project_id=project,
-                region=region,
-                repository=docker_repository,
-                image_name=image_id,
-                tag=tag,
-                docker_file="docker/tpu/Dockerfile.incremental",
-            )
+            if registry == "ghcr":
+                full_image_id = push_docker.push_to_github(
+                    local_image=image_id,
+                    tag=tag,
+                    github_user=github_user,
+                    github_token=github_token,
+                    docker_file="docker/tpu/Dockerfile.incremental",
+                )
+            elif registry == "gcp":
+                full_image_id = push_docker.push_to_gcp(
+                    project_id=project,
+                    region=region,
+                    repository=docker_repository,
+                    image_name=image_id,
+                    tag=tag,
+                    docker_file="docker/tpu/Dockerfile.incremental",
+                )
+            else:
+                raise ValueError(f"Unknown docker registry: {args.docker_registry}")
 
             git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
 
