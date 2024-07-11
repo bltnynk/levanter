@@ -323,7 +323,7 @@ class SplitLlamaConfig(HFCompatConfig):
             is_leaf=_is_special_module,
         )
 
-    def is_trainable_filter(self, model: M) -> M:
+    def lora_only_trainable_filter(self, model: M) -> M:
         """
         Creates a filter tree suitable for passing to Trainer.is_trainable marking which parameters are trainable and which
         are not.

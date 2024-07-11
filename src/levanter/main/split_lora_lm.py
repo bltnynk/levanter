@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Union
 
 import jax.random as jrandom
+from jaxtyping import PyTree
 
 import haliax as hax
 from haliax import Axis
@@ -34,6 +35,7 @@ class TrainLmConfig:
 
     data_seed: Optional[int] = None  # if provided, will override the data seed from the trainer
     trust_remote_code: bool = False
+    full_ft: bool = False
 
     def __post_init__(self):
         assert self.model.seq_len > self.skip_after_k_tokens, "skip_after_k_tokens must be less than seq_len"
@@ -119,7 +121,9 @@ def main(config: TrainLmConfig):
 
         logger.info("Loraizing and splitting model")
         model = loraize_hf_model(model)
-        is_trainable = model_config.is_trainable_filter(model)
+        is_trainable: PyTree = model_config.lora_only_trainable_filter(model)
+        if config.full_ft:
+            is_trainable = True
 
         state = trainer.initial_state(training_key, model=model, is_trainable=is_trainable)
 
@@ -156,7 +160,7 @@ def main(config: TrainLmConfig):
 
         flops_per_token = config.model.flops_per_token(vocab_size)
         # 2x the flops, because we compute backprop of the inputs and the fwd pass.
-        # assume the LoRA gradients are really small
+        # assume the LoRA gradients/flops are really small
         flops_per_example = 2 * flops_per_token * Pos.size if flops_per_token is not None else None
         trainer.add_hook(
             callbacks.log_performance_stats(Pos.size, trainer.config.train_batch_size, flops_per_example), every=1

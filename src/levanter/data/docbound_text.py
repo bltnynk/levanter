@@ -203,9 +203,12 @@ class SplitGenDataset(ShardableDataset[LmExample]):
                 return example
 
             for start_inds, tokens in self.dataset:
-                split_mask = make_split_mask(start_inds, self.QPos.size, self.skip_after_k_tokens)
-                example = _create_lm_example(split_mask, tokens)
-                yield example
+                if len(tokens) == self.QPos.size:
+                    split_mask = make_split_mask(start_inds, self.QPos.size, self.skip_after_k_tokens)
+                    example = _create_lm_example(split_mask, tokens)
+                    yield example
+                else:
+                    warnings.warn(f"Skipping example with length {len(tokens)}")
 
 
 def dset_from_config(

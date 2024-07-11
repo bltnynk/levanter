@@ -11,6 +11,8 @@ model:
 # initialize_from_hf: "meta-llama/Llama-2-7b-hf"
 # use_hf_model_config: true
 initialize_from_hf: "meta-llama/Llama-2-7b-hf"
+skip_after_k_tokens: 64
+full_ft: False
 trainer:
   tracker:
     type: wandb
@@ -18,7 +20,7 @@ trainer:
     tags: ["slimpj", "llamasg"]
 
   mp: p=f32,c=bfloat16
-  train_batch_size: 2048 # 4m tokens per batch
+  train_batch_size: 1024 # 4m tokens per batch
   per_device_parallelism: 16
   num_train_steps: 1000 # 4b tokens
   steps_per_eval: 50

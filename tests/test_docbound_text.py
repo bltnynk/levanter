@@ -48,7 +48,7 @@ def test_split_gen_dataset():
         _, caches = tiny_test_corpus.construct_realistic_data_cache(
             tmpdir,
             doc_len_min=8,
-            doc_len_max=512,
+            doc_len_max=2048,
             vocab_size=1024,
             bos_token_id=bos_token_id,
             chunk_size=64,
@@ -57,6 +57,7 @@ def test_split_gen_dataset():
         dset = TokenSeqWithDocBoundsDataset(caches["train"], seq_len, min_doc_len=skip_after_k)
         split_dset = SplitGenDataset(dset, Pos, KeyPos, skip_after_k, ignore_index=0)
         for elem in split_dset:
+            assert elem.tokens.array.shape[0] == seq_len
             i = 0
             while i < elem.lm_example.tokens.size:
                 if elem.lm_example.tokens[Pos, i] == 0:

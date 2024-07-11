@@ -14,8 +14,7 @@ from helpers import cli
 def setup_vm_docker(tpu_name, zone, docker_base_image, github_user=None, github_token=None):
     """Change docker permissions on `tpu_name`, remove any old runs, and setup the cache volume."""
     cmd = ["sudo", "usermod", "-aG", "docker", getpass.getuser()]
-    cmd += ["&&", "docker", "volume", "create", "--driver=local", "levanter"]
-    cmd += ["&&", "docker", "rm", "-f", "levanter"]
+    cmd += ["&&", "sudo", "docker", "rm", "-f", "levanter"]
     assert all([github_user, github_token]) or not any([github_user, github_token])
     if github_token is not None:
         cmd += ["&&", "docker", "login", "ghcr.io", "-u", github_user, "-p", github_token]

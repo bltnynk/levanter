@@ -120,3 +120,4 @@ local_*.sh
 trace/
 tests/wandb/
 scratch/
+.config
