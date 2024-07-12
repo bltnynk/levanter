@@ -32,6 +32,7 @@ class TrainLmConfig:
     # config related to continued pretraining
     initialize_from_hf: Optional[str] = "meta-llama/Llama-2-7b-hf"
     skip_after_k_tokens: int = 32
+    eval_loss_mask_after_k_tokens: Optional[int] = None
 
     data_seed: Optional[int] = None  # if provided, will override the data seed from the trainer
     trust_remote_code: bool = False
@@ -80,7 +81,12 @@ def main(config: TrainLmConfig):
         KeyPos = config.model.KeyPos
 
         valid_dset = dset_from_config(
-            config.data, "validation", Pos, KeyPos, skip_after_k_tokens=config.skip_after_k_tokens
+            config.data,
+            "validation",
+            Pos,
+            KeyPos,
+            skip_after_k_tokens=config.skip_after_k_tokens,
+            loss_mask_after_k_tokens=config.eval_loss_mask_after_k_tokens,
         )
         train_dset = dset_from_config(
             config.data,

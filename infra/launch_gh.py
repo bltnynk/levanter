@@ -17,7 +17,7 @@ def setup_vm_docker(tpu_name, zone, docker_base_image, github_user=None, github_
     cmd += ["&&", "sudo", "docker", "rm", "-f", "levanter"]
     assert all([github_user, github_token]) or not any([github_user, github_token])
     if github_token is not None:
-        cmd += ["&&", "docker", "login", "ghcr.io", "-u", github_user, "-p", github_token]
+        cmd += ["&&", "sudo", "docker", "login", "ghcr.io", "-u", github_user, "-p", github_token]
     cli.tpu_ssh(tpu_name, zone, *cmd)
 
 

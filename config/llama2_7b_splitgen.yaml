@@ -5,7 +5,7 @@ data:
 # Baseline loss is 1.780719581246376
 model:
   r: 64
-  attn_backend: jax_flash
+  attn_backend: splash
   tokenizer: "meta-llama/Llama-2-7b-hf"
 # TODO: uncomment this once we resolve the resource exhaustion issue
 # initialize_from_hf: "meta-llama/Llama-2-7b-hf"
@@ -20,9 +20,8 @@ trainer:
     tags: ["slimpj", "llamasg"]
 
   mp: p=f32,c=bfloat16
-  train_batch_size: 1024 # 4m tokens per batch
-  per_device_parallelism: 16
-  num_train_steps: 1000 # 4b tokens
+  train_batch_size: 768 # 3.1m tokens per batch
+  num_train_steps: 1330 # 4b tokens
   steps_per_eval: 50
   tensor_parallel_axes: ["mlp", "heads"]
   fsdp_axis: "embed"

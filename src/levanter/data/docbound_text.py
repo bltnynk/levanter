@@ -145,6 +145,7 @@ class SplitLmExample(eqx.Module):
     def new(
         split_mask: hax.NamedArray,
         tokens: hax.NamedArray,
+        loss_mask: hax.NamedArray,
         *,
         ignore_id: Optional[int] = None,
     ) -> "SplitLmExample":
@@ -154,10 +155,6 @@ class SplitLmExample(eqx.Module):
             raise ValueError(f"skip mask must be a 1D array: {split_mask.shape}")
         if split_mask.shape != tokens.shape:
             raise ValueError(f"skip mask and tokens must have the same shape: {split_mask.shape} != {tokens.shape}")
-        # Don't predict the last token
-        loss_mask = ~hax.nn.one_hot(-1, tokens.axes[0], dtype=bool)
-        # Only predict the tokens that are in the skip mask
-        loss_mask = loss_mask & split_mask
         lm_example = LmExample.causal(tokens=tokens, loss_mask=loss_mask, ignore_id=ignore_id)
         return SplitLmExample(lm_example, split_mask)
 
@@ -169,12 +166,14 @@ class SplitGenDataset(ShardableDataset[LmExample]):
         QPos: hax.Axis,
         KPos: hax.Axis,
         skip_after_k_tokens: int = 0,
+        loss_mask_after_k_tokens: Optional[int] = None,
         ignore_index: Optional[int] = None,
     ):
         self.dataset = dataset
         self.QPos = QPos
         self.KPos = KPos
         self.skip_after_k_tokens = skip_after_k_tokens
+        self.loss_mask_after_k_tokens = loss_mask_after_k_tokens
         self.ignore_id = ignore_index
 
     def shard(self, shard_id: int, num_shards: int) -> "SplitGenDataset":
@@ -183,6 +182,7 @@ class SplitGenDataset(ShardableDataset[LmExample]):
             self.QPos,
             self.KPos,
             self.skip_after_k_tokens,
+            self.loss_mask_after_k_tokens,
             self.ignore_id,
         )
 
@@ -192,12 +192,14 @@ class SplitGenDataset(ShardableDataset[LmExample]):
         with use_cpu_device():
 
             @functools.partial(eqx.filter_jit, out_shardings=sharding)
-            def _create_lm_example(split_mask, tokens):
+            def _create_lm_example(split_mask, loss_mask, tokens):
                 tokens = hax.named(tokens, self.QPos)
                 split_mask = hax.named(split_mask, self.QPos)
+                loss_mask = hax.named(loss_mask, self.QPos)
                 example = SplitLmExample.new(
                     split_mask,
                     tokens,
+                    loss_mask=loss_mask,
                     ignore_id=self.ignore_id,
                 )
                 return example
@@ -205,7 +207,19 @@ class SplitGenDataset(ShardableDataset[LmExample]):
             for start_inds, tokens in self.dataset:
                 if len(tokens) == self.QPos.size:
                     split_mask = make_split_mask(start_inds, self.QPos.size, self.skip_after_k_tokens)
-                    example = _create_lm_example(split_mask, tokens)
+                    # Don't predict the last token
+                    loss_mask = np.ones_like(tokens, dtype=bool)
+                    loss_mask[-1] = False
+                    if self.loss_mask_after_k_tokens is not None:
+                        # This is useful for a baseline comparison of a model that doesn't skip
+                        # the first k tokens. Otherwise the losses are also calculated over the early tokens.
+                        loss_mask = loss_mask & make_split_mask(
+                            start_inds, self.QPos.size, self.loss_mask_after_k_tokens
+                        )
+                    else:
+                        # Only predict the tokens that are in the skip mask
+                        loss_mask = loss_mask & split_mask
+                    example = _create_lm_example(split_mask, loss_mask, tokens)
                     yield example
                 else:
                     warnings.warn(f"Skipping example with length {len(tokens)}")
@@ -218,6 +232,7 @@ def dset_from_config(
     QPos: hax.Axis,
     *,
     skip_after_k_tokens: int,
+    loss_mask_after_k_tokens: Optional[int] = None,
     monitors: Union[bool, List[MetricsMonitor]] = True,
     ignore_index: Optional[int] = None,
     keep_tail: bool = False,
@@ -244,5 +259,6 @@ def dset_from_config(
         Pos,
         QPos,
         skip_after_k_tokens=skip_after_k_tokens,
+        loss_mask_after_k_tokens=loss_mask_after_k_tokens,
         ignore_index=ignore_index,
     )

@@ -1,11 +1,12 @@
 import tempfile
 
+import jax.numpy as jnp
 import numpy as np
 
 import haliax as hax
 
 import tiny_test_corpus
-from levanter.data.docbound_text import SplitGenDataset, TokenSeqWithDocBoundsDataset, make_examples, make_split_mask
+from levanter.data.docbound_text import dset_from_config, make_examples, make_split_mask
 
 
 def make_text_batches(lens):
@@ -45,7 +46,7 @@ def test_split_gen_dataset():
     Pos = hax.Axis("Pos", seq_len)
     KeyPos = hax.Axis("KeyPos", seq_len)
     with tempfile.TemporaryDirectory() as tmpdir:
-        _, caches = tiny_test_corpus.construct_realistic_data_cache(
+        config, _ = tiny_test_corpus.construct_realistic_data_cache(
             tmpdir,
             doc_len_min=8,
             doc_len_max=2048,
@@ -54,15 +55,33 @@ def test_split_gen_dataset():
             chunk_size=64,
             num_shards=1,
         )
-        dset = TokenSeqWithDocBoundsDataset(caches["train"], seq_len, min_doc_len=skip_after_k)
-        split_dset = SplitGenDataset(dset, Pos, KeyPos, skip_after_k, ignore_index=0)
-        for elem in split_dset:
+        dset = dset_from_config(config, "train", Pos, KeyPos, skip_after_k_tokens=skip_after_k)
+        for elem in dset:
+            assert (elem.loss_mask.array[:-1] == elem.split_mask.array[:-1]).all()
+            start_inds = jnp.argwhere(elem.tokens.array == 0).squeeze(1)
             assert elem.tokens.array.shape[0] == seq_len
-            i = 0
-            while i < elem.lm_example.tokens.size:
-                if elem.lm_example.tokens[Pos, i] == 0:
-                    assert not elem.split_mask[Pos, i : i + skip_after_k].any()
-                    i += skip_after_k
-                else:
-                    assert elem.split_mask[Pos, i]
-                    i += 1
+            for i in range(0, len(start_inds)):
+                split_end = start_inds[i] + skip_after_k
+                assert not elem.split_mask[Pos, start_inds[i] : split_end].any()
+                next_start = start_inds[i + 1] if i + 1 < len(start_inds) else seq_len
+                assert elem.split_mask[Pos, split_end:next_start].all()
+
+        loss_mask_after_k = 24
+        dset = dset_from_config(
+            config, "train", Pos, KeyPos, skip_after_k_tokens=skip_after_k, loss_mask_after_k_tokens=loss_mask_after_k
+        )
+        for elem in dset:
+            start_inds = jnp.argwhere(elem.tokens.array == 0).squeeze(1)
+            assert elem.tokens.array.shape[0] == seq_len
+            for i in range(0, len(start_inds)):
+                split_end = start_inds[i] + skip_after_k
+                assert not elem.split_mask[Pos, start_inds[i] : split_end].any()
+                next_start = start_inds[i + 1] if i + 1 < len(start_inds) else seq_len
+                assert elem.split_mask[Pos, split_end:next_start].all()
+
+                # loss mask checking
+                mask_until = min(next_start, start_inds[i] + loss_mask_after_k, seq_len - 1)
+                assert not elem.loss_mask[Pos, start_inds[i] : mask_until].any()
+                unmask_until = min(next_start, seq_len - 1)
+                print(mask_until, unmask_until)
+                assert elem.loss_mask[Pos, mask_until:unmask_until].all()
