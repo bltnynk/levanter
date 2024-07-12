@@ -55,7 +55,7 @@ class LlamaConfig(HFCompatConfig):
         rope_scaling (Dict, optional): dict containing the scaling configuration for the Rotary Positional Embedding.
     """
 
-    seq_len: int = 2048
+    seq_len: int = 4096
     hidden_dim: int = 4096
     intermediate_dim: int = 11008
     num_layers: int = 32

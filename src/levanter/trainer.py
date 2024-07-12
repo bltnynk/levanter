@@ -394,6 +394,18 @@ class Trainer:
 
             levanter.tracker.log_metrics({"throughput/loading_time": loading_time()}, step=info.step)
 
+            if self.config.max_loss is not None and info.loss > self.config.max_loss:
+                logger.info(f"Stopping training because loss {info.loss} exceeded max loss {self.config.max_loss}")
+                levanter.tracker.log_summary(
+                    {
+                        "diverged": True,
+                        "final_loss": info.loss,
+                        "final_step": info.step,
+                        "max_loss": self.config.max_loss,
+                    }
+                )
+                break
+
             yield info
 
     def train(self, state: S, train_loader: Iterable[X], run_hooks: bool = True) -> StepInfo[S]:
@@ -596,6 +608,9 @@ class TrainerConfig:
 
     # whether or not to shutdown the tpu at exit. If a float, shutdown after that many seconds. True = 5 minutes
     shutdown_at_exit: Union[bool, float] = False
+
+    # Maximum loss to stop training.
+    max_loss: Optional[float] = None
 
     @property
     def TrainBatch(self):

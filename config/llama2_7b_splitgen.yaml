@@ -4,6 +4,7 @@ data:
   tokenizer: "meta-llama/Llama-2-7b-hf"
 # Baseline loss is 1.780719581246376
 model:
+  seq_len: 4096
   r: 64
   attn_backend: splash
   tokenizer: "meta-llama/Llama-2-7b-hf"
@@ -12,6 +13,7 @@ model:
 # use_hf_model_config: true
 initialize_from_hf: "meta-llama/Llama-2-7b-hf"
 skip_after_k_tokens: 64
+eval_loss_mask_after_k_tokens: 64
 full_ft: False
 trainer:
   tracker:
@@ -20,14 +22,17 @@ trainer:
     tags: ["slimpj", "llamasg"]
 
   mp: p=f32,c=bfloat16
-  train_batch_size: 768 # 3.1m tokens per batch
-  num_train_steps: 1330 # 4b tokens
+  train_batch_size: 1024 # 4m tokens per batch
+  num_train_steps: 476 # 2b tokens
   steps_per_eval: 50
+  per_device_parallelism: 8
   tensor_parallel_axes: ["mlp", "heads"]
   fsdp_axis: "embed"
   batch_axis: "batch"
+  max_loss: 3.2
 optimizer:
   learning_rate: 6E-4
   weight_decay: 0.1
   min_lr_ratio: 0.1
-  lr_schedule: "constant"
+  warmup: 0.05
+  lr_schedule: "cosine"

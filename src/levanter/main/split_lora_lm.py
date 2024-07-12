@@ -167,7 +167,8 @@ def main(config: TrainLmConfig):
         flops_per_token = config.model.flops_per_token(vocab_size)
         # 2x the flops, because we compute backprop of the inputs and the fwd pass.
         # assume the LoRA gradients/flops are really small
-        flops_per_example = 2 * flops_per_token * Pos.size if flops_per_token is not None else None
+        multiplier = 3 if config.full_ft else 2
+        flops_per_example = multiplier * flops_per_token * Pos.size if flops_per_token is not None else None
         trainer.add_hook(
             callbacks.log_performance_stats(Pos.size, trainer.config.train_batch_size, flops_per_example), every=1
         )
