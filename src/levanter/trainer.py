@@ -404,6 +404,7 @@ class Trainer:
                         "max_loss": self.config.max_loss,
                     }
                 )
+                yield info
                 break
 
             yield info

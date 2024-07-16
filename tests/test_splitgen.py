@@ -40,7 +40,7 @@ def small_cfg(hf_test=True):
             num_heads=4,
             num_layers=32,
             num_kv_heads=4,
-            skip_indices=[1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31],
+            skip_indices=[23, 25, 27, 29, 31],
             attn_backend="jax_flash",
         )
         return cfg, None
