@@ -29,7 +29,7 @@ trainer:
   tensor_parallel_axes: ["mlp", "heads"]
   fsdp_axis: "embed"
   batch_axis: "batch"
-  max_loss: 3.2
+  max_loss: 4.5
 optimizer:
   learning_rate: 6E-4
   weight_decay: 0.1
