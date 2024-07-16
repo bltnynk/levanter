@@ -4,7 +4,7 @@ data:
   tokenizer: "meta-llama/Llama-2-7b-hf"
 model:
   type: llama
-  seq_len: 4096
+  seq_len: 2048
   hidden_dim: 896
   intermediate_dim: 2240
   num_heads: 7
@@ -17,9 +17,9 @@ trainer:
     project: "levanter"
     tags: ["lrsweep"]
   mp: p=f32,c=bfloat16
-  train_batch_size: 32
-  num_train_steps: 100
-  steps_per_eval: 50
+  train_batch_size: 512 # 1m tokens per batch
+  num_train_steps: 3700 # 3.8B tokens, 20 tokens/param
+  steps_per_eval: 100
   fsdp_axis: null
   batch_axis: "batch"
   checkpointer:
