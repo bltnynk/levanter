@@ -131,8 +131,47 @@ def _unify_model_and_model_init(model: Optional[M], model_init: Optional[Callabl
     return model_init
 
 
+class DivergenceDetector:
+    previous_losses: List[float]
+    threshold: float
+    patience: int
+    diverged: bool
+
+    def __init__(self, threshold=0.2, patience=10):
+        self.previous_losses = []
+        self.threshold = threshold
+        self.patience = patience
+        self.diverged = False
+        assert self.patience > 0
+        assert self.threshold > 0
+
+    def update(self, new_loss):
+        self.previous_losses.append(new_loss)
+        if len(self.previous_losses) > self.patience:
+            self.previous_losses.pop(0)
+
+    def check_divergence(self, new_loss: float) -> bool:
+        assert isinstance(new_loss, float)
+        if self.diverged:
+            return True
+        self.update(new_loss)
+
+        if len(self.previous_losses) < self.patience:
+            return False  # Not enough data to make a decision
+
+        recent_losses = self.previous_losses[-self.patience :]
+        avg_loss = sum(recent_losses) / len(recent_losses)
+
+        if new_loss > avg_loss * (1 + self.threshold):
+            self.diverged = True
+            return True  # Divergence detected
+
+        return False
+
+
 class Trainer:
     config: "TrainerConfig"
+    divergence_detector: DivergenceDetector
     optimizer: GradientTransformation
     hooks: TrainerHooks
     tracker: levanter.tracker.Tracker
@@ -177,6 +216,7 @@ class Trainer:
             self._add_default_hooks()
 
         self._cmanagers = []
+        self.divergence_detector = DivergenceDetector(config.divergence_patience, config.divergence_patience)
 
     @cached_property
     def loss_fn(self):
@@ -396,6 +436,14 @@ class Trainer:
 
             yield info
 
+            already_diverged = self.divergence_detector.diverged
+            diverged = self.divergence_detector.check_divergence(info.loss)
+            if diverged:
+                if not already_diverged:
+                    levanter.tracker.log_summary({"diverged": True})
+                if self.config.exit_on_divergence:
+                    return
+
     def train(self, state: S, train_loader: Iterable[X], run_hooks: bool = True) -> StepInfo[S]:
         """
         Performs training until the number of steps is reached.
@@ -596,6 +644,11 @@ class TrainerConfig:
 
     # whether or not to shutdown the tpu at exit. If a float, shutdown after that many seconds. True = 5 minutes
     shutdown_at_exit: Union[bool, float] = False
+
+    # divergence detection
+    exit_on_divergence: bool = False
+    divergence_threshold: float = 0.2
+    divergence_patience: int = 15
 
     @property
     def TrainBatch(self):

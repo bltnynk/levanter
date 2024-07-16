@@ -1,24 +1,26 @@
 data:
-  train_urls:
-    - "gs://pubmed-mosaic/openwebtext-sharded/openwebtext_train.{1..128}-of-128.jsonl.gz"
-  validation_urls:
-    - "gs://pubmed-mosaic/openwebtext-sharded/openwebtext_val.{1..8}-of-8.jsonl.gz"
-  cache_dir: "gs://levanter-data/tokenized/openwebtext_llama/"
-  tokenizer: "meta-llama/Llama-2-70b-hf"
+  id: "DKYoon/SlimPajama-6B"
+  cache_dir: "gs://levanter-will-data/tokenized/llama2-slimpj/"
+  tokenizer: "meta-llama/Llama-2-7b-hf"
 model:
   type: llama
-  hidden_dim: 32
-  num_heads: 4
-  num_kv_heads: 4
-  num_layers: 2
+  seq_len: 4096
+  hidden_dim: 896
+  intermediate_dim: 2240
+  num_heads: 7
+  num_kv_heads: 7
+  num_layers: 18
+  tie_word_embeddings: true
+  attn_backend: splash
 trainer:
   tracker:
     project: "levanter"
-    tags: ["openwebtext", "llama"]
-  mp: p=f32
+    tags: ["lrsweep"]
+  mp: p=f32,c=bfloat16
   train_batch_size: 32
   num_train_steps: 100
   steps_per_eval: 50
-  tensor_parallel_axes: ["mlp", "heads"]
-  fsdp_axis: "embed"
+  fsdp_axis: null
   batch_axis: "batch"
+  checkpointer:
+    save_interval: 2h

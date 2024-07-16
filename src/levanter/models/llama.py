@@ -83,6 +83,8 @@ class LlamaConfig(HFCompatConfig):
     reference_checkpoint: str = "meta-llama/Llama-2-7b-hf"
     tokenizer: Optional[str] = None
 
+    tie_word_embeddings: bool = False
+
     # Axis
     Pos = property(lambda self: Axis(name="position", size=self.seq_len))
     KeyPos = property(lambda self: self.Pos.alias("key_position"))
@@ -121,6 +123,7 @@ class LlamaConfig(HFCompatConfig):
             layer_norm_epsilon=hf_config.rms_norm_eps,
             rope_scaling=hf_config.rope_scaling,
             rope_theta=hf_config.rope_theta,
+            tie_word_embeddings=hf_config.tie_word_embeddings,
         )
 
     def to_hf_config(self, vocab_size: int, config_overrides: Optional[Dict] = None) -> HfLlamaConfig:
@@ -149,6 +152,7 @@ class LlamaConfig(HFCompatConfig):
             rope_scaling=self.rope_scaling,
             vocab_size=vocab_size,
             rope_theta=self.rope_theta,
+            tie_word_embeddings=self.tie_word_embeddings,
             **config_overrides,
         )
 
@@ -513,7 +517,7 @@ class LlamaEmbedding(StateDictSerializationMixin, eqx.Module):
 class LlamaLMHeadModel(eqx.Module, LmHeadModel[LlamaConfig], StateDictSerializationMixin):
     transformer: LlamaTransformer
     embeddings: LlamaEmbedding
-    lm_head: hnn.Linear
+    lm_head: Optional[hnn.Linear]
 
     @property
     def config(self):
@@ -532,7 +536,10 @@ class LlamaLMHeadModel(eqx.Module, LmHeadModel[LlamaConfig], StateDictSerializat
         k_t, k_emb = jrandom.split(key, 2)
         transformer = LlamaTransformer.init(config, key=k_t)
         embeddings = LlamaEmbedding.init(Vocab, config, key=k_emb)
-        lm_head = hnn.Linear.init(In=config.Embed, Out=Vocab, key=k_emb, use_bias=False, out_first=True)
+        if not config.tie_word_embeddings:
+            lm_head = hnn.Linear.init(In=config.Embed, Out=Vocab, key=k_emb, use_bias=False, out_first=True)
+        else:
+            lm_head = None
         return LlamaLMHeadModel(transformer, embeddings, lm_head)
 
     def __call__(
@@ -553,15 +560,22 @@ class LlamaLMHeadModel(eqx.Module, LmHeadModel[LlamaConfig], StateDictSerializat
         k_t, k_head = maybe_rng_split(key, 2)
         x = self.embeddings.embed(input_ids)
         x = self.transformer(x, attn_mask=attn_mask, key=k_t)
-        lm_logits = self.lm_head(x, key=k_head)
+        if self.config.tie_word_embeddings:
+            lm_logits = self.embeddings.unembed(x)
+        else:
+            assert self.lm_head is not None
+            lm_logits = self.lm_head(x, key=k_head)
         return lm_logits
 
     def resize_vocab(self, new_size: int, key=None) -> "LmHeadModel[LlamaConfig]":
         new_Vocab = self.Vocab.resize(new_size)
         k1, k2 = maybe_rng_split(key, 2)
         new_embeddings = self.embeddings.resize_embeddings(new_size, key=k1)
-        new_lm_matrix = hax.tree_util.resize_axis(self.lm_head.weight, self.Vocab, new_size, key=k2)
-        new_lm_head = dataclasses.replace(self.lm_head, Out=new_Vocab, weight=new_lm_matrix)
+        if self.lm_head is not None:
+            new_lm_matrix = hax.tree_util.resize_axis(self.lm_head.weight, self.Vocab, new_size, key=k2)
+            new_lm_head = dataclasses.replace(self.lm_head, Out=new_Vocab, weight=new_lm_matrix)
+        else:
+            new_lm_head = None
 
         return dataclasses.replace(self, embeddings=new_embeddings, lm_head=new_lm_head)
 
