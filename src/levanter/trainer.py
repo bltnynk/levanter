@@ -162,8 +162,9 @@ class DivergenceDetector:
         recent_losses = self.previous_losses[-self.patience :]
         avg_loss = sum(recent_losses) / len(recent_losses)
 
-        if new_loss > avg_loss * (1 + self.threshold):
+        if new_loss > (avg_loss + self.threshold):
             self.diverged = True
+            print(f"New loss: {new_loss}, avg: {avg_loss}, mult: {avg_loss * (1+self.threshold)}, diverged")
             return True  # Divergence detected
 
         return False
@@ -448,10 +449,11 @@ class Trainer:
         """
         Performs training until the number of steps is reached.
         """
+        info = None
         for info in self.training_steps(state, train_loader, run_hooks=run_hooks):
             pass
 
-        if run_hooks:
+        if info is not None and run_hooks:
             # force hooks to run at the end
             self.run_hooks(info, force=True)
 

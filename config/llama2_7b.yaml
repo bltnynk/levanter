@@ -1,11 +1,9 @@
 data:
-  train_urls:
-    - "gs://pubmed-mosaic/openwebtext-sharded/openwebtext_train.{1..128}-of-128.jsonl.gz"
-  validation_urls:
-    - "gs://pubmed-mosaic/openwebtext-sharded/openwebtext_val.{1..8}-of-8.jsonl.gz"
-  cache_dir: "gs://levanter-data/tokenized/openwebtext_llama/"
-  tokenizer: "meta-llama/Llama-2-70b-hf"
+  id: "DKYoon/SlimPajama-6B"
+  cache_dir: "gs://levanter-will-data/tokenized/llama2-slimpj/"
+  tokenizer: "meta-llama/Llama-2-7b-hf"
 model:
+  attn_backend: splash
   type: llama
 # TODO: uncomment this once we resolve the resource exhaustion issue
 # initialize_from_hf: "meta-llama/Llama-2-7b-hf"
@@ -17,13 +15,15 @@ trainer:
     tags: ["openwebtext", "llama"]
 
   mp: p=f32,c=bfloat16
-  train_batch_size: 256  # set for v4-64 TPU
-  num_train_steps: 1000
+  train_batch_size: 256 # set for v4-64 TPU
+  num_train_steps: 20
   steps_per_eval: 50
   tensor_parallel_axes: ["mlp", "heads"]
-  fsdp_axis: "embed"
+  fsdp_axis: None
   batch_axis: "batch"
+  profiler: True
+  profiler_num_steps: 10
 optimizer:
-  learning_rate: 1.2E-5  # set low for fine-tuning
+  learning_rate: 1.2E-5 # set low for fine-tuning
   weight_decay: 0.1
   min_lr_ratio: 0.1

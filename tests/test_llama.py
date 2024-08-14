@@ -389,3 +389,17 @@ def test_state_dict_consistency(scan_layers, num_kv_heads):
     print(hf_model.state_dict().keys())
     print(model.to_state_dict().keys())
     assert set(hf_model.state_dict().keys()) == set(model.to_state_dict().keys())
+
+
+def test_num_params():
+    config = LlamaConfig(
+        seq_len=4096,
+        hidden_dim=896,
+        intermediate_dim=2240,
+        num_heads=14,
+        num_layers=18,
+        num_kv_heads=14,
+        tie_word_embeddings=True,
+    )
+    model = LlamaLMHeadModel.init(hax.Axis("vocab", 32000), config, key=random.PRNGKey(0))
+    assert parameter_count(model) / 1e6 < 195

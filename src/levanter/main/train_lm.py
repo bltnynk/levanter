@@ -215,8 +215,14 @@ def main(config: TrainLmConfig):
                 next(train_loader)
 
         ## OK, actually run training!
-        trainer.train(state, train_loader)
+        info = trainer.train(state, train_loader)
         # checkpointer.on_step(last_step, force=True)
+        if trainer.divergence_detector.diverged and config.trainer.exit_on_divergence:
+            logger.error("Exiting due to divergence")
+        else:
+            ckpt = trainer.config.checkpointer.create(trainer.run_id)
+            ckpt.on_step(info, force=True)
+            ckpt.wait_until_finished()
 
 
 if __name__ == "__main__":
