@@ -6,6 +6,7 @@ import functools
 import json
 import logging
 import os
+import random
 import warnings
 from dataclasses import dataclass
 from functools import cached_property
@@ -1338,3 +1339,148 @@ class ChatJsonlDataSource(JsonlDataSource):
 
                     yield {"input": input_msg, "output": output_msg}
                 i += 1
+
+
+CANONICAL_REPO_NAME_FIELD = "repo_name"
+CANONICAL_FILES_FIELD = "files"
+CANONICAL_FILE_PATH_FIELD = "path"
+CANONICAL_FILE_CONTENT_FIELD = "content"
+CANONICAL_ID_FIELD = "blob_id"
+
+
+@dataclass(frozen=True)
+class FIMUrlSourceConfig:
+    cache_dir: str
+    train_urls: list[str] = dataclasses.field(default_factory=list)
+    validation_urls: list[str] = dataclasses.field(default_factory=list)
+
+    repo_level_percentage = 0.0
+    repo_name_field: str = CANONICAL_REPO_NAME_FIELD
+    files_field: str = CANONICAL_FILES_FIELD
+    file_path_field: str = CANONICAL_FILE_PATH_FIELD
+    file_content_field: str = CANONICAL_FILE_CONTENT_FIELD
+    id_field: str = CANONICAL_ID_FIELD
+
+    prefix_token: str = "<|fim_prefix|>"
+    middle_token: str = "<|fim_middle|>"
+    suffix_token: str = "<|fim_suffix|>"
+    repo_name_token: str = "<|repo_name|>"
+    file_sep_token: str = "<|file_sep|>"
+    eos_token: str = "<|endoftext|>"
+    """The overall prompt format is:
+    <|repo_name|>repo name\n
+    <|file_sep|>filename.py\n
+    mycode = x
+    <|file_sep|>target_file.py\n
+    <|fim_prefix|>all of the code goes here now except for<|fim_suffix|>which is pretty neat<|fim_middle|>the middle
+    """
+
+    def get_shard_source(self, split: str) -> Optional[ShardedDataSource[str]]:
+        urls = self.train_urls if split == "train" else self.validation_urls
+        if not urls:
+            return None
+
+        urls = [globbed for url in urls for globbed in expand_glob(url)]
+
+        source = UrlDataSource(urls, columns=[self.repo_name_field, self.files_field])
+
+        def make_entry(x) -> str:
+            files = x[self.files_field]
+            assert len(files) > 0, f"No files found in {x[self.file_path_field]}"
+            hash_input = files[0][self.id_field]
+            rand = random.Random(hash(hash_input))
+            is_repo_level = len(files) > 1 and (rand.random() < self.repo_level_percentage)
+            file = files[rand.choice(range(len(files)))]
+            file_len = len(file[self.file_content_field])
+            i0 = rand.randint(0, file_len - 1)
+            i1 = rand.randint(0, file_len - 1)
+            while i1 == i0:
+                i1 = rand.randint(0, file_len - 1)
+            i0, i1 = min(i0, i1), max(i0, i1) + 1
+            content = file[self.file_content_field]
+            prefix = content[:i0]
+            middle = content[i0:i1]
+            suffix = content[i1:]
+            to_join = []
+            if is_repo_level:
+                to_join = [self.repo_name_token, x[self.repo_name_field], "\n"]
+                for f in files:
+                    to_join.extend([self.file_sep_token, f[self.file_path_field], "\n", f[self.file_content_field]])
+
+            to_join.extend(
+                [self.prefix_token, prefix, self.suffix_token, suffix, self.middle_token, middle, self.eos_token]
+            )
+            return "".join(to_join)
+
+        return source.map(make_entry)
+
+
+def _preprocess_fim_example(batch: Sequence[str], tokenizer: PreTrainedTokenizerBase, middle_token_id: int) -> dict:
+    tokenized = tokenizer(batch, padding=False, truncation=True)
+    tokenized = [np.array(ids, dtype=np.int32) for ids in tokenized["input_ids"]]
+    middle_idxs = [np.where(ids == middle_token_id)[0][0].astype(np.int32) for ids in tokenized]
+    return {
+        "input_ids": tokenized,
+        "middle_idxs": middle_idxs,
+        "lens": np.array([len(ids) for ids in tokenized], dtype=np.int32),
+    }
+
+
+def _mk_fim_example_jit(Pos, input_ids: hax.NamedArray, middle_idxs: hax.NamedArray, lens: hax.NamedArray):
+    # mask out padding and anything before the start of the target
+    loss_mask = hax.arange(Pos) >= middle_idxs  # predict the token after the <|fim_middle|> marker
+    loss_mask &= hax.arange(Pos) < lens - 1  # the len-1 token is the eos token, so we don't predict that
+    return LmExample.causal(input_ids, loss_mask=loss_mask)
+
+
+def _prepare_fim_examples(ex: list[dict], tokenizer: PreTrainedTokenizerBase, Pos: hax.Axis) -> list[LmExample]:
+    middles = np.array([ex["middle_idxs"] for ex in ex])
+    lens = np.array([ex["lens"] for ex in ex])
+
+    ex_pad = tokenizer.pad(
+        ex,
+        padding="max_length",
+        max_length=Pos.size,
+    )
+
+    input_ids = ex_pad["input_ids"]
+    truncated = [ids[-Pos.size :] for ids in input_ids]
+
+    out = []
+    for ids, mids, lens in zip(truncated, middles, ex_pad["lens"]):
+        causal = _mk_fim_example_jit(Pos, hax.named(ids, Pos), mids, lens)
+
+        out.append(causal)
+
+    return out
+
+
+def mk_fim_dataset(
+    config: FIMUrlSourceConfig,
+    split: str,
+    tokenizer: HfTokenizer,
+    Pos: hax.Axis,
+) -> AsyncDataset[LmExample]:
+
+    source = config.get_shard_source(split)
+
+    output_exemplar = {
+        "input_ids": np.zeros((0,), dtype=np.int32),
+        "middle_idxs": np.zeros((0,), dtype=np.int32),
+        "lens": np.zeros((0,), dtype=np.int32),
+    }
+
+    middle_token_id = tokenizer.convert_tokens_to_ids(config.middle_token)
+    dataset = source.map_batches(  # type: ignore
+        lambda ex: _preprocess_fim_example(ex, tokenizer, middle_token_id),
+        batch_size=128,
+        num_cpus=num_cpus_used_by_tokenizer(tokenizer),
+        output_exemplar=output_exemplar,
+    )
+
+    cached_dataset: AsyncDataset[dict] = dataset.build_or_load_cache(config.cache_dir, await_finished=True)
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    return cached_dataset.map_batches(lambda ex: _prepare_fim_examples(ex, tokenizer, Pos))
