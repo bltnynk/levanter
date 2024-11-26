@@ -1350,7 +1350,8 @@ CANONICAL_ID_FIELD = "blob_id"
 
 @dataclass(frozen=True)
 class FIMUrlSourceConfig:
-    cache_dir: str
+    cache_dir: str = "cache/"
+    tokenizer: str = "Qwen/Qwen2.5-Coder-1.5B"
     train_urls: list[str] = dataclasses.field(default_factory=list)
     validation_urls: list[str] = dataclasses.field(default_factory=list)
 
@@ -1413,6 +1414,10 @@ class FIMUrlSourceConfig:
             return "".join(to_join)
 
         return source.map(make_entry)
+
+    @property
+    def the_tokenizer(self) -> HfTokenizer:
+        return load_tokenizer(self.tokenizer)
 
 
 def _preprocess_fim_example(batch: Sequence[str], tokenizer: PreTrainedTokenizerBase, middle_token_id: int) -> dict:

@@ -1,5 +1,6 @@
+import dataclasses
 from dataclasses import dataclass
-from typing import Dict, Optional, Type
+from typing import Dict, Optional, Type, Union
 
 import equinox as eqx
 import jax.numpy as jnp
@@ -269,6 +270,18 @@ class QwenLMHeadModel(LmHeadModel[QwenConfig], ModuleWithStateDictSerialization)
     embeddings: LlamaEmbedding  # Can reuse Llama embeddings
     lm_head: Optional[hnn.Linear]
 
+    @property
+    def config(self):
+        return self.transformer.config
+
+    @property
+    def vocab_size(self) -> int:
+        return self.Vocab.size
+
+    @property
+    def Vocab(self) -> Axis:
+        return self.embeddings.Vocab
+
     @classmethod
     def init(cls, Vocab: Axis, config: QwenConfig, *, key) -> "QwenLMHeadModel":
         k_t, k_emb = jrandom.split(key, 2)
@@ -280,3 +293,66 @@ class QwenLMHeadModel(LmHeadModel[QwenConfig], ModuleWithStateDictSerialization)
             lm_head = hnn.Linear.init(In=config.Embed, Out=Vocab, key=k_emb, use_bias=False, out_first=True)
 
         return QwenLMHeadModel(transformer, embeddings, lm_head)
+
+    def __call__(
+        self,
+        input_ids: NamedArray,
+        attn_mask: Optional[Union[NamedArray, AttentionMask]] = None,
+        *,
+        key=None,
+    ) -> NamedArray:
+        """
+        Args:
+            input_ids (NamedArray): [batch, position]
+                Indices of input sequence tokens in the vocabulary.
+            attn_mask (Union[NamedArray, AttentionMask], optional): [batch, position]
+                Mask to avoid performing attention on the padding token indices of the encoder input.
+                The attn_mask from training pipeline may be an AttentionMask object instead of NamedArray
+        """
+        k_t, k_head = maybe_rng_split(key, 2)
+        x = self.embeddings.embed(input_ids)
+        x = self.transformer(x, attn_mask=attn_mask, key=k_t)
+        if self.lm_head:
+            lm_logits = self.lm_head(x, key=k_head)
+        else:
+            lm_logits = self.embeddings.unembed(x)
+        return lm_logits
+
+    def activations(
+        self, input_ids: NamedArray, attn_mask: Optional[AttentionMask | NamedArray] = None, *, key=None
+    ) -> NamedArray:
+        """
+        Compute the activations for the next token in a sequence.
+        Args:
+            input_ids: token IDs with shape {Pos}
+            attn_mask: attention mask with shape {Pos, KeyPos}
+            key: PRNGKey for random number generation
+
+        Returns:
+            NamedArray: activations with shape {Pos, Embed}
+
+        """
+        x = self.embeddings.embed(input_ids)
+        x = self.transformer(x, attn_mask=attn_mask, key=key)
+
+        return x
+
+    def get_lm_head(self) -> hax.NamedArray:
+        if self.lm_head is None:
+            return self.embeddings.token_embeddings.weight
+        else:
+            return self.lm_head.weight
+
+    def resize_vocab(self, new_size: int, key=None) -> "LmHeadModel[LlamaConfig]":
+        new_Vocab = self.Vocab.resize(new_size)
+        k1, k2 = maybe_rng_split(key, 2)
+        new_embeddings = self.embeddings.resize_embeddings(new_size, key=k1)
+        if self.lm_head is not None:
+            new_lm_matrix = hax.tree_util.resize_axis(self.lm_head.weight, self.Vocab, new_size, key=k2)
+            new_lm_head = dataclasses.replace(self.lm_head, Out=new_Vocab, weight=new_lm_matrix)
+            return dataclasses.replace(self, embeddings=new_embeddings, lm_head=new_lm_head)
+        else:
+            return dataclasses.replace(self, embeddings=new_embeddings)
+
+    def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
+        return {"transformer": "model", "embeddings": None}
