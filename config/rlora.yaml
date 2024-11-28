@@ -1,0 +1,40 @@
+data:
+  train_urls:
+    - "gs://usc-stack-v2/shard1_150.jsonl.gz"
+  cache_dir: "gs://usc2-datacache/shard1_150_tokenized"
+  tokenizer: "Qwen/Qwen2.5-Coder-1.5B"
+model:
+  seq_len: 32768
+  hidden_dim: 1536
+  intermediate_dim: 8960
+  num_heads: 12
+  num_layers: 28
+  num_kv_heads: 2
+  layer_norm_epsilon: 1e-6
+  rope:
+    type: default
+    theta: 1000000
+  tie_word_embeddings: true
+
+  use_flash_attention: True
+  flash_attention_block_size: 512
+  use_bias: false
+  use_layer_norm_weight: false
+  disable_lora_mask: false
+
+  num_loras: 64
+  lora_rank: 16
+  top_k: 4
+
+trainer:
+  tracker:
+    type: wandb
+    project: "levanter-rlora"
+    tags: ["testing", "qwen"]
+  mp: p=f32,c=bfloat16
+  train_batch_size: 4
+  num_train_steps: 100
+  steps_per_eval: 50
+  tensor_parallel_axes: ["mlp", "heads"]
+  fsdp_axis: "embed"
+  batch_axis: "batch"

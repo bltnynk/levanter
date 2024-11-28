@@ -134,6 +134,8 @@ class RQwenConfig(LlamaConfig):
     num_loras: int = 64
     lora_rank: int = 16
     top_k: int = 4
+    disable_lora_mask: bool = False
+
     Loras = property(lambda self: Axis("loras", self.num_loras))
     LoraRank = property(lambda self: Axis("lora_rank", self.lora_rank))
 
@@ -556,6 +558,8 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         seq_mask = seq_mask.broadcast_to([Batch, Pos, Loras])
         lora_mask = lora_mask * seq_mask
 
+        if self.config.disable_lora_mask:
+            lora_mask = None
         return self(input_ids, attn_mask=attn_mask, lora_mask=lora_mask, key=key)
 
     def get_lm_head(self) -> hax.NamedArray:

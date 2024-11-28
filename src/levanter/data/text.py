@@ -1421,13 +1421,27 @@ class FIMUrlSourceConfig:
 
 
 def _preprocess_fim_example(batch: Sequence[str], tokenizer: PreTrainedTokenizerBase, middle_token_id: int) -> dict:
-    tokenized = tokenizer(batch, padding=False, truncation=True)
+    tokenized = tokenizer(batch, padding=False)
     tokenized = [np.array(ids, dtype=np.int32) for ids in tokenized["input_ids"]]
-    middle_idxs = [np.where(ids == middle_token_id)[0][0].astype(np.int32) for ids in tokenized]
+    input_ids = []
+    middle_idxs = []
+    for i, elem in enumerate(tokenized):
+        if len(elem) > tokenizer.model_max_length:
+            continue
+        middle_idx = np.where(elem == middle_token_id)[0]
+        if len(middle_idx) == 0:
+            with open("fim_error.txt", "w") as f:
+                f.write(str(batch[i]))
+            raise ValueError(f"No middle token ({middle_token_id}) found in {batch[i]}")
+        if len(middle_idx) > 1:
+            raise ValueError(f"Multiple middle tokens ({middle_token_id}) found in {batch[i]}")
+        middle_idxs.append(middle_idx[0].astype(np.int32))
+        input_ids.append(elem)
+
     return {
-        "input_ids": tokenized,
+        "input_ids": input_ids,
         "middle_idxs": middle_idxs,
-        "lens": np.array([len(ids) for ids in tokenized], dtype=np.int32),
+        "lens": np.array([len(ids) for ids in input_ids], dtype=np.int32),
     }
 
 
