@@ -1,3 +1,4 @@
+initialize_from_hf: "Qwen/Qwen2.5-Coder-1.5B"
 data:
   train_urls:
     - "gs://usc-stack-v2/shard1_150.jsonl.gz"
@@ -16,10 +17,10 @@ model:
     theta: 1000000
   tie_word_embeddings: true
 
-  use_flash_attention: True
+  use_flash_attention: true
   flash_attention_block_size: 512
   use_bias: false
-  use_layer_norm_weight: false
+  use_layer_norm_weight: true
   disable_lora_mask: false
 
   num_loras: 64

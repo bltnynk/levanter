@@ -119,7 +119,18 @@ class RLoraLinear(ModuleWithStateDictSerialization):
         return output
 
     def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
-        return {"linear.bias": "bias", "linear.weight": "weight"}
+        return {"linear": None}
+
+    def from_state_dict(self, state_dict, prefix=None):
+        fsd = ModuleWithStateDictSerialization.from_state_dict
+        if prefix is not None and prefix + ".low_rank_linear.lora_a" not in state_dict:
+            print("Skipping lora load")
+            low_rank_linear = self.low_rank_linear
+            self = dataclasses.replace(self, low_rank_linear=None)
+            self = fsd(self, state_dict, prefix)
+            self = dataclasses.replace(self, low_rank_linear=low_rank_linear)
+            return self
+        return fsd(self, state_dict, prefix)
 
 
 @LmConfig.register_subclass("rlora_qwen")
@@ -581,3 +592,14 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
 
     def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
         return {"transformer": "model", "embeddings": None}
+
+    def from_state_dict(self, state_dict, prefix=None):
+        fsd = ModuleWithStateDictSerialization.from_state_dict
+        if "router.weight" not in state_dict:
+            print("Skipping router init")
+            router = self.router
+            self = dataclasses.replace(self, router=None)
+            self = fsd(self, state_dict, prefix)
+            self = dataclasses.replace(self, router=router)
+            return self
+        return fsd(self, state_dict, prefix)
