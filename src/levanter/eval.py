@@ -165,6 +165,7 @@ def cb_tagged_lm_evaluate(
     max_examples_per_dataset: Optional[int] = None,
     prefix: str = "eval",
     mp: jmp.Policy = None,
+    loss_fn=compute_next_token_loss,
 ) -> Callable[[StepInfo], EvalResult]:
     """
     Evaluates multiple tagged datasets using a given evaluation function.
@@ -189,7 +190,14 @@ def cb_tagged_lm_evaluate(
     """
 
     evaluator = TaggedEvaluator(
-        EvalBatch, tagged_eval_sets, tokenizer, device_mesh, axis_mapping, max_examples_per_dataset, mp=mp
+        EvalBatch,
+        tagged_eval_sets,
+        tokenizer,
+        device_mesh,
+        axis_mapping,
+        max_examples_per_dataset,
+        mp=mp,
+        loss_fn=loss_fn,
     )
 
     def eval_callback(step: StepInfo):
@@ -266,6 +274,7 @@ class TaggedEvaluator:
         axis_mapping=None,
         max_examples_per_dataset=None,
         mp: Optional[jmp.Policy] = None,
+        loss_fn=compute_next_token_loss,
     ):
         self.EvalBatch = EvalBatch
         self.dataset = DomainTaggedDataset(tagged_eval_sets, max_examples_per_dataset)
@@ -301,7 +310,7 @@ class TaggedEvaluator:
                 m = self.mp.cast_to_compute(m)
 
             with hax.axis_mapping(axis_mapping):
-                losses = compute_next_token_loss(m, batch, reduction=None, reduction_axis=())
+                losses = loss_fn(m, batch, reduction=None, reduction_axis=())
                 mask = batch.loss_mask  # [Batch, Pos]
                 this_tokens = hax.sum(mask)
                 this_loss = hax.einsum("->", losses, mask)  # to scalar

@@ -48,6 +48,26 @@ class LmExample(eqx.Module):
         return LmExample(tokens=tokens, loss_mask=loss_mask, attn_mask=attn_mask)
 
 
+class RoutableLmExample(LmExample):
+    router_hs_idxs: Optional[hax.NamedArray] = None
+
+    @staticmethod
+    def causal(
+        tokens: hax.NamedArray,
+        router_hs_idxs: Optional[hax.NamedArray] = None,
+        *,
+        loss_mask: Optional[hax.NamedArray] = None,
+        ignore_id: Optional[int] = None,
+    ) -> "RoutableLmExample":
+        lm_example = LmExample.causal(tokens, loss_mask=loss_mask, ignore_id=ignore_id)
+        return RoutableLmExample(
+            tokens=lm_example.tokens,
+            loss_mask=lm_example.loss_mask,
+            attn_mask=lm_example.attn_mask,
+            router_hs_idxs=router_hs_idxs,
+        )
+
+
 # TODO: for some reason, mypy doesn't like the discover_packages_path argument?
 @dataclass(frozen=True)
 class LmConfig(draccus.PluginRegistry, abc.ABC, Generic[LmT], discover_packages_path="levanter.models"):  # type: ignore

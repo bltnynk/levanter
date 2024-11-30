@@ -55,10 +55,10 @@ async def test_fim_url_data():
             # trim the padding
             tokens = e.tokens.array
             last_non_pad = jax.numpy.where(tokens != tokenizer.pad_token_id)[0][-1]
-            text = tokenizer.decode(e.tokens.array[: last_non_pad + 3])
+            text = tokenizer.decode(e.tokens.array[: last_non_pad + 5])
             chars = list(text)
             remap = tokenizer(text)
-            for token_idx, masked in enumerate(e.loss_mask.array[: last_non_pad + 3]):
+            for token_idx, masked in enumerate(e.loss_mask.array[: last_non_pad + 5]):
                 cs = remap.token_to_chars(token_idx)
                 if masked:
                     chars[cs.start : cs.end] = [c.upper() for c in chars[cs.start : cs.end]]

@@ -35,7 +35,7 @@ from levanter.data.mixture import MixtureDataset, StopStrategy
 # intercept the logging nonsense here
 from levanter.logging import silence_transformer_nag  # noqa
 from levanter.models.attention import AttentionMask
-from levanter.models.lm_model import LmExample
+from levanter.models.lm_model import LmExample, RoutableLmExample
 from levanter.store.cache import CacheOptions, TreeCache
 from levanter.store.jagged_array import JaggedArrayStore
 from levanter.store.tree_store import TreeStore
@@ -1449,10 +1449,12 @@ def _mk_fim_example_jit(Pos, input_ids: hax.NamedArray, middle_idxs: hax.NamedAr
     # mask out padding and anything before the start of the target
     loss_mask = hax.arange(Pos) >= middle_idxs  # predict the token after the <|fim_middle|> marker
     loss_mask &= hax.arange(Pos) < lens - 1  # the len-1 token is the eos token, so we don't predict that
-    return LmExample.causal(input_ids, loss_mask=loss_mask)
+    return RoutableLmExample.causal(input_ids, router_hs_idxs=middle_idxs, loss_mask=loss_mask)
 
 
-def _prepare_fim_examples(ex: list[dict], tokenizer: PreTrainedTokenizerBase, Pos: hax.Axis) -> list[LmExample]:
+def _prepare_fim_examples(
+    ex: list[dict], tokenizer: PreTrainedTokenizerBase, Pos: hax.Axis
+) -> list[RoutableLmExample]:
     middles = np.array([ex["middle_idxs"] for ex in ex])
     lens = np.array([ex["lens"] for ex in ex])
 
@@ -1479,7 +1481,7 @@ def mk_fim_dataset(
     split: str,
     tokenizer: HfTokenizer,
     Pos: hax.Axis,
-) -> AsyncDataset[LmExample]:
+) -> AsyncDataset[RoutableLmExample]:
 
     source = config.get_shard_source(split)
 

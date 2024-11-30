@@ -1,7 +1,6 @@
 import os
 import tempfile
 
-import jax
 import pytest
 
 import levanter.main.rlora_train as rlora_train
@@ -17,7 +16,10 @@ def test_rlora_train():
     # just testing if train_lm has a pulse
     with tempfile.TemporaryDirectory() as tmpdir:
         test_data_jsonl = tiny_test_corpus.write_fim_data(tmpdir + "/test_data.jsonl", len=2048)
-        cfg = FIMUrlSourceConfig(cache_dir=tmpdir + "/cache", train_urls=[test_data_jsonl])
+        test_validation_jsonl = tiny_test_corpus.write_fim_data(tmpdir + "/test_data_valid.jsonl", len=2048)
+        cfg = FIMUrlSourceConfig(
+            cache_dir=tmpdir + "/cache", train_urls=[test_data_jsonl], validation_urls=[test_validation_jsonl]
+        )
         try:
             config = rlora_train.TrainLmConfig(
                 # initialize_from_hf="Qwen/Qwen2.5-Coder-0.5B",
@@ -38,8 +40,9 @@ def test_rlora_train():
                 ),
                 trainer=rlora_train.TrainerConfig(
                     num_train_steps=2,
-                    train_batch_size=len(jax.devices()),
+                    train_batch_size=2,
                     max_eval_batches=1,
+                    steps_per_eval=1,
                     wandb=WandbConfig(mode="disabled"),
                     require_accelerator=False,
                     ray=RayConfig(auto_start_cluster=False),

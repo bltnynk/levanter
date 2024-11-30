@@ -3,20 +3,23 @@ import functools
 import gc
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Type
 
 import equinox as eqx
+import jax.numpy as jnp
 import jax.random as jrandom
 
-from haliax import Axis
+import haliax as hax
+from haliax import Axis, NamedArray
 from haliax.partitioning import named_jit, round_axis_for_partitioning
 
 import levanter
 from levanter import callbacks
 from levanter.checkpoint import EpochCheckpointer, load_checkpoint
 from levanter.data.text import FIMUrlSourceConfig, mk_fim_dataset
-from levanter.models.lm_model import compute_next_token_loss
-from levanter.models.routed_lora_model import RQwenConfig, lora_trainable_params_filter
+from levanter.models.lm_model import LmExample, RoutableLmExample
+from levanter.models.loss import next_token_loss
+from levanter.models.routed_lora_model import RQwenConfig, RQwenLMHeadModel, lora_trainable_params_filter
 from levanter.optim import AdamConfig, OptimizerConfig
 from levanter.trainer import Trainer, TrainerConfig
 from levanter.utils.jax_utils import parameter_count
@@ -39,6 +42,49 @@ class TrainLmConfig:
     z_loss_weight: float = 0.0
 
 
+def compute_next_token_loss(
+    model: RQwenLMHeadModel,
+    example: LmExample,
+    *,
+    batch_axis: Axis,
+    key=None,
+    reduction: Optional[hax.ReductionFunction] = hax.mean,
+    reduction_axis: Optional[hax.AxisSelection] = None,
+    logsumexp_weight: Optional[float] = None,
+    loss_dtype: Optional[Type[jnp.dtype]] = jnp.float32,
+) -> jnp.ndarray | NamedArray:
+    """
+    Computes the cross-entropy loss for a language modeling example. If reduction is not None, the loss is reduced
+    across the reduction axis (with reduction_axis=None meaning all axes). If reduction is None, the loss is not
+    reduced, and the result is a named array with axes (*batch axes, sequence_length).
+    """
+    assert isinstance(example, RoutableLmExample)
+    # This is problematic, we don't get correctly batched ones so...
+    idxs = jnp.squeeze(example.router_hs_idxs, axis=1)
+    idxs = hax.NamedArray(idxs, (batch_axis,))
+    example = dataclasses.replace(example, router_hs_idxs=idxs)
+    activations = model.routed_forward(
+        batch_axis, example.tokens, example.router_hs_idxs, example.attn_mask, key=key, activations=True
+    )
+
+    loss = next_token_loss(
+        model.Pos,
+        model.Embed,
+        model.Vocab,
+        activations,
+        model.get_lm_head(),
+        example.tokens,
+        loss_mask=example.loss_mask,
+        reduction=reduction,
+        reduction_axis=reduction_axis,
+        logsumexp_weight=logsumexp_weight,
+        dtype=loss_dtype,
+        block_size=model.config.cross_entropy_block_size,
+    )
+
+    return loss
+
+
 def main(config: TrainLmConfig):
     tokenizer = config.data.the_tokenizer
 
@@ -57,7 +103,13 @@ def main(config: TrainLmConfig):
     levanter.initialize(config)
     optimizer = config.optimizer.build(config.trainer.num_train_steps)
 
-    loss_function = functools.partial(compute_next_token_loss, logsumexp_weight=config.z_loss_weight)
+    # some axes we need
+    Batch = config.trainer.TrainBatch
+    Pos = config.model.Pos
+
+    loss_function = functools.partial(
+        compute_next_token_loss, logsumexp_weight=config.z_loss_weight, batch_axis=config.trainer.TrainBatch
+    )
 
     # Using the trainer as a context manager does 3 things:
     # 1. Sets the device mesh
@@ -72,10 +124,6 @@ def main(config: TrainLmConfig):
         # We have two axis_mappings: one for storing the model and optimizer states, and one for compute
         # This allows Zero-3-style parameter sharding, where we shard the parameters and optimizer state across the mesh
         parameter_axis_mapping = trainer.parameter_axis_mapping
-
-        # some axes we need
-        Batch = config.trainer.TrainBatch
-        Pos = config.model.Pos
 
         train_dataset = mk_fim_dataset(config.data, "train", tokenizer, Pos)
 
@@ -146,6 +194,10 @@ def main(config: TrainLmConfig):
         max_eval_examples_per_ds = config.trainer.max_eval_batches
         if max_eval_examples_per_ds is not None:
             max_eval_examples_per_ds *= config.trainer.eval_batch_size
+
+        if len(config.data.validation_urls) > 0:
+            eval_dataset = mk_fim_dataset(config.data, "validation", tokenizer, Pos)
+            trainer.add_eval_hook(eval_dataset)
 
         flops_per_token = config.model.flops_per_token(vocab_size)
         # Doing 3x the flops: 1 to get the router set, 1 w/the loras, 1 for the backprop (+ the loras but that's small)

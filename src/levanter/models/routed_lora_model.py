@@ -542,6 +542,7 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         attn_mask: Optional[NamedArray] = None,
         *,
         key=None,
+        activations: bool = False,
     ) -> NamedArray:
         k_head, k_rout = maybe_rng_split(key, 2)
         Loras, Pos = self.config.Loras, self.config.Pos
@@ -571,6 +572,8 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
 
         if self.config.disable_lora_mask:
             lora_mask = None
+        if activations:
+            return self.activations(input_ids, attn_mask=attn_mask, lora_mask=lora_mask, key=k_head)
         return self(input_ids, attn_mask=attn_mask, lora_mask=lora_mask, key=key)
 
     def get_lm_head(self) -> hax.NamedArray:

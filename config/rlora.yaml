@@ -18,14 +18,15 @@ model:
   tie_word_embeddings: true
 
   use_flash_attention: true
+  attn_backend: jax_flash
   flash_attention_block_size: 512
   use_bias: false
   use_layer_norm_weight: true
   disable_lora_mask: false
 
-  num_loras: 64
-  lora_rank: 16
-  top_k: 4
+  num_loras: 256
+  lora_rank: 4
+  top_k: 16
 
 trainer:
   tracker:
@@ -34,7 +35,7 @@ trainer:
     tags: ["testing", "qwen"]
   mp: p=f32,c=bfloat16
   train_batch_size: 4
-  num_train_steps: 100
+  num_train_steps: 2000
   steps_per_eval: 50
   tensor_parallel_axes: ["mlp", "heads"]
   fsdp_axis: "embed"
