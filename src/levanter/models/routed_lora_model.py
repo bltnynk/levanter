@@ -23,7 +23,6 @@ from levanter.models.gpt2 import ACT2FN
 from levanter.models.llama import LlamaConfig, LlamaEmbedding, LlamaRMSNorm
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.models.rotary import RotaryEmbeddingsConfig
-from levanter.types import BlockFoldable
 from levanter.utils.flop_utils import lm_flops_per_token
 
 
@@ -69,7 +68,7 @@ class LowRankLinear(ModuleWithStateDictSerialization):
 
 def lora_trainable_params_filter(model: eqx.Module) -> Dict[str, jnp.ndarray]:
     def is_lora_param(x):
-        return isinstance(x, LowRankLinear)
+        return isinstance(x, LowRankLinear) or isinstance(x, Router)
 
     return jax.tree_util.tree_map(is_lora_param, model, is_leaf=is_lora_param)
 
@@ -421,16 +420,12 @@ class RQwenDecoderLayer(eqx.Module):
 # Modified transformer for Qwen
 class RQwenTransformer(eqx.Module):
     config: RQwenConfig = eqx.static_field()
-    layers: BlockFoldable[RQwenDecoderLayer]
+    layers: Stacked[RQwenDecoderLayer]
     norm: LlamaRMSNorm
 
     @staticmethod
     def init(config: RQwenConfig, *, key) -> "RQwenTransformer":
         S = Stacked
-        if not config.scan_layers:
-            from haliax.nn.scan import BlockSeq
-
-            S = BlockSeq
 
         # Initialize layers with their indices
         layers = S.init(config.Layers, RQwenDecoderLayer, gradient_checkpointing=config.gradient_checkpointing)(
@@ -453,11 +448,18 @@ class RQwenTransformer(eqx.Module):
 
 
 # Modified LM head model for Qwen
+class Router(hnn.Linear):
+    @staticmethod
+    def init(*args, **kwargs):
+        linear = hnn.Linear.init(*args, **kwargs)
+        return Router(linear.weight, linear.bias, linear.In, linear.Out, linear.dot_general)
+
+
 class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerialization):
     transformer: RQwenTransformer
     embeddings: LlamaEmbedding  # Can reuse Llama embeddings
     lm_head: Optional[hnn.Linear]
-    router: hnn.Linear
+    router: Router
 
     @classmethod
     def init(cls, Vocab: Axis, config: RQwenConfig, *, key) -> "RQwenLMHeadModel":
@@ -469,7 +471,7 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         else:
             lm_head = hnn.Linear.init(In=config.Embed, Out=Vocab, key=k_emb, use_bias=False, out_first=True)
 
-        router = hnn.Linear.init(In=config.Embed, Out=config.Loras, key=k_rout, use_bias=False, out_first=True)
+        router = Router.init(In=config.Embed, Out=config.Loras, key=k_rout, use_bias=False, out_first=True)
 
         return RQwenLMHeadModel(transformer, embeddings, lm_head, router)
 

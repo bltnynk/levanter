@@ -2,14 +2,17 @@ import dataclasses
 import functools
 import gc
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Optional, Type
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 import jax.random as jrandom
 
 import haliax as hax
+import haliax.nn as hnn
 from haliax import Axis, NamedArray
 from haliax.partitioning import named_jit, round_axis_for_partitioning
 
@@ -19,10 +22,16 @@ from levanter.checkpoint import EpochCheckpointer, load_checkpoint
 from levanter.data.text import FIMUrlSourceConfig, mk_fim_dataset
 from levanter.models.lm_model import LmExample, RoutableLmExample
 from levanter.models.loss import next_token_loss
-from levanter.models.routed_lora_model import RQwenConfig, RQwenLMHeadModel, lora_trainable_params_filter
+from levanter.models.routed_lora_model import (
+    LowRankLinear,
+    Router,
+    RQwenConfig,
+    RQwenLMHeadModel,
+    lora_trainable_params_filter,
+)
 from levanter.optim import AdamConfig, OptimizerConfig
 from levanter.trainer import Trainer, TrainerConfig
-from levanter.utils.jax_utils import parameter_count
+from levanter.utils.jax_utils import key_iterator, parameter_count
 
 
 logger = logging.getLogger(__name__)
@@ -83,6 +92,41 @@ def compute_next_token_loss(
     )
 
     return loss
+
+
+def reinit_lora_weights(model: eqx.Module, *, key: jax.random.PRNGKey) -> eqx.Module:
+    """Re-initialize all LoRA weights in the model while preserving other weights."""
+
+    def where(m: RQwenLMHeadModel):
+        return [
+            m.transformer.layers.stacked.mlp.down_proj.low_rank_linear,
+            m.transformer.layers.stacked.mlp.up_proj.low_rank_linear,
+            m.transformer.layers.stacked.mlp.gate_proj.low_rank_linear,
+            m.transformer.layers.stacked.self_attn.q_proj.low_rank_linear,
+            m.transformer.layers.stacked.self_attn.k_proj.low_rank_linear,
+            m.transformer.layers.stacked.self_attn.v_proj.low_rank_linear,
+            m.transformer.layers.stacked.self_attn.o_proj.low_rank_linear,
+            m.router,
+        ]
+
+    def re_init_linear(x: hnn.Linear, init_scale=1.0, *, key):
+        input_size = hax.axis_size(x.In)
+        weight = hax.random.truncated_normal(key, x.weight.axes, -3, 3) * (init_scale / math.sqrt(input_size))
+        return dataclasses.replace(x, weight=weight)
+
+    keys = key_iterator(key)
+
+    def replace_fn(x: eqx.Module):
+        if isinstance(x, LowRankLinear):
+            lora_a = re_init_linear(x.lora_a, init_scale=1.0, key=next(keys))
+            lora_b = re_init_linear(x.lora_b, init_scale=0.0, key=next(keys))
+            return LowRankLinear(lora_a, lora_b)
+        elif isinstance(x, Router):
+            return re_init_linear(x, init_scale=1.0, key=next(keys))
+        else:
+            return x
+
+    return eqx.tree_at(where, model, replace_fn=replace_fn)
 
 
 def main(config: TrainLmConfig):
@@ -159,7 +203,6 @@ def main(config: TrainLmConfig):
 
         model_shape = eqx.filter_eval_shape(model_init)
         is_trainable = lora_trainable_params_filter(model_shape)
-        print("is_trainable", is_trainable)
         state = trainer.initial_state(training_key, model_init=model_init, is_trainable=is_trainable)
 
         seek_dataloader = True
@@ -184,15 +227,18 @@ def main(config: TrainLmConfig):
                     axis_mapping=parameter_axis_mapping,
                     dtype=trainer.mp.compute_dtype,
                 )
-                model = named_jit(trainer.mp.cast_to_param, parameter_axis_mapping)(model)
+                # Loading from HF zeros out all missing weights so...
+                model = named_jit(
+                    lambda m: trainer.mp.cast_to_param(reinit_lora_weights(m, key=model_key)), parameter_axis_mapping
+                )(model)
                 state = dataclasses.replace(state, model=model)
             else:
                 logger.info("No checkpoint found. Starting from scratch.")
 
         trainable_params = parameter_count(state.trainable_model)
-        levanter.tracker.log_summary(
-            {"parameter_count": parameter_count(state.model), "trainable_params": trainable_params}
-        )
+        param_count = parameter_count(state.model)
+        print(f"Trainable params: {trainable_params}, Total params: {param_count}")
+        levanter.tracker.log_summary({"parameter_count": param_count, "trainable_params": trainable_params})
 
         max_eval_examples_per_ds = config.trainer.max_eval_batches
         if max_eval_examples_per_ds is not None:

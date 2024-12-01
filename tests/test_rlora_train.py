@@ -50,7 +50,7 @@ def test_rlora_train():
 
         try:
             config = rlora_train.TrainLmConfig(
-                # initialize_from_hf=torch_model_dir,
+                initialize_from_hf=torch_model_dir,
                 data=data_cfg,
                 model=model_cfg,
                 trainer=rlora_train.TrainerConfig(
