@@ -119,13 +119,13 @@ def main(config: TrainLmConfig):
         # randomness in jax is tightly controlled by "keys" which are the states of the random number generators
         # this makes deterministic training pretty easy
         seed = config.trainer.seed
-        model_key, training_key = jrandom.split(jrandom.PRNGKey(seed), 2)
+        model_key, data_key, training_key = jrandom.split(jrandom.PRNGKey(seed), 3)
 
         # We have two axis_mappings: one for storing the model and optimizer states, and one for compute
         # This allows Zero-3-style parameter sharding, where we shard the parameters and optimizer state across the mesh
         parameter_axis_mapping = trainer.parameter_axis_mapping
 
-        train_dataset = mk_fim_dataset(config.data, "train", tokenizer, Pos)
+        train_dataset = mk_fim_dataset(config.data, "train", tokenizer, Pos, key=data_key)
 
         # add epoch logging if epochs specified
         if config.epoch > 0:
@@ -196,7 +196,7 @@ def main(config: TrainLmConfig):
             max_eval_examples_per_ds *= config.trainer.eval_batch_size
 
         if len(config.data.validation_urls) > 0:
-            eval_dataset = mk_fim_dataset(config.data, "validation", tokenizer, Pos)
+            eval_dataset = mk_fim_dataset(config.data, "validation", tokenizer, Pos, key=data_key)
             trainer.add_eval_hook(eval_dataset)
 
         flops_per_token = config.model.flops_per_token(vocab_size)

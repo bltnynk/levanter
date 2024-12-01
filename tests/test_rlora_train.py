@@ -1,6 +1,7 @@
 import os
 import tempfile
 
+import jmp
 import pytest
 
 import levanter.main.rlora_train as rlora_train
@@ -8,6 +9,7 @@ import tiny_test_corpus
 from levanter.data.text import FIMUrlSourceConfig
 from levanter.distributed import RayConfig
 from levanter.models.rotary import DefaultRotaryEmbeddingsConfig
+from levanter.optim.config import AdamConfig
 from levanter.tracker.wandb import WandbConfig
 
 
@@ -31,22 +33,29 @@ def test_rlora_train():
                     seq_len=64,
                     hidden_dim=32,
                     intermediate_dim=64,
-                    attn_backend=None,  # use default for platform
+                    attn_backend="jax_flash",
                     num_loras=2,
                     lora_rank=2,
                     top_k=2,
                     tie_word_embeddings=True,
+                    disable_lora_mask=False,
+                    use_layer_norm_weight=True,
                     rope=DefaultRotaryEmbeddingsConfig(theta=1000000.0),
                 ),
                 trainer=rlora_train.TrainerConfig(
-                    num_train_steps=2,
-                    train_batch_size=2,
+                    num_train_steps=10,
+                    train_batch_size=8,
                     max_eval_batches=1,
-                    steps_per_eval=1,
+                    steps_per_eval=2,
                     wandb=WandbConfig(mode="disabled"),
                     require_accelerator=False,
                     ray=RayConfig(auto_start_cluster=False),
+                    fsdp_axis="embed",
+                    batch_axis="batch",
+                    tensor_parallel_axes=["mlp", "heads"],
+                    mp=jmp.get_policy("p=f32,c=bf16"),
                 ),
+                optimizer=AdamConfig(learning_rate=0.00001, weight_decay=0.1, warmup=0.01),
             )
             rlora_train.main(config)
         finally:

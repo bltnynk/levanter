@@ -1354,6 +1354,7 @@ class FIMUrlSourceConfig:
     tokenizer: str = "Qwen/Qwen2.5-Coder-1.5B"
     train_urls: list[str] = dataclasses.field(default_factory=list)
     validation_urls: list[str] = dataclasses.field(default_factory=list)
+    shuffle: bool | int = True
 
     repo_level_percentage = 0.0
     repo_name_field: str = CANONICAL_REPO_NAME_FIELD
@@ -1420,13 +1421,17 @@ class FIMUrlSourceConfig:
         return load_tokenizer(self.tokenizer)
 
 
-def _preprocess_fim_example(batch: Sequence[str], tokenizer: PreTrainedTokenizerBase, middle_token_id: int) -> dict:
+def _preprocess_fim_example(
+    batch: Sequence[str], tokenizer: PreTrainedTokenizerBase, middle_token_id: int, max_model_len=None
+) -> dict:
+    if max_model_len is None:
+        max_model_len = tokenizer.model_max_length
     tokenized = tokenizer(batch, padding=False)
     tokenized = [np.array(ids, dtype=np.int32) for ids in tokenized["input_ids"]]
     input_ids = []
     middle_idxs = []
     for i, elem in enumerate(tokenized):
-        if len(elem) > tokenizer.model_max_length:
+        if len(elem) > max_model_len:
             continue
         middle_idx = np.where(elem == middle_token_id)[0]
         if len(middle_idx) == 0:
@@ -1470,6 +1475,11 @@ def _prepare_fim_examples(
     out = []
     for ids, mids, lens in zip(truncated, middles, ex_pad["lens"]):
         causal = _mk_fim_example_jit(Pos, hax.named(ids, Pos), mids, lens)
+        if np.any(causal.router_hs_idxs >= Pos.size):
+            raise ValueError(
+                f"Middle token index {causal.router_hs_idxs} out of bounds for {Pos}. You need to regenerate your"
+                " cache after changing seq_len."
+            )
 
         out.append(causal)
 
@@ -1481,6 +1491,7 @@ def mk_fim_dataset(
     split: str,
     tokenizer: HfTokenizer,
     Pos: hax.Axis,
+    key: Optional[PRNGKeyArray] = None,
 ) -> AsyncDataset[RoutableLmExample]:
 
     source = config.get_shard_source(split)
@@ -1493,15 +1504,24 @@ def mk_fim_dataset(
 
     middle_token_id = tokenizer.convert_tokens_to_ids(config.middle_token)
     dataset = source.map_batches(  # type: ignore
-        lambda ex: _preprocess_fim_example(ex, tokenizer, middle_token_id),
+        lambda ex: _preprocess_fim_example(ex, tokenizer, middle_token_id, max_model_len=Pos.size),
         batch_size=128,
         num_cpus=num_cpus_used_by_tokenizer(tokenizer),
         output_exemplar=output_exemplar,
     )
 
-    cached_dataset: AsyncDataset[dict] = dataset.build_or_load_cache(config.cache_dir, await_finished=True)
+    split_cache_dir = os.path.join(config.cache_dir, split)
+    cached_dataset: AsyncDataset[dict] = dataset.build_or_load_cache(split_cache_dir, await_finished=True)
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    return cached_dataset.map_batches(lambda ex: _prepare_fim_examples(ex, tokenizer, Pos))
+    ds = cached_dataset.map_batches(lambda ex: _prepare_fim_examples(ex, tokenizer, Pos))
+
+    if config.shuffle is True:
+        assert key is not None, "Key must be provided when shuffle=True"
+        ds = ds.shuffle(key)
+    elif isinstance(config.shuffle, int) and config.shuffle > 0:
+        ds = ds.era_shuffle(config.shuffle, key=key)
+
+    return ds  # type: ignore

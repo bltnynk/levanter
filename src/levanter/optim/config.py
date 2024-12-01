@@ -260,6 +260,17 @@ class HessianOptConfig(OptimizerConfig, abc.ABC):
     """How often to update the hessian approximation."""
 
 
+def log_global_norm() -> optax.GradientTransformation:
+    def update_fn(updates, state, params=None):
+        del params
+        leaves = jax.tree_leaves(updates)
+        norm = sum(jnp.linalg.norm(x) for x in leaves)
+        levanter.tracker.jit_log_metrics({"avg_grad_norm": norm / len(leaves)})
+        return updates, state
+
+    return optax.GradientTransformation(lambda _: optax.EmptyState(), update_fn)
+
+
 @OptimizerConfig.register_subclass("adam")
 @dataclass
 class AdamConfig(OptimizerConfig):
@@ -276,6 +287,7 @@ class AdamConfig(OptimizerConfig):
         def _optimizer(learning_rate):
             components = []
 
+            components.append(log_global_norm())
             if self.max_grad_norm:
                 components.append(optax.clip_by_global_norm(self.max_grad_norm))
 
