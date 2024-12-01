@@ -264,8 +264,14 @@ def log_global_norm() -> optax.GradientTransformation:
     def update_fn(updates, state, params=None):
         del params
         leaves = jax.tree_leaves(updates)
-        norm = sum(jnp.linalg.norm(x) for x in leaves)
-        levanter.tracker.jit_log_metrics({"avg_grad_norm": norm / len(leaves)})
+        norms = jnp.array([jnp.linalg.norm(x) for x in leaves])
+        levanter.tracker.jit_log_metrics(
+            {
+                "optim/avg_grad_norm": jnp.sum(norms) / len(leaves),
+                "optim/max_grad_norm": jnp.max(norms),
+                "optim/min_grad_norm": jnp.min(norms),
+            }
+        )
         return updates, state
 
     return optax.GradientTransformation(lambda _: optax.EmptyState(), update_fn)

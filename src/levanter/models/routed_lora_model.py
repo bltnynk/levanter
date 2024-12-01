@@ -551,8 +551,9 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         # Get the hidden states for the idxs we select
         router_inputs = x.take(Pos, router_hs_idxs)
         # Get the logits from the router
-        router_inputs = jax.lax.stop_gradient(router_inputs)
+        router_inputs = jax.lax.stop_gradient(router_inputs)  # TODO: do i need this?
         router_logits = self.router(router_inputs, key=k_rout)
+        router_logits = router_logits.astype(jnp.float32)
 
         # Softmax, topk
         sm = hax.nn.softmax(router_logits, Loras)
@@ -562,7 +563,7 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         # Arrange batch indicies for a .at
         batch_indices = hax.arange(Batch).broadcast_to((Batch, TopK))
         lora_mask = lora_mask.array.at[batch_indices.array, inds.array].set(elems.array)
-        lora_mask = hax.NamedArray(lora_mask, [Batch, Loras])
+        lora_mask = hax.NamedArray(lora_mask, [Batch, Loras]).astype(x.dtype)
 
         # Broadcast the mask to the almost full shape
         lora_mask = lora_mask.broadcast_to([Batch, Pos, Loras])

@@ -159,7 +159,7 @@ def main(config: TrainLmConfig):
 
         model_shape = eqx.filter_eval_shape(model_init)
         is_trainable = lora_trainable_params_filter(model_shape)
-
+        print("is_trainable", is_trainable)
         state = trainer.initial_state(training_key, model_init=model_init, is_trainable=is_trainable)
 
         seek_dataloader = True
@@ -189,7 +189,10 @@ def main(config: TrainLmConfig):
             else:
                 logger.info("No checkpoint found. Starting from scratch.")
 
-        levanter.tracker.log_summary({"parameter_count": parameter_count(state.model)})
+        trainable_params = parameter_count(state.trainable_model)
+        levanter.tracker.log_summary(
+            {"parameter_count": parameter_count(state.model), "trainable_params": trainable_params}
+        )
 
         max_eval_examples_per_ds = config.trainer.max_eval_batches
         if max_eval_examples_per_ds is not None:
