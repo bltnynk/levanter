@@ -29,7 +29,7 @@ model:
   use_layer_norm_weight: true
   disable_lora_mask: false
 
-  num_loras: 256
+  num_loras: 128
   lora_rank: 4
   top_k: 16
 
@@ -40,12 +40,15 @@ trainer:
     tags: ["testing", "qwen"]
   mp: p=f32,c=bfloat16
   train_batch_size: 8
-  num_train_steps: 16000
+  num_train_steps: 4000
   steps_per_eval: 100
   max_eval_batches: 50
   tensor_parallel_axes: ["mlp", "heads"]
   fsdp_axis: "embed"
   batch_axis: "batch"
+  checkpointer:
+    base_path: gs://usc2-ckpt
+    save_interval: 30m
 
 optimizer:
   type: adam
