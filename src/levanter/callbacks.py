@@ -81,6 +81,7 @@ def eval_loss_loop(loss_fn, model, dataset, max_batches: Optional[int] = None, n
     total_loss = 0.0
     total_load_time = 0.0
     total_loss_time = 0.0
+    others = {}
     n = 0
 
     if name is not None:
@@ -99,7 +100,11 @@ def eval_loss_loop(loss_fn, model, dataset, max_batches: Optional[int] = None, n
             break
         load_time = time.time() - time_in
         total_load_time += load_time
-        loss = loss_fn(model, batch)
+        loss, extras = loss_fn(model, batch)
+        for k, v in extras.items():
+            if k not in others:
+                others[k] = 0.0
+            others[k] += v
         total_loss += loss.item()
         n += 1
         loss_time = time.time() - time_in - load_time
@@ -112,11 +117,12 @@ def eval_loss_loop(loss_fn, model, dataset, max_batches: Optional[int] = None, n
 
     if n > 0:
         total_loss /= n
+        others = {k: v / n for k, v in others.items()}
 
     # logger.info(f"eval loading time: {total_load_time / n:.3f} s/ba")
     # logger.info(f"eval loss time: {total_loss_time / n:.3f} s/ba")
 
-    return total_loss
+    return total_loss, others
 
 
 def compute_validation_loss(
@@ -126,12 +132,13 @@ def compute_validation_loss(
     name: Optional[str] = None,
 ):
     def compute_loss(info: StepInfo):
-        loss = eval_loss_loop(loss_fn, info.model, dataset, max_batches=max_batches, name=name)
+        loss, extra = eval_loss_loop(loss_fn, info.model, dataset, max_batches=max_batches, name=name)
 
         prefix = "eval"
         if name:
             prefix += "/" + name
-        levanter.tracker.log_metrics({f"{prefix}/loss": loss}, step=info.step)
+        others = {f"{prefix}/{k}": v for k, v in extra.items()}
+        levanter.tracker.log_metrics({f"{prefix}/loss": loss} | others, step=info.step)
 
         if name:
             logger.info(f"{name} validation loss: {loss:.3f}")
@@ -145,7 +152,9 @@ def compute_validation_loss(
 
 def log_step_info(total_steps: Optional[int]):
     def log_step_info_inner(step: StepInfo):
-        metrics = {"train/loss": step.loss, "global_step": step.step}
+        metrics = {"train/loss": step.loss, "global_step": step.step} | {
+            f"train/{k}": v for k, v in step.extras.items()
+        }
         if total_steps:
             metrics["run_progress"] = step.step / total_steps
         log_optimizer_hyperparams(step.opt_state, step=step.step, prefix="optim")

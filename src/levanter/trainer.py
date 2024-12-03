@@ -79,6 +79,7 @@ class StepInfo(Generic[S]):
     state: S
     loss: float
     step_duration: float
+    extras: dict = field(default_factory=dict)
 
     model = property(lambda self: self.state.model)
     opt_state = property(lambda self: self.state.opt_state)
@@ -182,7 +183,12 @@ class Trainer:
         def fn(model, *batch, **batch_kwargs):
             with hax.axis_mapping(self.compute_axis_mapping):
                 model = self.mp.cast_to_compute(model)
-                return _ensure_scalar(self._raw_loss_function(model, *batch, **batch_kwargs))
+                res = self._raw_loss_function(model, *batch, **batch_kwargs)
+                if isinstance(res, tuple):
+                    loss, aux = res
+                else:
+                    loss, aux = res, {}
+                return _ensure_scalar(loss), {k: _ensure_scalar(v) for k, v in aux.items()}
 
         return fn
 
@@ -366,11 +372,11 @@ class Trainer:
         Performs a single training step.
         """
         with capture_time() as step_time:
-            loss, new_state = self._jit_train_step_fn(state, *batch, **batch_kwargs)
+            loss, new_state, extras = self._jit_train_step_fn(state, *batch, **batch_kwargs)
             # force the loss so timing numbers are accurate. laziness isn't going to help here (i think?)
             loss = loss.item()  # type: ignore
 
-        return StepInfo(new_state, loss, step_time())
+        return StepInfo(new_state, loss, step_time(), extras)
 
     def training_steps(self, state: S, train_loader, run_hooks: bool = True) -> typing.Iterator[StepInfo[S]]:
         """
@@ -485,11 +491,13 @@ class Trainer:
             donate_args=(True,),
         )
 
-    def _train_step(self, state: S, *batch, **batch_kwargs) -> tuple[Scalar, S]:
+    def _train_step(self, state: S, *batch, **batch_kwargs) -> tuple[Scalar, S, dict]:
         key, new_key = jax.random.split(state.training_key)
         model = inference_mode(state.model, False)
 
-        loss, grads = self._compute_gradients_microbatched(self.loss_fn, model, *batch, **batch_kwargs, key=key)
+        (loss, extras), grads = self._compute_gradients_microbatched(
+            self.loss_fn, model, *batch, **batch_kwargs, key=key
+        )
 
         # Sophia needs to be able to access the loss function in the optimizer
         def obj_fun(trainable_model):
@@ -500,10 +508,10 @@ class Trainer:
 
         new_state = state.take_step(grads, obj_fun=obj_fun)
         new_state = hax.shard(new_state, self.parameter_axis_mapping)
-        return loss, new_state
+        return loss, new_state, extras
 
     def _compute_gradients_microbatched(self, loss_fn, model: M, *batch, **batch_kwargs) -> tuple[Scalar, M]:
-        grad_fn = eqx.filter_value_and_grad(loss_fn, has_aux=False)
+        grad_fn = eqx.filter_value_and_grad(loss_fn, has_aux=True)
         mbs = self.config.microbatch_size
         grad_fn = microbatched(
             grad_fn,

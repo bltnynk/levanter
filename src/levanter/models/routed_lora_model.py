@@ -545,7 +545,7 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         *,
         key=None,
         activations: bool = False,
-    ) -> NamedArray:
+    ) -> tuple[NamedArray, dict]:
         k_head, k_rout = maybe_rng_split(key, 2)
         Loras, Pos = self.config.Loras, self.config.Pos
         TopK = hax.Axis("top_k", self.config.top_k)
@@ -559,6 +559,10 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
 
         # Softmax, topk
         sm = hax.nn.softmax(router_logits, Loras)
+        ent = hax.sum(-sm * hax.log2(sm), Loras)
+        mean_ent = hax.mean(ent, Batch)
+        std_ent = hax.std(ent, Batch)
+
         elems, inds = hax.top_k(sm, Loras, TopK.size, TopK)
         # Create a mask
         lora_mask = hax.zeros_like(router_logits)
@@ -576,8 +580,10 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         if self.config.disable_lora_mask:
             lora_mask = None
         if activations:
-            return self.activations(input_ids, attn_mask=attn_mask, lora_mask=lora_mask, key=k_head)
-        return self(input_ids, attn_mask=attn_mask, lora_mask=lora_mask, key=key)
+            res = self.activations(input_ids, attn_mask=attn_mask, lora_mask=lora_mask, key=k_head)
+        else:
+            res = self(input_ids, attn_mask=attn_mask, lora_mask=lora_mask, key=k_head)
+        return res, {"router/mean_ent": mean_ent, "router/std_ent": std_ent}
 
     def get_lm_head(self) -> hax.NamedArray:
         if self.lm_head is None:

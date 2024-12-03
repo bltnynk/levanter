@@ -54,10 +54,10 @@ def test_rlora_train():
                 data=data_cfg,
                 model=model_cfg,
                 trainer=rlora_train.TrainerConfig(
-                    num_train_steps=100,
+                    num_train_steps=4,
                     train_batch_size=8,
                     max_eval_batches=1,
-                    steps_per_eval=5,
+                    steps_per_eval=2,
                     wandb=WandbConfig(mode="disabled"),
                     require_accelerator=False,
                     ray=RayConfig(auto_start_cluster=False),

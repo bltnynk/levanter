@@ -72,7 +72,7 @@ def compute_next_token_loss(
     idxs = jnp.squeeze(example.router_hs_idxs, axis=1)
     idxs = hax.NamedArray(idxs, (batch_axis,))
     example = dataclasses.replace(example, router_hs_idxs=idxs)
-    activations = model.routed_forward(
+    activations, extras = model.routed_forward(
         batch_axis, example.tokens, example.router_hs_idxs, example.attn_mask, key=key, activations=True
     )
 
@@ -91,7 +91,7 @@ def compute_next_token_loss(
         block_size=model.config.cross_entropy_block_size,
     )
 
-    return loss
+    return loss, extras
 
 
 def reinit_lora_weights(model: eqx.Module, *, key: jax.random.PRNGKey) -> eqx.Module:
