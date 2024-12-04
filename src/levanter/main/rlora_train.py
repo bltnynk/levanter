@@ -93,6 +93,7 @@ def compute_next_token_loss(
         block_size=model.config.cross_entropy_block_size,
     )
 
+    extras["lm_loss"] = loss
     if router_zloss_weight > 0.0:
         z_loss = hax.nn.logsumexp(rlogits, model.config.Loras)
         z_loss = hax.mean(hax.square(z_loss), batch_axis)
