@@ -545,31 +545,39 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         *,
         key=None,
         activations: bool = False,
-    ) -> tuple[NamedArray, dict]:
+    ) -> tuple[NamedArray, NamedArray, dict]:
         k_head, k_rout = maybe_rng_split(key, 2)
         Loras, Pos = self.config.Loras, self.config.Pos
         TopK = hax.Axis("top_k", self.config.top_k)
-        x = self.activations(input_ids, attn_mask=attn_mask, key=k_head)
-        # Get the hidden states for the idxs we select
-        router_inputs = x.take(Pos, router_hs_idxs)
-        # Get the logits from the router
-        router_inputs = jax.lax.stop_gradient(router_inputs)  # TODO: do i need this?
-        router_logits = self.router(router_inputs, key=k_rout)
-        router_logits = router_logits.astype(jnp.float32)
+        compute_dtype = self.embeddings.token_embeddings.weight.dtype
 
         # Softmax, topk
+        if Loras.size > 1:
+            x = self.activations(input_ids, attn_mask=attn_mask, key=k_head)
+            # Get the hidden states for the idxs we select
+            router_inputs = x.take(Pos, router_hs_idxs)
+            # Get the logits from the router
+            router_inputs = jax.lax.stop_gradient(router_inputs)  # TODO: do i need this?
+            router_logits = self.router(router_inputs, key=k_rout)
+            router_logits = router_logits.astype(jnp.float32)
+        else:
+            router_logits = hax.zeros((Batch, Loras), dtype=jnp.float32)
+
         sm = hax.nn.softmax(router_logits, Loras)
         ent = hax.sum(-sm * hax.log2(sm), Loras)
         mean_ent = hax.mean(ent, Batch)
         std_ent = hax.std(ent, Batch)
 
+        batch_sm = sm.mean(Batch)
+        batch_ent = hax.sum(-batch_sm * hax.log2(batch_sm), Loras)
+
         elems, inds = hax.top_k(sm, Loras, TopK.size, TopK)
         # Create a mask
-        lora_mask = hax.zeros_like(router_logits)
+        lora_mask = hax.zeros((Batch, Loras), dtype=compute_dtype)
         # Arrange batch indicies for a .at
         batch_indices = hax.arange(Batch).broadcast_to((Batch, TopK))
-        lora_mask = lora_mask.array.at[batch_indices.array, inds.array].set(elems.array)
-        lora_mask = hax.NamedArray(lora_mask, [Batch, Loras]).astype(x.dtype)
+        lora_mask = lora_mask.array.at[batch_indices.array, inds.array].set(elems.array.astype(compute_dtype))
+        lora_mask = hax.NamedArray(lora_mask, [Batch, Loras])
 
         # Broadcast the mask to the almost full shape
         lora_mask = lora_mask.broadcast_to([Batch, Pos, Loras])
@@ -583,7 +591,11 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
             res = self.activations(input_ids, attn_mask=attn_mask, lora_mask=lora_mask, key=k_head)
         else:
             res = self(input_ids, attn_mask=attn_mask, lora_mask=lora_mask, key=k_head)
-        return res, {"router/mean_ent": mean_ent, "router/std_ent": std_ent}
+        return (
+            res,
+            router_logits,
+            {"router/mean_ent": mean_ent, "router/std_ent": std_ent, "router/batch_ent": batch_ent},
+        )
 
     def get_lm_head(self) -> hax.NamedArray:
         if self.lm_head is None:

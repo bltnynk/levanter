@@ -67,6 +67,7 @@ def test_rlora_train():
                     mp=jmp.get_policy("p=f32,c=bf16"),
                 ),
                 optimizer=AdamConfig(learning_rate=0.001, weight_decay=0.1, warmup=0.01),
+                router_z_loss_weight=0.001,
             )
             rlora_train.main(config)
         finally:

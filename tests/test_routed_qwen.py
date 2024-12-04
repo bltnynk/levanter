@@ -29,8 +29,12 @@ def test_routed_qwen_forward():
     Batch = hax.Axis("batch", 32)
     x = hax.random.randint(key, (Batch, config.Pos), 0, Vocab.size)
     inds = hax.random.randint(key, Batch, 0, config.Pos.size - 1)
-    y = model.routed_forward(Batch, x, inds)
-    print(y)
+    _ = model.routed_forward(Batch, x, inds)
+
+    # test with num_loras=1
+    config = dataclasses.replace(config, num_loras=1, top_k=1)
+    model = RQwenLMHeadModel.init(Vocab, config, key=key)
+    _ = model.routed_forward(Batch, x, inds)
 
 
 @skip_if_no_torch

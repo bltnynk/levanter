@@ -49,6 +49,7 @@ class TrainLmConfig:
     # if provided, will initialize from this checkpoint, used for llama style data mixture
     epoch: int = 0
     z_loss_weight: float = 0.0
+    router_z_loss_weight: float = 0.0
 
 
 def compute_next_token_loss(
@@ -61,7 +62,8 @@ def compute_next_token_loss(
     reduction_axis: Optional[hax.AxisSelection] = None,
     logsumexp_weight: Optional[float] = None,
     loss_dtype: Optional[Type[jnp.dtype]] = jnp.float32,
-) -> jnp.ndarray | NamedArray:
+    router_zloss_weight: float = 0.0,
+) -> tuple[jnp.ndarray | NamedArray, dict]:
     """
     Computes the cross-entropy loss for a language modeling example. If reduction is not None, the loss is reduced
     across the reduction axis (with reduction_axis=None meaning all axes). If reduction is None, the loss is not
@@ -72,7 +74,7 @@ def compute_next_token_loss(
     idxs = jnp.squeeze(example.router_hs_idxs, axis=1)
     idxs = hax.NamedArray(idxs, (batch_axis,))
     example = dataclasses.replace(example, router_hs_idxs=idxs)
-    activations, extras = model.routed_forward(
+    activations, rlogits, extras = model.routed_forward(
         batch_axis, example.tokens, example.router_hs_idxs, example.attn_mask, key=key, activations=True
     )
 
@@ -90,6 +92,12 @@ def compute_next_token_loss(
         dtype=loss_dtype,
         block_size=model.config.cross_entropy_block_size,
     )
+
+    if router_zloss_weight > 0.0:
+        z_loss = hax.nn.logsumexp(rlogits, model.config.Loras)
+        z_loss = hax.mean(hax.square(z_loss), batch_axis)
+        loss += router_zloss_weight * z_loss
+        extras["router/z_loss"] = z_loss
 
     return loss, extras
 
@@ -152,7 +160,10 @@ def main(config: TrainLmConfig):
     Pos = config.model.Pos
 
     loss_function = functools.partial(
-        compute_next_token_loss, logsumexp_weight=config.z_loss_weight, batch_axis=config.trainer.TrainBatch
+        compute_next_token_loss,
+        logsumexp_weight=config.z_loss_weight,
+        batch_axis=config.trainer.TrainBatch,
+        router_zloss_weight=config.router_z_loss_weight,
     )
 
     # Using the trainer as a context manager does 3 things:
