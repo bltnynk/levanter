@@ -145,6 +145,7 @@ class RQwenConfig(LlamaConfig):
     lora_rank: int = 16
     top_k: int = 4
     disable_lora_mask: bool = False
+    ident_lora_mask: bool = False
 
     Loras = property(lambda self: Axis("loras", self.num_loras))
     LoraRank = property(lambda self: Axis("lora_rank", self.lora_rank))
@@ -544,6 +545,7 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         attn_mask: Optional[NamedArray] = None,
         *,
         key=None,
+        router_stop_grad: bool = True,
         activations: bool = False,
     ) -> tuple[NamedArray, NamedArray, dict]:
         k_head, k_rout = maybe_rng_split(key, 2)
@@ -557,7 +559,8 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
             # Get the hidden states for the idxs we select
             router_inputs = x.take(Pos, router_hs_idxs)
             # Get the logits from the router
-            router_inputs = jax.lax.stop_gradient(router_inputs)  # TODO: do i need this?
+            if router_stop_grad:
+                router_inputs = jax.lax.stop_gradient(router_inputs)
             router_logits = self.router(router_inputs, key=k_rout)
             router_logits = router_logits.astype(jnp.float32)
         else:
@@ -587,6 +590,8 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
 
         if self.config.disable_lora_mask:
             lora_mask = None
+        elif self.config.ident_lora_mask:
+            lora_mask = hax.ones((Batch, Pos, Loras), dtype=compute_dtype)
         if activations:
             res = self.activations(input_ids, attn_mask=attn_mask, lora_mask=lora_mask, key=k_head)
         else:

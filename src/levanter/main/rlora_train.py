@@ -10,6 +10,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom
+from jaxtyping import PyTree
 
 import haliax as hax
 import haliax.nn as hnn
@@ -31,6 +32,7 @@ from levanter.models.routed_lora_model import (
 )
 from levanter.optim import AdamConfig, OptimizerConfig
 from levanter.trainer import Trainer, TrainerConfig
+from levanter.types import FilterSpec
 from levanter.utils.jax_utils import key_iterator, parameter_count
 
 
@@ -50,6 +52,7 @@ class TrainLmConfig:
     epoch: int = 0
     z_loss_weight: float = 0.0
     router_z_loss_weight: float = 0.0
+    full_ft: bool = False
 
 
 def compute_next_token_loss(
@@ -63,6 +66,7 @@ def compute_next_token_loss(
     logsumexp_weight: Optional[float] = None,
     loss_dtype: Optional[Type[jnp.dtype]] = jnp.float32,
     router_zloss_weight: float = 0.0,
+    stop_grad: bool = True,
 ) -> tuple[jnp.ndarray | NamedArray, dict]:
     """
     Computes the cross-entropy loss for a language modeling example. If reduction is not None, the loss is reduced
@@ -75,7 +79,13 @@ def compute_next_token_loss(
     idxs = hax.NamedArray(idxs, (batch_axis,))
     example = dataclasses.replace(example, router_hs_idxs=idxs)
     activations, rlogits, extras = model.routed_forward(
-        batch_axis, example.tokens, example.router_hs_idxs, example.attn_mask, key=key, activations=True
+        batch_axis,
+        example.tokens,
+        example.router_hs_idxs,
+        example.attn_mask,
+        key=key,
+        activations=True,
+        router_stop_grad=stop_grad,
     )
 
     loss = next_token_loss(
@@ -165,6 +175,7 @@ def main(config: TrainLmConfig):
         logsumexp_weight=config.z_loss_weight,
         batch_axis=config.trainer.TrainBatch,
         router_zloss_weight=config.router_z_loss_weight,
+        stop_grad=not config.full_ft,
     )
 
     # Using the trainer as a context manager does 3 things:
@@ -214,7 +225,11 @@ def main(config: TrainLmConfig):
             return config.model.build(Vocab, key=model_key)
 
         model_shape = eqx.filter_eval_shape(model_init)
-        is_trainable = lora_trainable_params_filter(model_shape)
+        is_trainable: PyTree[FilterSpec]
+        if config.full_ft:
+            is_trainable = True
+        else:
+            is_trainable = lora_trainable_params_filter(model_shape)
         state = trainer.initial_state(training_key, model_init=model_init, is_trainable=is_trainable)
 
         seek_dataloader = True
