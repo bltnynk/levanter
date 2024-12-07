@@ -40,7 +40,13 @@ def test_rlora_train():
         test_data_jsonl = tiny_test_corpus.write_fim_data(tmpdir + "/test_data.jsonl", len=2048)
         test_validation_jsonl = tiny_test_corpus.write_fim_data(tmpdir + "/test_data_valid.jsonl", len=2048)
         data_cfg = FIMUrlSourceConfig(
-            cache_dir=tmpdir + "/cache", train_urls=[test_data_jsonl], validation_urls=[test_validation_jsonl]
+            cache_dir=tmpdir + "/cache",
+            train_urls=[test_data_jsonl],
+            validation_urls=[test_validation_jsonl],
+            add_router_token=True,
+            predict_fim_token=False,
+            predict_router_token=False,
+            predict_prefix=False,
         )
         tokenizer = data_cfg.the_tokenizer
         hf_config = model_cfg.to_hf_config(tokenizer.vocab_size)
@@ -54,8 +60,8 @@ def test_rlora_train():
                 data=data_cfg,
                 model=model_cfg,
                 trainer=rlora_train.TrainerConfig(
-                    num_train_steps=4,
-                    train_batch_size=8,
+                    num_train_steps=8,
+                    train_batch_size=4,
                     max_eval_batches=1,
                     steps_per_eval=2,
                     wandb=WandbConfig(mode="disabled"),
@@ -66,7 +72,7 @@ def test_rlora_train():
                     tensor_parallel_axes=["mlp", "heads"],
                     mp=jmp.get_policy("p=f32,c=bf16"),
                 ),
-                optimizer=AdamConfig(learning_rate=0.001, weight_decay=0.1, warmup=0.01),
+                optimizer=AdamConfig(learning_rate=0.001, weight_decay=0.1, warmup=0.00, lr_schedule="constant"),
                 router_z_loss_weight=0.001,
             )
             rlora_train.main(config)

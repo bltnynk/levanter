@@ -3,7 +3,6 @@ import tempfile
 
 import jax
 import pytest
-from transformers import AutoTokenizer
 
 import haliax as hax
 
@@ -43,14 +42,22 @@ async def test_fim_url_data():
     with tempfile.TemporaryDirectory() as tmpdir:
         max_len = 128
         test_data_jsonl = "file://" + write_test_data(tmpdir + "/test_data.jsonl")
-        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Coder-32B")
-        cfg = FIMUrlSourceConfig(cache_dir=tmpdir + "/cache", train_urls=[test_data_jsonl])
+        cfg = FIMUrlSourceConfig(
+            cache_dir=tmpdir + "/cache",
+            train_urls=[test_data_jsonl],
+            predict_prefix=True,
+            predict_fim_token=False,
+            predict_router_token=False,
+            shuffle=False,
+        )
+        tokenizer = cfg.the_tokenizer
         Pos = hax.Axis("Pos", max_len)
         dataset = mk_fim_dataset(cfg, "train", tokenizer, Pos)
         await dataset.wait_until_len_at_least(1)
         elem = await dataset.get_batch([0, 1, 2, 3])
 
         print("Check that for all the uppercase tokens, we want to predict the token after them")
+        print("MAIN MASK")
         for e in elem:
             # trim the padding
             tokens = e.tokens.array
@@ -59,6 +66,22 @@ async def test_fim_url_data():
             chars = list(text)
             remap = tokenizer(text)
             for token_idx, masked in enumerate(e.loss_mask.array[: last_non_pad + 5]):
+                cs = remap.token_to_chars(token_idx)
+                if masked:
+                    chars[cs.start : cs.end] = [c.upper() for c in chars[cs.start : cs.end]]
+            text = "".join(chars)
+
+            print(text)
+
+        print("COMPLETION MASK")
+        for e in elem:
+            # trim the padding
+            tokens = e.tokens.array
+            last_non_pad = jax.numpy.where(tokens != tokenizer.pad_token_id)[0][-1]
+            text = tokenizer.decode(e.tokens.array[: last_non_pad + 5])
+            chars = list(text)
+            remap = tokenizer(text)
+            for token_idx, masked in enumerate(e.completion_mask.array[: last_non_pad + 5]):
                 cs = remap.token_to_chars(token_idx)
                 if masked:
                     chars[cs.start : cs.end] = [c.upper() for c in chars[cs.start : cs.end]]

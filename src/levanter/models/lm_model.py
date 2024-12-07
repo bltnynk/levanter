@@ -50,6 +50,7 @@ class LmExample(eqx.Module):
 
 class RoutableLmExample(LmExample):
     router_hs_idxs: Optional[hax.NamedArray] = None
+    completion_mask: Optional[hax.NamedArray] = None
 
     @staticmethod
     def causal(
@@ -57,6 +58,7 @@ class RoutableLmExample(LmExample):
         router_hs_idxs: Optional[hax.NamedArray] = None,
         *,
         loss_mask: Optional[hax.NamedArray] = None,
+        completion_mask: Optional[hax.NamedArray] = None,
         ignore_id: Optional[int] = None,
     ) -> "RoutableLmExample":
         lm_example = LmExample.causal(tokens, loss_mask=loss_mask, ignore_id=ignore_id)
@@ -65,6 +67,7 @@ class RoutableLmExample(LmExample):
             loss_mask=lm_example.loss_mask,
             attn_mask=lm_example.attn_mask,
             router_hs_idxs=router_hs_idxs,
+            completion_mask=completion_mask,
         )
 
 

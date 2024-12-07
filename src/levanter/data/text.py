@@ -1355,6 +1355,10 @@ class FIMUrlSourceConfig:
     train_urls: list[str] = dataclasses.field(default_factory=list)
     validation_urls: list[str] = dataclasses.field(default_factory=list)
     shuffle: bool | int = True
+    add_router_token: bool = True
+    predict_prefix: bool = False
+    predict_router_token: bool = False
+    predict_fim_token: bool = False
 
     repo_level_percentage = 0.0
     repo_name_field: str = CANONICAL_REPO_NAME_FIELD
@@ -1369,6 +1373,7 @@ class FIMUrlSourceConfig:
     repo_name_token: str = "<|repo_name|>"
     file_sep_token: str = "<|file_sep|>"
     eos_token: str = "<|endoftext|>"
+    router_token: str = "<|router|>"
     """The overall prompt format is:
     <|repo_name|>repo name\n
     <|file_sep|>filename.py\n
@@ -1376,6 +1381,10 @@ class FIMUrlSourceConfig:
     <|file_sep|>target_file.py\n
     <|fim_prefix|>all of the code goes here now except for<|fim_suffix|>which is pretty neat<|fim_middle|>the middle
     """
+
+    def __post_init__(self):
+        if not self.add_router_token:
+            assert not self.predict_router_token, "Can't predict router token if it's not in the data"
 
     def get_shard_source(self, split: str) -> Optional[ShardedDataSource[str]]:
         urls = self.train_urls if split == "train" else self.validation_urls
@@ -1409,16 +1418,20 @@ class FIMUrlSourceConfig:
                 for f in files:
                     to_join.extend([self.file_sep_token, f[self.file_path_field], "\n", f[self.file_content_field]])
 
-            to_join.extend(
-                [self.prefix_token, prefix, self.suffix_token, suffix, self.middle_token, middle, self.eos_token]
-            )
+            to_join.extend([self.prefix_token, prefix, self.suffix_token, suffix])
+            if self.add_router_token:
+                to_join.extend([self.router_token])
+            to_join.extend([self.middle_token, middle, self.eos_token])
             return "".join(to_join)
 
         return source.map(make_entry)
 
     @property
     def the_tokenizer(self) -> HfTokenizer:
-        return load_tokenizer(self.tokenizer)
+        tokenizer = load_tokenizer(self.tokenizer)
+        if self.add_router_token:
+            tokenizer.add_special_tokens({"additional_special_tokens": [self.router_token]})
+        return tokenizer
 
 
 def _preprocess_fim_example(
@@ -1450,15 +1463,47 @@ def _preprocess_fim_example(
     }
 
 
-def _mk_fim_example_jit(Pos, input_ids: hax.NamedArray, middle_idxs: hax.NamedArray, lens: hax.NamedArray):
-    # mask out padding and anything before the start of the target
-    loss_mask = hax.arange(Pos) >= middle_idxs  # predict the token after the <|fim_middle|> marker
-    loss_mask &= hax.arange(Pos) < lens - 1  # the len-1 token is the eos token, so we don't predict that
-    return RoutableLmExample.causal(input_ids, router_hs_idxs=middle_idxs, loss_mask=loss_mask)
+@functools.partial(jax.jit, static_argnums=(0, 4, 5, 6, 7))
+def _mk_fim_example_jit(
+    Pos: hax.Axis,
+    input_ids: hax.NamedArray,
+    middle_idxs: np.ndarray,
+    lens: np.ndarray,
+    has_router_token: bool,
+    predict_prefix: bool,
+    predict_router_token: bool,
+    predict_fim_token: bool,
+) -> RoutableLmExample:
+    loss_mask = ~hax.nn.one_hot(-1, Pos, dtype=jax.numpy.bool_)
+    # loss_mask[i]=true => predict the (i+1)-th token from the i-th token
+    if has_router_token and not predict_router_token:
+        # don't make the previous token predict the "<|router|>" token
+        # loss_mask &= ~hax.nn.one_hot(middle_idxs - 2, Pos, dtype=jax.numpy.bool_)
+        loss_mask &= ~jax.nn.one_hot(middle_idxs - 2, Pos.size, dtype=jax.numpy.bool_)[0]
+    if not predict_fim_token:
+        # don't make the previous token predict the <|fim_middle|> token
+        loss_mask &= ~jax.nn.one_hot(middle_idxs - 1, Pos.size, dtype=jax.numpy.bool_)[0]
+    if not predict_prefix:
+        # 0 out everything before the <|fim_prefix|> or <|router|> token
+        idx = middle_idxs - 3 if has_router_token else middle_idxs - 2
+        loss_mask &= hax.arange(Pos) > idx  # all the tokens before the <|router|> token or the <|fim_middle|> token
+    # the lens-1 token is the eos token, so we don't predict the next after that
+    completion_mask = hax.arange(Pos) < lens - 1
+    completion_mask &= hax.arange(Pos) >= middle_idxs
+    loss_mask &= hax.arange(Pos) < lens - 1
+    return RoutableLmExample.causal(
+        input_ids, router_hs_idxs=middle_idxs, loss_mask=loss_mask, completion_mask=completion_mask
+    )
 
 
 def _prepare_fim_examples(
-    ex: list[dict], tokenizer: PreTrainedTokenizerBase, Pos: hax.Axis
+    ex: list[dict],
+    tokenizer: PreTrainedTokenizerBase,
+    Pos: hax.Axis,
+    has_router_token: bool,
+    predict_prefix: bool,
+    predict_fim_token: bool,
+    predict_router_token: bool,
 ) -> list[RoutableLmExample]:
     middles = np.array([ex["middle_idxs"] for ex in ex])
     lens = np.array([ex["lens"] for ex in ex])
@@ -1474,7 +1519,18 @@ def _prepare_fim_examples(
 
     out = []
     for ids, mids, lens in zip(truncated, middles, ex_pad["lens"]):
-        causal = _mk_fim_example_jit(Pos, hax.named(ids, Pos), mids, lens)
+        assert len(mids) == 1
+        assert len(lens) == 1
+        causal = _mk_fim_example_jit(
+            Pos,
+            hax.named(ids, Pos),
+            mids,
+            lens,
+            has_router_token=has_router_token,
+            predict_prefix=predict_prefix,
+            predict_router_token=predict_router_token,
+            predict_fim_token=predict_fim_token,
+        )
         if np.any(causal.router_hs_idxs >= Pos.size):
             raise ValueError(
                 f"Middle token index {causal.router_hs_idxs} out of bounds for {Pos}. You need to regenerate your"
@@ -1510,13 +1566,25 @@ def mk_fim_dataset(
         output_exemplar=output_exemplar,
     )
 
+    if config.add_router_token:
+        split += "_with_router"
     split_cache_dir = os.path.join(config.cache_dir, split)
     cached_dataset: AsyncDataset[dict] = dataset.build_or_load_cache(split_cache_dir, await_finished=True)
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    ds = cached_dataset.map_batches(lambda ex: _prepare_fim_examples(ex, tokenizer, Pos))
+    ds = cached_dataset.map_batches(
+        lambda ex: _prepare_fim_examples(
+            ex,
+            tokenizer,
+            Pos,
+            has_router_token=config.add_router_token,
+            predict_prefix=config.predict_prefix,
+            predict_fim_token=config.predict_fim_token,
+            predict_router_token=config.predict_router_token,
+        )
+    )
 
     if config.shuffle is True:
         assert key is not None, "Key must be provided when shuffle=True"

@@ -1,4 +1,5 @@
 initialize_from_hf: "Qwen/Qwen2.5-Coder-1.5B"
+full_ft: true
 data:
   train_urls:
     - gs://usc-stack-v2/shard1_150_flat.jsonl.gz
@@ -9,6 +10,9 @@ data:
   cache_dir: "gs://usc2-datacache/shard1"
   tokenizer: "Qwen/Qwen2.5-Coder-1.5B"
   shuffle: true
+  predict_prefix: true
+  predict_router_token: false
+  predict_fim_token: false
 model:
   seq_len: 8192
   hidden_dim: 1536
@@ -28,6 +32,7 @@ model:
   use_bias: false
   use_layer_norm_weight: true
   disable_lora_mask: false
+  ident_lora_mask: true
 
   num_loras: 64
   lora_rank: 8

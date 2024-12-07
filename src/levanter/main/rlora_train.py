@@ -103,7 +103,23 @@ def compute_next_token_loss(
         block_size=model.config.cross_entropy_block_size,
     )
 
-    extras["lm_loss"] = loss
+    completion_loss = next_token_loss(
+        model.Pos,
+        model.Embed,
+        model.Vocab,
+        activations,
+        model.get_lm_head(),
+        example.tokens,
+        loss_mask=example.completion_mask,  # only looking at completion
+        reduction=reduction,
+        reduction_axis=reduction_axis,
+        logsumexp_weight=logsumexp_weight,
+        dtype=loss_dtype,
+        block_size=model.config.cross_entropy_block_size,
+    )
+
+    extras["all_lm_loss"] = loss
+    extras["lm_loss"] = completion_loss
     if router_zloss_weight > 0.0:
         z_loss = hax.nn.logsumexp(rlogits, model.config.Loras)
         z_loss = hax.mean(hax.square(z_loss), batch_axis)
