@@ -69,6 +69,7 @@ async def test_fim_url_data():
                 cs = remap.token_to_chars(token_idx)
                 if masked:
                     chars[cs.start : cs.end] = [c.upper() for c in chars[cs.start : cs.end]]
+            print("idx token:", tokenizer.decode(e.tokens.array[e.router_hs_idxs]))
             text = "".join(chars)
 
             print(text)

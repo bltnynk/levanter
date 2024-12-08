@@ -1491,6 +1491,8 @@ def _mk_fim_example_jit(
     completion_mask = hax.arange(Pos) < lens - 1
     completion_mask &= hax.arange(Pos) >= middle_idxs
     loss_mask &= hax.arange(Pos) < lens - 1
+    if has_router_token:
+        middle_idxs = middle_idxs - 1
     return RoutableLmExample.causal(
         input_ids, router_hs_idxs=middle_idxs, loss_mask=loss_mask, completion_mask=completion_mask
     )
