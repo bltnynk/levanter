@@ -36,6 +36,7 @@ class LowRankLinear(ModuleWithStateDictSerialization):
 
     lora_a: hnn.Linear
     lora_b: hnn.Linear
+    scale: float = eqx.field(static=True)
 
     @staticmethod
     def init(
@@ -44,6 +45,7 @@ class LowRankLinear(ModuleWithStateDictSerialization):
         Out: AxisSpec,
         *,
         key: PRNGKey,
+        scale: float = 1.0,
         out_first: bool = True,
         dot_general: Optional[DotGeneralOp] = None,
     ) -> "LowRankLinear":
@@ -54,7 +56,7 @@ class LowRankLinear(ModuleWithStateDictSerialization):
         )
         lora_a = hnn.Linear.init(In=In, Out=Inter, key=k_a, use_bias=False, init_scale=1.0, **kwargs)
         lora_b = hnn.Linear.init(In=Inter, Out=Out, key=k_b, use_bias=False, init_scale=0.0, **kwargs)
-        return LowRankLinear(lora_a, lora_b)
+        return LowRankLinear(lora_a, lora_b, scale)
 
     @named_call
     def __call__(self, x: NamedArray, lora_mask: Optional[NamedArray], *, key=None) -> NamedArray:
@@ -63,7 +65,7 @@ class LowRankLinear(ModuleWithStateDictSerialization):
         if lora_mask is not None:
             lora_a *= lora_mask
         lora_b = self.lora_b(lora_a, key=k_b)
-        return lora_b
+        return lora_b * self.scale
 
 
 def lora_trainable_params_filter(model: eqx.Module) -> Dict[str, jnp.ndarray]:
@@ -86,6 +88,7 @@ class RLoraLinear(ModuleWithStateDictSerialization):
         Inter: AxisSpec,
         *,
         key: PRNGKey,
+        scale: float = 1.0,
         use_bias: bool = True,
         out_first: bool = True,
         dot_general: Optional[DotGeneralOp] = None,
@@ -102,7 +105,7 @@ class RLoraLinear(ModuleWithStateDictSerialization):
             dot_general=dot_general,
         )
         low_rank_linear = LowRankLinear.init(
-            In=In, Inter=Inter, Out=Out, key=k_low_rank, out_first=out_first, dot_general=dot_general
+            In=In, Inter=Inter, Out=Out, scale=scale, key=k_low_rank, out_first=out_first, dot_general=dot_general
         )
         return RLoraLinear(low_rank_linear, linear)
 
@@ -146,6 +149,7 @@ class RQwenConfig(LlamaConfig):
     top_k: int = 4
     disable_lora_mask: bool = False
     ident_lora_mask: bool = False
+    scale: float = 1.0
 
     Loras = property(lambda self: Axis("loras", self.num_loras))
     LoraRank = property(lambda self: Axis("lora_rank", self.lora_rank))
@@ -246,6 +250,7 @@ class RQwenAttention(eqx.Module):
             In=Embed,
             Out=(config.KVHeads, QHeadsPerGroup, config.HeadSize),
             Inter=(config.Loras, config.LoraRank),
+            scale=config.scale,
             key=k_q,
             use_bias=True,  # Qwen always uses bias in attention
             out_first=True,
@@ -254,6 +259,7 @@ class RQwenAttention(eqx.Module):
             In=Embed,
             Out=(config.KVHeads, config.HeadSize),
             Inter=(config.Loras, config.LoraRank),
+            scale=config.scale,
             key=k_k,
             use_bias=True,
             out_first=True,
@@ -262,6 +268,7 @@ class RQwenAttention(eqx.Module):
             In=Embed,
             Out=(config.KVHeads, config.HeadSize),
             Inter=(config.Loras, config.LoraRank),
+            scale=config.scale,
             key=k_v,
             use_bias=True,
             out_first=True,
@@ -270,6 +277,7 @@ class RQwenAttention(eqx.Module):
             In=(config.Heads, config.HeadSize),
             Out=Embed,
             Inter=(config.Loras, config.LoraRank),
+            scale=config.scale,
             key=k_o,
             use_bias=False,  # Qwen doesn't use bias in o_proj
             out_first=True,
@@ -351,13 +359,18 @@ class RQwenMlp(eqx.Module):
         activation_fn: Union[str, Callable],
         *,
         key,
+        scale: float = 1.0,
         use_bias: bool = False,
     ) -> "RLoraLinear":
         k_fc, k_up_proj, k_down_proj = jrandom.split(key, 3)
-        gate_proj = RLoraLinear.init(Out=Mlp, In=Embed, Inter=Inter, key=k_fc, use_bias=use_bias, out_first=True)
-        up_proj = RLoraLinear.init(Out=Mlp, In=Embed, Inter=Inter, key=k_up_proj, use_bias=use_bias, out_first=True)
+        gate_proj = RLoraLinear.init(
+            Out=Mlp, In=Embed, Inter=Inter, scale=scale, key=k_fc, use_bias=use_bias, out_first=True
+        )
+        up_proj = RLoraLinear.init(
+            Out=Mlp, In=Embed, Inter=Inter, scale=scale, key=k_up_proj, use_bias=use_bias, out_first=True
+        )
         down_proj = RLoraLinear.init(
-            Out=Embed, In=Mlp, Inter=Inter, key=k_down_proj, use_bias=use_bias, out_first=True
+            Out=Embed, In=Mlp, Inter=Inter, scale=scale, key=k_down_proj, use_bias=use_bias, out_first=True
         )
         if isinstance(activation_fn, str):
             activation_fn = ACT2FN[activation_fn]
@@ -392,6 +405,7 @@ class RQwenDecoderLayer(eqx.Module):
             config.Mlp,
             (config.Loras, config.LoraRank),
             config.activation_function,
+            scale=config.scale,
             key=k_mlp,
             use_bias=config.use_bias,
         )
