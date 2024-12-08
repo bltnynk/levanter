@@ -155,7 +155,7 @@ def reinit_lora_weights(model: eqx.Module, *, key: jax.random.PRNGKey) -> eqx.Mo
         if isinstance(x, LowRankLinear):
             lora_a = re_init_linear(x.lora_a, init_scale=1.0, key=next(keys))
             lora_b = re_init_linear(x.lora_b, init_scale=0.0, key=next(keys))
-            return LowRankLinear(lora_a, lora_b)
+            return LowRankLinear(lora_a, lora_b, x.scale)
         elif isinstance(x, Router):
             return re_init_linear(x, init_scale=1.0, key=next(keys))
         else:
