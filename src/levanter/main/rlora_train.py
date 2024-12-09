@@ -10,6 +10,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom
+import optax
 from jaxtyping import PyTree
 
 import haliax as hax
@@ -53,6 +54,34 @@ class TrainLmConfig:
     z_loss_weight: float = 0.0
     router_z_loss_weight: float = 0.0
     full_ft: bool = False
+    embedding_router_token_ft: bool = False
+
+    def __post_init__(self):
+        if self.embedding_router_token_ft and self.full_ft:
+            raise ValueError("Can't have both full_ft and embedding_router_token_ft")
+        if self.embedding_router_token_ft and not self.data.add_router_token:
+            raise ValueError("Can't have embedding_router_token_ft without add_router_token")
+
+
+def filter_embedding_grads(optimizer: optax.GradientTransformation, Embed, Vocab, token_mask: hax.NamedArray):
+    def where(m: RQwenLMHeadModel):
+        return [m.embeddings]
+
+    def replace_fn(x):
+        if isinstance(x, hnn.Embedding):
+            assert x.weight is not None, "No embedding updates, is embedding_ft True?"
+            new_grads = x.weight * token_mask.broadcast_to((Vocab, Embed))
+            return dataclasses.replace(x, weight=new_grads)
+        return x
+
+    def update_fn(updates, state, params=None):
+        del params
+        updates = eqx.tree_at(where, updates, replace_fn=replace_fn)
+        return updates, state
+
+    mask_transform = optax.GradientTransformation(lambda _: optax.EmptyState(), update_fn)
+
+    return optax.chain(optimizer, mask_transform)
 
 
 def compute_next_token_loss(
@@ -180,7 +209,19 @@ def main(config: TrainLmConfig):
         converter = converter.replaced(reference_checkpoint=config.initialize_from_hf, tokenizer=tokenizer)
 
     levanter.initialize(config)
+
+    vocab_size = len(tokenizer)
+    parameter_axis_mapping = config.trainer.parameter_axis_mapping
+    Vocab = round_axis_for_partitioning(Axis("vocab", vocab_size), parameter_axis_mapping)
+    if vocab_size != Vocab.size:
+        logger.info(f"Rounding vocab size from {vocab_size} to {Vocab.size} for partitioning")
+
     optimizer = config.optimizer.build(config.trainer.num_train_steps)
+    if config.embedding_router_token_ft:
+        token_mask = hax.nn.one_hot(
+            tokenizer.convert_tokens_to_ids(config.data.router_token), Vocab, dtype=jnp.float32
+        )
+        optimizer = filter_embedding_grads(optimizer, config.model.Embed, Vocab, token_mask)
 
     # some axes we need
     Batch = config.trainer.TrainBatch
@@ -191,7 +232,7 @@ def main(config: TrainLmConfig):
         logsumexp_weight=config.z_loss_weight,
         batch_axis=config.trainer.TrainBatch,
         router_zloss_weight=config.router_z_loss_weight,
-        stop_grad=not config.full_ft,
+        stop_grad=not (config.full_ft or config.embedding_router_token_ft),
     )
 
     # Using the trainer as a context manager does 3 things:
@@ -232,10 +273,6 @@ def main(config: TrainLmConfig):
         # to do partitioning, our dimensions have to be divisible by the size of the physical axes they're mapped to
         # For most things, we just insist you specify the config right, but tokenizers often have strange numbers of
         # tokens: gpt-2 has 50257, for example. So we round up.
-        vocab_size = len(tokenizer)
-        Vocab = round_axis_for_partitioning(Axis("vocab", vocab_size), parameter_axis_mapping)
-        if vocab_size != Vocab.size:
-            logger.info(f"Rounding vocab size from {vocab_size} to {Vocab.size} for partitioning")
 
         def model_init():
             return config.model.build(Vocab, key=model_key)
@@ -246,6 +283,8 @@ def main(config: TrainLmConfig):
             is_trainable = True
         else:
             is_trainable = lora_trainable_params_filter(model_shape)
+            if config.embedding_router_token_ft:
+                is_trainable = eqx.tree_at(lambda x: x.embeddings, is_trainable, replace=True)
         state = trainer.initial_state(training_key, model_init=model_init, is_trainable=is_trainable)
 
         seek_dataloader = True

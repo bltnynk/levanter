@@ -74,6 +74,8 @@ def test_rlora_train():
                 ),
                 optimizer=AdamConfig(learning_rate=0.001, weight_decay=0.1, warmup=0.00, lr_schedule="constant"),
                 router_z_loss_weight=0.001,
+                full_ft=False,
+                embedding_router_token_ft=True,
             )
             rlora_train.main(config)
         finally:
