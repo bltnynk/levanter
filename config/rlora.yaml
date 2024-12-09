@@ -1,5 +1,6 @@
 initialize_from_hf: "Qwen/Qwen2.5-Coder-1.5B"
-full_ft: true
+full_ft: false
+embedding_router_token_ft: true
 data:
   train_urls:
     - gs://usc-stack-v2/shard1_150_flat.jsonl.gz
@@ -10,7 +11,7 @@ data:
   cache_dir: "gs://usc2-datacache/shard1"
   tokenizer: "Qwen/Qwen2.5-Coder-1.5B"
   shuffle: true
-  predict_prefix: true
+  predict_prefix: false
   predict_router_token: false
   predict_fim_token: false
 model:
@@ -36,13 +37,14 @@ model:
 
   num_loras: 64
   lora_rank: 8
-  top_k: 16
+  top_k: 8
+  scale: 1.0
 
 trainer:
   tracker:
     type: wandb
     project: "levanter-rlora"
-    tags: ["testing", "qwen"]
+    tags: ["full_ft_sweep_v4"]
   mp: p=f32,c=bfloat16
   train_batch_size: 8
   num_train_steps: 3000
