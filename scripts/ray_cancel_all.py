@@ -16,7 +16,14 @@ def cancel_all_ray_jobs():
 
     # Extract job IDs using regex
     job_list_output = result.stdout
-    job_ids = re.findall(r"job_id='([a-fA-F0-9]+)'", job_list_output)
+    job_ids = []
+    for line in job_list_output.split("\n"):
+        if "status=<JobStatus.RUNNING" in line or "status=<JobStatus.PENDING" in line:
+            job_id = re.findall(r"job_id='([a-fA-F0-9]+)'", line)
+            if job_id:
+                job_ids.append(job_id[0])
+            else:
+                print(f"Failed to extract job ID from line: {line}")
 
     if not job_ids:
         print("No jobs found to cancel.")
