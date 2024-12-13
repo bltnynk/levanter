@@ -1,4 +1,5 @@
 import contextlib
+import functools
 import json
 import warnings
 from dataclasses import fields
@@ -12,12 +13,14 @@ from jax.experimental import mesh_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec, PositionalSharding
 from jaxtyping import PRNGKeyArray, PyTree
 
-import haliax
+import haliax as hax
+from haliax import is_named_array
 from haliax.jax_utils import is_jax_array_like
-from haliax.partitioning import ResourceAxis
+from haliax.partitioning import ResourceAxis, ResourceMapping
 
 
 X = TypeVar("X")
+T = TypeVar("T", bound=PyTree)
 
 
 def jnp_to_python(a: jnp.ndarray):
@@ -152,17 +155,21 @@ def leaf_key_paths(
         x, prefix=join_key(prefix, p), is_leaf=is_leaf, use_state_dict_keys=use_state_dict_keys
     )
 
+    out: PyTree[str]
+
     if is_leaf is not None and is_leaf(pytree):
-        return prefix
+        out = prefix
+    elif pytree is None:
+        out = None
     elif isinstance(pytree, dict):
-        return {k: rec(v, k) for k, v in pytree.items()}
+        out = {k: rec(v, k) for k, v in pytree.items()}
     elif _isnamedtupleinstance(pytree):
         d = {k: rec(v, k) for k, v in pytree._asdict().items()}
-        return pytree.__class__(**d)
+        out = pytree.__class__(**d)
     elif isinstance(pytree, list):
-        return [rec(v, str(i)) for i, v in enumerate(pytree)]
+        out = [rec(v, str(i)) for i, v in enumerate(pytree)]
     elif isinstance(pytree, tuple):
-        return tuple(rec(v, str(i)) for i, v in enumerate(pytree))
+        out = tuple(rec(v, str(i)) for i, v in enumerate(pytree))
     elif isinstance(pytree, eqx.Module):
         names = []
         rec_values = []
@@ -170,26 +177,28 @@ def leaf_key_paths(
             if field.metadata.get("static", False):
                 continue
             field_name = field.name
-            field = getattr(pytree, field_name)
+            field_value = getattr(pytree, field_name)
             names.append(field_name)
 
             if use_state_dict_keys and hasattr(pytree, "_state_dict_key_map"):
                 field_name = pytree._state_dict_key_map().get(field_name, field_name)
 
-            rec_value = rec(field, field_name)
+            rec_value = rec(field_value, field_name)
             rec_values.append(rec_value)
 
         _, tree_def = eqx.tree_flatten_one_level(pytree)
         out = jax.tree_util.tree_unflatten(tree_def, rec_values)
-        return out
-        # this doesn't work reliably because tree_at doesn't like none values
-        # return eqx.tree_at(lambda m: [getattr(m, name) for name in names], pytree, rec_values, is_leaf=lambda x: x is None)
     else:
         leaves, treedef = jax.tree_util.tree_flatten(pytree, is_leaf=is_leaf)
-        if len(leaves) == 1:
-            return jax.tree_util.tree_unflatten(treedef, [f"{prefix}"])
+        if len(leaves) == 0:
+            out = None
+        elif len(leaves) == 1:
+            out = jax.tree_util.tree_unflatten(treedef, [f"{prefix}"])
         else:
-            return jax.tree_util.tree_unflatten(treedef, [join_key(prefix, str(i)) for i in range(len(leaves))])
+            out = jax.tree_util.tree_unflatten(treedef, [join_key(prefix, str(i)) for i in range(len(leaves))])
+
+    # assert len(jax.tree.leaves(out, is_leaf=is_leaf)) == len(jax.tree.leaves(pytree, is_leaf=is_leaf)), (out, pytree)
+    return out
 
 
 def join_key(prefix, k):
@@ -252,7 +261,7 @@ def best_effort_sharding(shape, *, devices=None, mesh=None):
         devices = jax.devices()
 
     if mesh is None:
-        mesh = haliax.partitioning._get_mesh()
+        mesh = hax.partitioning._get_mesh()
         if mesh.devices.shape == ():
             mesh = None
 
@@ -273,7 +282,7 @@ def best_effort_sharding(shape, *, devices=None, mesh=None):
         return sharding
     else:
         # get the existing mesh and find the FSDP axis
-        fsdp_axis = mesh.axis_names.index(haliax.partitioning.ResourceAxis.DATA)
+        fsdp_axis = mesh.axis_names.index(hax.partitioning.ResourceAxis.DATA)
         num_devices = mesh.devices.shape[fsdp_axis]
 
         for i in range(len(shape) - 1, -1, -1):
@@ -285,7 +294,7 @@ def best_effort_sharding(shape, *, devices=None, mesh=None):
             return NamedSharding(mesh, PartitionSpec(None))
 
         axis_sharding = [None] * len(shape)
-        axis_sharding[sharded_axis] = haliax.partitioning.ResourceAxis.DATA
+        axis_sharding[sharded_axis] = hax.partitioning.ResourceAxis.DATA
         sharding = NamedSharding(mesh, PartitionSpec(*axis_sharding))
 
         return sharding
@@ -334,3 +343,29 @@ def estimated_free_device_memory(device) -> Optional[float]:
         in_use = stats.get("bytes_in_use", 0)
 
         return (limit - in_use) // (1024.0**3)
+
+
+def zeros_like_tree(tree: T, axis_mapping: Optional[ResourceMapping] = None, dtype: Optional[jnp.dtype] = None) -> T:
+    """
+    Creates a tree of zeros with the same structure as the input tree. If the input tree contains NamedArrays, then
+    those will be sharded according to the axis_mapping (or the context axis mapping if not provided).
+    """
+    _zeros = functools.partial(_zeros_like, axis_mapping, dtype)
+    acc = jax.tree_util.tree_map(_zeros, tree, is_leaf=is_named_array)
+    return acc
+
+
+def _zeros_like(mapping, dtype, n):
+    if isinstance(n, hax.NamedArray):
+        return hax.shard(hax.zeros_like(n, dtype=dtype), mapping)
+    elif is_jax_array_like(n):
+        return jnp.zeros_like(n, dtype)
+    else:
+        assert jnp.isscalar(n)
+        if dtype is None:
+            # if it's a nan, we want to go to 0
+            if n != n:
+                return 0
+            return n - n
+        else:
+            return jnp.zeros((), dtype=dtype)

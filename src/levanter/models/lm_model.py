@@ -4,28 +4,34 @@ from typing import Generic, Optional, Type, TypeVar
 
 import draccus
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 from jax.random import PRNGKey
 
 import haliax as hax
-from haliax import Axis, NamedArray
+from haliax import Axis, NamedArray, NamedOrNumeric
 
+from levanter.grad_accum import NumElementsBatch
 from levanter.models.attention import AttentionMask
-from levanter.models.loss import next_token_loss
+from levanter.models.loss import maybe_fused_next_token_loss
 
 
 LmConfigT = TypeVar("LmConfigT", bound="LmConfig")
 LmT = TypeVar("LmT", bound="LmHeadModel")
 
 
-class LmExample(eqx.Module):
+class LmExample(eqx.Module, NumElementsBatch):
     tokens: hax.NamedArray
     loss_mask: hax.NamedArray
     attn_mask: AttentionMask | NamedArray = AttentionMask.causal()
 
     @staticmethod
     def causal(
-        tokens: hax.NamedArray, *, loss_mask: Optional[hax.NamedArray] = None, ignore_id: Optional[int] = None
+        tokens: hax.NamedArray,
+        *,
+        loss_mask: Optional[hax.NamedArray] = None,
+        ignore_id: Optional[int] = None,
+        eos_id: Optional[int] = None,
     ) -> "LmExample":
         if tokens.ndim != 1:
             raise ValueError("tokens must be a 1D array")
@@ -45,7 +51,46 @@ class LmExample(eqx.Module):
             loss_mask = loss_mask * ignore_mask
 
         attn_mask = AttentionMask.causal()
+
+        if eos_id is not None:
+            # the next token after an eos token is in a new segment
+            eos_mask = hax.roll(tokens, 1, Pos) == eos_id
+            # first token is always in segment 0
+            eos_mask = eos_mask.at[Pos, 0].set(False).astype(jnp.int32)
+            segment_ids = hax.cumsum(eos_mask, axis=Pos)
+            attn_mask = attn_mask.with_segment_ids(segment_ids)
+
         return LmExample(tokens=tokens, loss_mask=loss_mask, attn_mask=attn_mask)
+
+    @staticmethod
+    def from_prompt_and_completion(
+        Pos,
+        tokens: hax.NamedArray,
+        prompt_length: NamedOrNumeric,
+        *,
+        ignore_id: Optional[int] = None,
+        all_causal: bool = True,
+    ) -> "LmExample":
+        # mask out the prompt tokens
+        loss_mask = hax.arange(Pos) >= prompt_length - 1
+        # don't predict the padding
+        if ignore_id is not None:
+            targets = hax.roll(tokens, -1, Pos)
+            loss_mask = loss_mask & (targets != ignore_id)
+
+        # don't predict the last token
+        loss_mask = loss_mask & (1 - hax.nn.one_hot(-1, Pos, dtype=jax.numpy.bool_))
+
+        if all_causal:
+            attn_mask = AttentionMask.causal()
+        else:
+            # causal just for the completion part. We don't have a special structured mask for this, so we just
+            raise NotImplementedError("Not implemented yet")
+
+        return LmExample(tokens=tokens, loss_mask=loss_mask, attn_mask=attn_mask)
+
+    def num_elements(self):
+        return self.loss_mask.sum()
 
 
 class RoutableLmExample(LmExample):
@@ -53,7 +98,7 @@ class RoutableLmExample(LmExample):
     completion_mask: Optional[hax.NamedArray] = None
 
     @staticmethod
-    def causal(
+    def causal_with_hs_idxs(
         tokens: hax.NamedArray,
         router_hs_idxs: Optional[hax.NamedArray] = None,
         *,
@@ -69,6 +114,11 @@ class RoutableLmExample(LmExample):
             router_hs_idxs=router_hs_idxs,
             completion_mask=completion_mask,
         )
+
+    def num_elements(self, completion=False):
+        if completion:
+            return self.completion_mask.sum()
+        return super().num_elements()
 
 
 # TODO: for some reason, mypy doesn't like the discover_packages_path argument?
@@ -203,6 +253,7 @@ def compute_next_token_loss(
     key=None,
     reduction: Optional[hax.ReductionFunction] = hax.mean,
     reduction_axis: Optional[hax.AxisSelection] = None,
+    batch_num_elements: Optional[int] = None,
     logsumexp_weight: Optional[float] = None,
     loss_dtype: Optional[Type[jnp.dtype]] = jnp.float32,
 ) -> jnp.ndarray | NamedArray:
@@ -213,7 +264,7 @@ def compute_next_token_loss(
     """
     activations = model.activations(example.tokens, example.attn_mask, key=key)
 
-    loss = next_token_loss(
+    loss = maybe_fused_next_token_loss(
         model.Pos,
         model.Embed,
         model.Vocab,
@@ -223,6 +274,7 @@ def compute_next_token_loss(
         loss_mask=example.loss_mask,
         reduction=reduction,
         reduction_axis=reduction_axis,
+        batch_num_elements=batch_num_elements,
         logsumexp_weight=logsumexp_weight,
         dtype=loss_dtype,
         block_size=model.config.cross_entropy_block_size,

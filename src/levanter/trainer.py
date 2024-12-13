@@ -9,21 +9,7 @@ import warnings
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Generic,
-    Iterable,
-    List,
-    Mapping,
-    Optional,
-    Protocol,
-    Sequence,
-    Tuple,
-    TypeVar,
-    Union,
-)
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple, TypeVar, Union
 
 import equinox as eqx
 import jax
@@ -42,28 +28,28 @@ from haliax.quantization import Fp8Config
 from haliax.types import Scalar
 
 import levanter.checkpoint
-import levanter.logging
 import levanter.tracker
 import levanter.tracker.wandb
+import levanter.utils.logging
 from levanter import tracker
+from levanter.callbacks import Callback, CBInfo, JitCallback, LambdaCallback, M, S, StepInfo
 from levanter.checkpoint import CheckpointerConfig, load_checkpoint_or_initialize
 from levanter.config import JsonAtom
 from levanter.data import AsyncDataset, DataLoader
 from levanter.distributed import DistributedConfig, RayConfig
-from levanter.grad_accum import microbatched
+from levanter.grad_accum import NumElementsBatch, ReductionType, microbatched
+from levanter.models.lm_model import RoutableLmExample
 from levanter.tracker import TrackerConfig, capture_time
 from levanter.trainer_state import TrainerState, saveable_training_mask
-from levanter.types import ComputeLossFunction, FilterSpec
 from levanter.utils import cloud_utils, fsspec_utils
-from levanter.utils.jax_utils import create_fsdp_mesh
+from levanter.utils.jax_utils import create_fsdp_mesh, zeros_like_tree
 from levanter.utils.tree_utils import inference_mode
+from levanter.utils.types import ComputeLossFunction, FilterSpec
 
 
 logger = pylogging.getLogger(__name__)
 
-M = TypeVar("M")  # Model
 X = TypeVar("X")  # Input
-S = TypeVar("S", bound=TrainerState)
 
 DEFAULT_JAX_CONFIG: Dict[str, JsonAtom] = {
     "jax_threefry_partitionable": True,
@@ -71,46 +57,66 @@ DEFAULT_JAX_CONFIG: Dict[str, JsonAtom] = {
 }
 
 
-# A note on the semantics of "step" vs "next_step":
-# The "step" of a TrainerState is the state after `step` steps have been taken.
-# A "StepInfo"'s step is the step that was just completed. If you want the next step, use `next_step`.
-@dataclass
-class StepInfo(Generic[S]):
-    state: S
-    loss: float
-    step_duration: float
-    extras: dict = field(default_factory=dict)
-
-    model = property(lambda self: self.state.model)
-    opt_state = property(lambda self: self.state.opt_state)
-
-    step = property(lambda self: int(self.state.step) - 1)
-    """
-    The step that was just completed. If you want the next step, use `next_step`.
-    """
-    next_step = property(lambda self: int(self.state.step))
-
-
 @dataclass
 class _Hook:
-    fn: Callable[[StepInfo], None]
+    fn: Callback
+    every: int
+
+
+@dataclass
+class _JitHook:
+    fn: JitCallback
     every: int
 
 
 class TrainerHooks:
     hooks: List[_Hook]
+    stateful_hooks: List[_JitHook]
 
     def __init__(self):
         self.hooks = []
+        self.stateful_hooks = []
 
     def run_hooks(self, info: StepInfo, force: bool = False):
         for hook in self.hooks:
             if force or info.step % hook.every == 0:
-                hook.fn(info)
+                hook.fn.on_step(info, force=force)
 
-    def add_hook(self, fn: Optional[Callable[[StepInfo], Any]] = None, *, every: int = 1):
-        def decorator(fn: Callable[[StepInfo], None]):
-            self.hooks.append(_Hook(fn, every))
+    def run_jit_hooks_outside_step(self, info: StepInfo, cb_infos: Sequence[PyTree], force: bool = False):
+        for s_hook, cb_info in zip(self.stateful_hooks, cb_infos):
+            if force or (info.step % s_hook.every == 0):
+                s_hook.fn.on_step(info, cb_info)
+
+    def run_jit_hooks(self, state: TrainerState, grad: M, force: bool = False) -> tuple[PyTree, ...]:
+        hook: _JitHook
+        hook_infos = []
+        for hook in self.stateful_hooks:
+            hook_shape = eqx.filter_eval_shape(hook.fn.inside_step, state, grad)
+            new_s = jax.lax.cond(
+                force or (state.step % hook.every == 0),
+                lambda: hook.fn.inside_step(state, grad),
+                lambda: zeros_like_tree(hook_shape),
+            )
+            hook_infos.append(new_s)
+
+        return tuple(hook_infos)
+
+    def add_hook(self, fn: Optional[Callable[[StepInfo], Any] | JitCallback | Callback] = None, *, every: int = 1):
+        def decorator(fn):
+            is_something = False
+
+            if isinstance(fn, Callback):
+                self.hooks.append(_Hook(fn, every))
+                is_something = True
+
+            if isinstance(fn, JitCallback):
+                self.stateful_hooks.append(_JitHook(fn, every))
+                is_something = True
+
+            if not is_something:
+                if not callable(fn):
+                    raise ValueError(f"fn must be callable, got {fn}")
+                self.hooks.append(_Hook(LambdaCallback(fn), every))
 
         if fn is None:
             return decorator
@@ -221,10 +227,18 @@ class Trainer:
         ...
 
     @typing.overload
+    def add_hook(self, fn: JitCallback, *, every: int = 1):
+        ...
+
+    @typing.overload
+    def add_hook(self, fn: Callback, *, every: int = 1):
+        ...
+
+    @typing.overload
     def add_hook(self, *, every: int = 1):
         ...
 
-    def add_hook(self, fn: Optional[Callable[[StepInfo], Any]] = None, *, every: int = 1):
+    def add_hook(self, fn: Optional[Callable[[StepInfo], Any] | Callback | JitCallback] = None, *, every: int = 1):
         return self.hooks.add_hook(fn, every=every)
 
     def run_hooks(self, info: StepInfo, force: bool = False):
@@ -367,18 +381,35 @@ class Trainer:
             checkpoint_path = self.config.checkpointer.expanded_path(self.run_id)
         return checkpoint_path
 
-    def train_step(self, state: S, *batch: X, **batch_kwargs) -> StepInfo[S]:
+    def train_step(self, state: S, batch: X, **batch_kwargs) -> StepInfo[S]:
         """
         Performs a single training step.
         """
+        # jit hooks impose a nontrivial cost even when they're not run (since they defeat some compiler optimizations)
+        # so we avoid running them when they're not needed
+        # this results in two compiles, but the cost of the second compile is worth it
+        hooks_this_time = any(state.step % h.every == 0 for h in self.hooks.stateful_hooks)
+
         with capture_time() as step_time:
-            loss, new_state, extras = self._jit_train_step_fn(state, *batch, **batch_kwargs)
-            # force the loss so timing numbers are accurate. laziness isn't going to help here (i think?)
+            if hooks_this_time:
+                loss, new_state, extras, cb_states = self._jit_train_step_fn(state, batch, batch_kwargs)
+                # force the loss so timing numbers are accurate. laziness isn't going to help here (i think?)
+            else:
+                loss, new_state, extras = self._jit_train_step_fn_no_hook(state, batch, batch_kwargs)
             loss = loss.item()  # type: ignore
 
-        return StepInfo(new_state, loss, step_time(), extras)
+            info = StepInfo(new_state, loss, step_time(), extras)
 
-    def training_steps(self, state: S, train_loader, run_hooks: bool = True) -> typing.Iterator[StepInfo[S]]:
+            with capture_time() as hook_time:
+                self.run_hooks(info)
+                if hooks_this_time:
+                    self.hooks.run_jit_hooks_outside_step(info, cb_states)
+
+            levanter.tracker.log({"throughput/hook_time": hook_time()}, step=info.step)
+
+        return info
+
+    def training_steps(self, state: S, train_loader) -> typing.Iterator[StepInfo[S]]:
         """
         Generator that yields training steps and runs hooks.
         """
@@ -390,26 +421,19 @@ class Trainer:
             info = self.train_step(state, example)
             state = info.state
 
-            if run_hooks:
-                with capture_time() as hook_time:
-                    self.run_hooks(info)
-
-                levanter.tracker.log_metrics({"throughput/hook_time": hook_time()}, step=info.step)
-
-            levanter.tracker.log_metrics({"throughput/loading_time": loading_time()}, step=info.step)
+            levanter.tracker.log({"throughput/loading_time": loading_time()}, step=info.step)
 
             yield info
 
-    def train(self, state: S, train_loader: Iterable[X], run_hooks: bool = True) -> StepInfo[S]:
+    def train(self, state: S, train_loader: Iterable[X]) -> StepInfo[S]:
         """
         Performs training until the number of steps is reached.
         """
-        for info in self.training_steps(state, train_loader, run_hooks=run_hooks):
+        for info in self.training_steps(state, train_loader):
             pass
 
-        if run_hooks:
-            # force hooks to run at the end
-            self.run_hooks(info, force=True)
+        # force hooks to run at the end
+        self.run_hooks(info, force=True)
 
         return info
 
@@ -491,13 +515,28 @@ class Trainer:
             donate_args=(True,),
         )
 
-    def _train_step(self, state: S, *batch, **batch_kwargs) -> tuple[Scalar, S, dict]:
+    @cached_property
+    def _jit_train_step_fn_no_hook(self):
+        return named_jit(
+            functools.partial(self._train_step, _no_hooks=True),
+            axis_resources=self.parameter_axis_mapping,
+            out_axis_resources=self.parameter_axis_mapping,
+            donate_args=(True,),
+        )
+
+    def _train_step(
+        self, state: S, batch, batch_kwargs, _no_hooks=False
+    ) -> tuple[Scalar, S, dict, Sequence[CBInfo]] | tuple[Scalar, S, dict]:
         key, new_key = jax.random.split(state.training_key)
         model = inference_mode(state.model, False)
 
         (loss, extras), grads = self._compute_gradients_microbatched(
-            self.loss_fn, model, *batch, **batch_kwargs, key=key
+            self.loss_fn, model, batch, **batch_kwargs, key=key
         )
+
+        with hax.axis_mapping(self.parameter_axis_mapping):
+            if not _no_hooks:
+                hook_infos = self.hooks.run_jit_hooks(state, grads, force=False)
 
         # Sophia needs to be able to access the loss function in the optimizer
         def obj_fun(trainable_model):
@@ -508,20 +547,34 @@ class Trainer:
 
         new_state = state.take_step(grads, obj_fun=obj_fun)
         new_state = hax.shard(new_state, self.parameter_axis_mapping)
-        return loss, new_state, extras
+        if _no_hooks:
+            return loss, new_state, extras
+        else:
+            return loss, new_state, extras, hook_infos
 
-    def _compute_gradients_microbatched(self, loss_fn, model: M, *batch, **batch_kwargs) -> tuple[Scalar, M]:
+    def _compute_gradients_microbatched(self, loss_fn, model: M, batch: X, **batch_kwargs) -> tuple[Scalar, M]:
         grad_fn = eqx.filter_value_and_grad(loss_fn, has_aux=True)
         mbs = self.config.microbatch_size
+        reduce = ReductionType.MEAN
+        if isinstance(batch, NumElementsBatch) and mbs != self.TrainBatch.size:
+            # tell the loss function how many elements are in the batch
+            batch_kwargs["batch_num_elements"] = batch.num_elements()
+            # the loss fn should sum the loss and divide by the number of elements, not average
+            batch_kwargs["reduction"] = hax.sum
+            reduce = ReductionType.SUM  # we're already normalizing the loss
+            if isinstance(batch, RoutableLmExample):
+                batch_kwargs["batch_completion_num_elements"] = batch.num_elements(completion=True)
+
         grad_fn = microbatched(
             grad_fn,
             self.TrainBatch,
             mbs,
             self.parameter_axis_mapping,
             self.compute_axis_mapping,
+            reduce=reduce,
         )
         with hax.axis_mapping(self.compute_axis_mapping):
-            return grad_fn(model, *batch, **batch_kwargs)
+            return grad_fn(model, batch, **batch_kwargs)
 
 
 def _initialize_global_tracker(config, run_id):
@@ -634,7 +687,7 @@ class TrainerConfig:
         self._validate_and_set_defaults()
 
         id = self._maybe_set_id()
-        levanter.logging.init_logging(self.log_dir, f"{id}.log")
+        levanter.utils.logging.init_logging(self.log_dir, f"{id}.log")
         _initialize_global_tracker(self.tracker, id)
 
         self.ray.initialize()

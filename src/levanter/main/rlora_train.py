@@ -23,7 +23,7 @@ from levanter import callbacks
 from levanter.checkpoint import EpochCheckpointer, load_checkpoint
 from levanter.data.text import FIMUrlSourceConfig, mk_fim_dataset
 from levanter.models.lm_model import LmExample, RoutableLmExample
-from levanter.models.loss import next_token_loss
+from levanter.models.loss import maybe_fused_next_token_loss
 from levanter.models.routed_lora_model import (
     LowRankLinear,
     Router,
@@ -33,8 +33,8 @@ from levanter.models.routed_lora_model import (
 )
 from levanter.optim import AdamConfig, OptimizerConfig
 from levanter.trainer import Trainer, TrainerConfig
-from levanter.types import FilterSpec
 from levanter.utils.jax_utils import key_iterator, parameter_count
+from levanter.utils.types import FilterSpec
 
 
 logger = logging.getLogger(__name__)
@@ -88,10 +88,11 @@ def compute_next_token_loss(
     model: RQwenLMHeadModel,
     example: LmExample,
     *,
-    batch_axis: Axis,
     key=None,
     reduction: Optional[hax.ReductionFunction] = hax.mean,
     reduction_axis: Optional[hax.AxisSelection] = None,
+    batch_num_elements: Optional[int] = None,
+    batch_completion_num_elements: Optional[int] = None,
     logsumexp_weight: Optional[float] = None,
     loss_dtype: Optional[Type[jnp.dtype]] = jnp.float32,
     router_zloss_weight: float = 0.0,
@@ -105,6 +106,7 @@ def compute_next_token_loss(
     assert isinstance(example, RoutableLmExample)
     # This is problematic, we don't get correctly batched ones so...
     idxs = jnp.squeeze(example.router_hs_idxs, axis=1)
+    batch_axis = example.tokens.resolve_axis("batch")
     idxs = hax.NamedArray(idxs, (batch_axis,))
     example = dataclasses.replace(example, router_hs_idxs=idxs)
     activations, rlogits, extras = model.routed_forward(
@@ -117,7 +119,7 @@ def compute_next_token_loss(
         router_stop_grad=stop_grad,
     )
 
-    loss = next_token_loss(
+    loss = maybe_fused_next_token_loss(
         model.Pos,
         model.Embed,
         model.Vocab,
@@ -125,6 +127,7 @@ def compute_next_token_loss(
         model.get_lm_head(),
         example.tokens,
         loss_mask=example.loss_mask,
+        batch_num_elements=batch_num_elements,
         reduction=reduction,
         reduction_axis=reduction_axis,
         logsumexp_weight=logsumexp_weight,
@@ -132,7 +135,7 @@ def compute_next_token_loss(
         block_size=model.config.cross_entropy_block_size,
     )
 
-    completion_loss = next_token_loss(
+    completion_loss = maybe_fused_next_token_loss(
         model.Pos,
         model.Embed,
         model.Vocab,
@@ -142,6 +145,7 @@ def compute_next_token_loss(
         loss_mask=example.completion_mask,  # only looking at completion
         reduction=reduction,
         reduction_axis=reduction_axis,
+        batch_num_elements=batch_completion_num_elements,
         logsumexp_weight=logsumexp_weight,
         dtype=loss_dtype,
         block_size=model.config.cross_entropy_block_size,
@@ -230,7 +234,6 @@ def main(config: TrainLmConfig):
     loss_function = functools.partial(
         compute_next_token_loss,
         logsumexp_weight=config.z_loss_weight,
-        batch_axis=config.trainer.TrainBatch,
         router_zloss_weight=config.router_z_loss_weight,
         stop_grad=not (config.full_ft or config.embedding_router_token_ft),
     )

@@ -1,6 +1,6 @@
 import dataclasses
 from dataclasses import dataclass
-from typing import Dict, Optional, Type, Union
+from typing import Dict, Optional, Type
 
 import equinox as eqx
 import jax.numpy as jnp
@@ -14,13 +14,13 @@ from haliax.nn.scan import Stacked
 from haliax.state_dict import ModuleWithStateDictSerialization
 
 from levanter.compat.hf_checkpoints import HFCheckpointConverter
-from levanter.logging import silence_transformer_nag
 from levanter.models.attention import AttentionMask, dot_product_attention
 from levanter.models.llama import LlamaConfig, LlamaEmbedding, LlamaMlp, LlamaRMSNorm, LlamaTransformer
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.models.rotary import RotaryEmbeddingsConfig
-from levanter.types import BlockFoldable
 from levanter.utils.flop_utils import lm_flops_per_token
+from levanter.utils.logging import silence_transformer_nag
+from levanter.utils.types import BlockFoldable
 
 
 silence_transformer_nag()
@@ -282,42 +282,6 @@ class QwenLMHeadModel(LmHeadModel[QwenConfig], ModuleWithStateDictSerialization)
     def Vocab(self) -> Axis:
         return self.embeddings.Vocab
 
-    @classmethod
-    def init(cls, Vocab: Axis, config: QwenConfig, *, key) -> "QwenLMHeadModel":
-        k_t, k_emb = jrandom.split(key, 2)
-        transformer = QwenTransformer.init(config, key=k_t)
-        embeddings = LlamaEmbedding.init(Vocab, config, key=k_emb)
-        if config.tie_word_embeddings:
-            lm_head = None
-        else:
-            lm_head = hnn.Linear.init(In=config.Embed, Out=Vocab, key=k_emb, use_bias=False, out_first=True)
-
-        return QwenLMHeadModel(transformer, embeddings, lm_head)
-
-    def __call__(
-        self,
-        input_ids: NamedArray,
-        attn_mask: Optional[Union[NamedArray, AttentionMask]] = None,
-        *,
-        key=None,
-    ) -> NamedArray:
-        """
-        Args:
-            input_ids (NamedArray): [batch, position]
-                Indices of input sequence tokens in the vocabulary.
-            attn_mask (Union[NamedArray, AttentionMask], optional): [batch, position]
-                Mask to avoid performing attention on the padding token indices of the encoder input.
-                The attn_mask from training pipeline may be an AttentionMask object instead of NamedArray
-        """
-        k_t, k_head = maybe_rng_split(key, 2)
-        x = self.embeddings.embed(input_ids)
-        x = self.transformer(x, attn_mask=attn_mask, key=k_t)
-        if self.lm_head:
-            lm_logits = self.lm_head(x, key=k_head)
-        else:
-            lm_logits = self.embeddings.unembed(x)
-        return lm_logits
-
     def activations(
         self, input_ids: NamedArray, attn_mask: Optional[AttentionMask | NamedArray] = None, *, key=None
     ) -> NamedArray:
@@ -353,6 +317,18 @@ class QwenLMHeadModel(LmHeadModel[QwenConfig], ModuleWithStateDictSerialization)
             return dataclasses.replace(self, embeddings=new_embeddings, lm_head=new_lm_head)
         else:
             return dataclasses.replace(self, embeddings=new_embeddings)
+
+    @classmethod
+    def init(cls, Vocab: Axis, config: QwenConfig, *, key) -> "QwenLMHeadModel":
+        k_t, k_emb = jrandom.split(key, 2)
+        transformer = QwenTransformer.init(config, key=k_t)
+        embeddings = LlamaEmbedding.init(Vocab, config, key=k_emb)
+        if config.tie_word_embeddings:
+            lm_head = None
+        else:
+            lm_head = hnn.Linear.init(In=config.Embed, Out=Vocab, key=k_emb, use_bias=False, out_first=True)
+
+        return QwenLMHeadModel(transformer, embeddings, lm_head)
 
     def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
         return {"transformer": "model", "embeddings": None}

@@ -60,8 +60,9 @@ def test_rlora_train():
                 data=data_cfg,
                 model=model_cfg,
                 trainer=rlora_train.TrainerConfig(
-                    num_train_steps=8,
-                    train_batch_size=4,
+                    num_train_steps=16,
+                    train_batch_size=2,
+                    per_device_parallelism=1,  # test out grad accum
                     max_eval_batches=1,
                     steps_per_eval=2,
                     wandb=WandbConfig(mode="disabled"),
