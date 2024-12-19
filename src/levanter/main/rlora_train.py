@@ -68,11 +68,10 @@ def filter_embedding_grads(optimizer: optax.GradientTransformation, Embed, Vocab
         return [m.embeddings]
 
     def replace_fn(x):
-        if isinstance(x, hnn.Embedding):
-            assert x.weight is not None, "No embedding updates, is embedding_ft True?"
-            new_grads = x.weight * token_mask.broadcast_to((Vocab, Embed))
-            return dataclasses.replace(x, weight=new_grads)
-        return x
+        assert hasattr(x, 'token_embeddings') and isinstance(x.token_embeddings, hnn.Embedding) and x.token_embeddings.weight is not None
+        new_grads = x.token_embeddings.weight * token_mask.broadcast_to((Vocab, Embed))
+        new_token_embeddings = dataclasses.replace(x.token_embeddings, weight=new_grads)
+        return dataclasses.replace(x, token_embeddings=new_token_embeddings)
 
     def update_fn(updates, state, params=None):
         del params
