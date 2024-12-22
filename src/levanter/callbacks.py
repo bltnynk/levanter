@@ -17,6 +17,7 @@ from jaxtyping import PyTree
 from tqdm_loggable import tqdm_logging
 from tqdm_loggable.auto import tqdm
 
+import haliax as hax
 import haliax.nn
 from haliax import NamedArray, is_named_array
 from haliax.jax_utils import is_jax_array_like
@@ -30,6 +31,8 @@ from levanter.trainer_state import TrainerState
 from levanter.utils import flop_utils, jax_utils
 from levanter.utils.jax_utils import barrier_sync, jnp_to_python
 from levanter.utils.logging import save_xla_dumps_to_wandb
+from levanter.utils.stat_utils import RunningMean
+from levanter.utils.types import Extras
 from levanter.visualization import compute_and_visualize_log_probs as viz_probs
 
 
@@ -146,11 +149,8 @@ def get_total_dataset_tokens(ds: AsyncDataset, seq_length: int):
 
 
 def eval_loss_loop(loss_fn, model, dataset, max_batches: Optional[int] = None, name: Optional[str] = None):
-    total_loss = 0.0
-    total_load_time = 0.0
-    total_loss_time = 0.0
-    others = {}
-    n = 0
+    loss = RunningMean(jnp.zeros(()), jnp.zeros(()))
+    extras: Extras = {}
 
     if name is not None:
         desc = f"eval {name}"
@@ -161,33 +161,27 @@ def eval_loss_loop(loss_fn, model, dataset, max_batches: Optional[int] = None, n
     pbar = tqdm(dataset, desc=desc, position=1, leave=False, total=max_batches)
 
     iter_ = iter(pbar)
+    n = 0
     while True:
-        time_in = time.time()
+        n += 1
         batch = next(iter_, None)
         if batch is None:
             break
-        load_time = time.time() - time_in
-        total_load_time += load_time
-        loss, extras = loss_fn(model, batch)
+        losses, where, extras = loss_fn(model, batch)
+        mean_loss = hax.mean(losses, where=where)
+        loss += RunningMean(mean_loss, where.sum())
         for k, v in extras.items():
-            if k not in others:
-                others[k] = 0.0
-            others[k] += v
-        total_loss += loss.item()
-        n += 1
-        loss_time = time.time() - time_in - load_time
-        total_loss_time += loss_time
+            if k not in extras:
+                extras[k] = v
+            else:
+                extras[k] += v
 
-        pbar.set_postfix(loss=total_loss / n)
+        pbar.set_postfix(loss=loss.mean.item())
 
         if max_batches is not None and n >= max_batches:
             break
 
-    if n > 0:
-        total_loss /= n
-        others = {k: v / n for k, v in others.items()}
-
-    return total_loss, others
+    return loss.item(), {k: v.item() for k, v in extras.items()}
 
 
 def compute_validation_loss(
@@ -197,13 +191,14 @@ def compute_validation_loss(
     name: Optional[str] = None,
 ):
     def compute_loss(info: StepInfo):
-        loss, extra = eval_loss_loop(loss_fn, info.model, dataset, max_batches=max_batches, name=name)
+        loss, extras = eval_loss_loop(loss_fn, info.model, dataset, max_batches=max_batches, name=name)
 
         prefix = "eval"
         if name:
             prefix += "/" + name
-        others = {f"{prefix}/{k}": v for k, v in extra.items()}
-        levanter.tracker.log({f"{prefix}/loss": loss} | others, step=info.step)
+        levanter.tracker.log(
+            {f"{prefix}/loss": loss} | {f"{prefix}/{k}": v for k, v in extras.items()}, step=info.step
+        )
 
         if name:
             logger.info(f"{name} validation loss: {loss:.3f}")

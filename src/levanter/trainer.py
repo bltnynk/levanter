@@ -37,14 +37,13 @@ from levanter.checkpoint import CheckpointerConfig, load_checkpoint_or_initializ
 from levanter.config import JsonAtom
 from levanter.data import AsyncDataset, DataLoader
 from levanter.distributed import DistributedConfig, RayConfig
-from levanter.grad_accum import NumElementsBatch, ReductionType, microbatched
-from levanter.models.lm_model import RoutableLmExample
+from levanter.grad_accum import microbatched
 from levanter.tracker import TrackerConfig, capture_time
 from levanter.trainer_state import TrainerState, saveable_training_mask
 from levanter.utils import cloud_utils, fsspec_utils
 from levanter.utils.jax_utils import create_fsdp_mesh, zeros_like_tree
 from levanter.utils.tree_utils import inference_mode
-from levanter.utils.types import ComputeLossFunction, FilterSpec
+from levanter.utils.types import ComputeLossFunction, Extras, FilterSpec
 
 
 logger = pylogging.getLogger(__name__)
@@ -405,7 +404,8 @@ class Trainer:
                 if hooks_this_time:
                     self.hooks.run_jit_hooks_outside_step(info, cb_states)
 
-            levanter.tracker.log({"throughput/hook_time": hook_time()}, step=info.step)
+            log_items = {k: v.item() for k, v in extras.items()} | {"throughput/hook_time": hook_time()}
+            levanter.tracker.log(log_items, step=info.step)
 
         return info
 
@@ -526,7 +526,7 @@ class Trainer:
 
     def _train_step(
         self, state: S, batch, batch_kwargs, _no_hooks=False
-    ) -> tuple[Scalar, S, dict, Sequence[CBInfo]] | tuple[Scalar, S, dict]:
+    ) -> tuple[Scalar, S, Extras, Sequence[CBInfo]] | tuple[Scalar, S, Extras]:
         key, new_key = jax.random.split(state.training_key)
         model = inference_mode(state.model, False)
 
@@ -552,27 +552,17 @@ class Trainer:
         else:
             return loss, new_state, extras, hook_infos
 
-    def _compute_gradients_microbatched(self, loss_fn, model: M, batch: X, **batch_kwargs) -> tuple[Scalar, M]:
-        grad_fn = eqx.filter_value_and_grad(loss_fn, has_aux=True)
+    def _compute_gradients_microbatched(
+        self, loss_fn, model: M, batch: X, **batch_kwargs
+    ) -> tuple[tuple[Scalar, Extras], M]:
         mbs = self.config.microbatch_size
-        reduce = ReductionType.MEAN
-        if isinstance(batch, NumElementsBatch) and mbs != self.TrainBatch.size:
-            # tell the loss function how many elements are in the batch
-            batch_kwargs["batch_num_elements"] = batch.num_elements()
-            # the loss fn should sum the loss and divide by the number of elements, not average
-            batch_kwargs["reduction"] = hax.sum
-            reduce = ReductionType.SUM  # we're already normalizing the loss
-            if isinstance(batch, RoutableLmExample):
-                batch_kwargs["batch_completion_num_elements"] = batch.num_elements(completion=True)
-
         grad_fn = microbatched(
-            grad_fn,
+            loss_fn,
             self.TrainBatch,
             mbs,
             self.parameter_axis_mapping,
             self.compute_axis_mapping,
-            reduce=reduce,
-        )
+        )  # type: ignore
         with hax.axis_mapping(self.compute_axis_mapping):
             return grad_fn(model, batch, **batch_kwargs)
 

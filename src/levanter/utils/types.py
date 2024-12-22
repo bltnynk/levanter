@@ -1,6 +1,10 @@
-from typing import Any, Callable, Optional, Protocol, Tuple, TypeVar, Union
+import abc
+from typing import Any, Callable, Dict, Protocol, Tuple, TypeAlias, TypeVar, Union
 
+import equinox as eqx
+import jax
 from jaxtyping import PyTree
+from typing_extensions import Self
 
 import haliax as hax
 from haliax.types import Scalar
@@ -9,6 +13,19 @@ from haliax.types import Scalar
 M = TypeVar("M")  # Model
 M_con = TypeVar("M_con", contravariant=True)  # Model
 X = TypeVar("X", contravariant=True)  # Input
+
+
+class Accumulatable(abc.ABC, eqx.Module):
+    @abc.abstractmethod
+    def item(self) -> float:
+        pass
+
+    @abc.abstractmethod
+    def __add__(self, other: Self) -> Self:
+        pass
+
+
+Extras: TypeAlias = Dict[str, jax.Array | Accumulatable]
 
 try:
     from haliax.nn.scan import BlockFoldable
@@ -52,9 +69,6 @@ class ComputeLossFunction(Protocol[M_con, X]):
         self,
         model: M_con,
         input: X,
-        reduction: Optional[hax.ReductionFunction] = hax.mean,
-        reduction_axis: Optional[hax.AxisSelection] = None,
-        batch_num_elements: Optional[int] = None,
         **kwargs,
-    ) -> Scalar | hax.NamedArray:
+    ) -> tuple[hax.NamedArray, hax.NamedArray, Extras]:
         ...
