@@ -27,7 +27,7 @@ from levanter.models.lm_model import LmConfig, LmExample, RoutableLmExample
 from levanter.models.routed_mlp_model import (
     RoutedQwenConfig,
     compute_next_token_loss_with_routing,
-    reinit_routed_mlp_weights
+    reinit_routed_weights
     
 )
 from levanter.optim import AdamConfig, OptimizerConfig
@@ -150,7 +150,7 @@ def main(config: RoutedLMConfig):
         if config.full_ft:
             is_trainable = True
         else:
-            is_trainable = lora_trainable_params_filter(model_shape)
+            is_trainable = reinit_routed_weights(model_shape)
             if config.embedding_router_token_ft:
 
                 token_mask = hax.nn.one_hot(
@@ -190,7 +190,7 @@ def main(config: RoutedLMConfig):
                 )
                 # Loading from HF zeros out all missing weights so...
                 model = named_jit(
-                    lambda m: trainer.mp.cast_to_param(reinit_routed_mlp_weights(m, key=model_key)), parameter_axis_mapping
+                    lambda m: trainer.mp.cast_to_param(reinit_routed_weights(m, key=model_key)), parameter_axis_mapping
                 )(model)
                 state = dataclasses.replace(state, model=model)
             else:

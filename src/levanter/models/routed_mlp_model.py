@@ -22,6 +22,7 @@ from levanter.models.gpt2 import ACT2FN
 from levanter.models.llama import LlamaConfig, LlamaEmbedding, LlamaRMSNorm
 from levanter.models.lm_model import LmConfig, LmHeadModel, LmExample, RoutableLmExample
 from levanter.models.rotary import RotaryEmbeddingsConfig
+from levanter.models.qwen import QwenAttention
 from levanter.utils.flop_utils import lm_flops_per_token
 from levanter.utils.logging import silence_transformer_nag
 from levanter.models.loss import maybe_fused_next_token_loss
@@ -34,127 +35,6 @@ from transformers import Qwen2Config as HfQwenConfig  # noqa: E402
 
 import math
 
-
-class RoutedLowRankLayer(ModuleWithStateDictSerialization):
-    """Similar to LowRankLinear, with a non-linearity between two low-rank matrices mlp_a and mlp_b
-    Also contains a set of experts, each of which is a pair of (column, row) that could be routed to."""
-
-    mlp_a: hnn.Linear
-    mlp_b: hnn.Linear
-    expert_cols: hnn.Linear
-    expert_rows: hnn.Linear
-    scale: float = eqx.field(static=True)
-    act: Callable = eqx.static_field()
-
-    @staticmethod
-    def init(
-        In: AxisSpec,
-        Inter: AxisSpec,
-        Expert: AxisSpec,
-        Out: AxisSpec,
-        activation_fn: Union[str, Callable],
-        *,
-        key: PRNGKey,
-        scale: float = 1.0,
-        out_first: bool = True,
-        dot_general: Optional[DotGeneralOp] = None,
-    ) -> "RoutedLowRankLayer":
-        k_a, k_b, k_cols, k_rows = jrandom.split(key, 4)
-        kwargs = dict(
-            out_first=out_first,
-            dot_general=dot_general,
-        )
-        mlp_a = hnn.Linear.init(In=In, Out=Inter, key=k_a, use_bias=False, init_scale=1.0, **kwargs)
-        mlp_b = hnn.Linear.init(In=Inter, Out=Out, key=k_b, use_bias=False, init_scale=0.0, **kwargs)
-        expert_cols = hnn.Linear.init(In=In, Out=Expert, key=k_cols, use_bias=False, init_scale=1.0, **kwargs)
-        expert_rows = hnn.Linear.init(In=Expert, Out=Out, key=k_rows, use_bias=False, init_scale=0.0, **kwargs)
-        if isinstance(activation_fn, str):
-            activation_fn = ACT2FN[activation_fn]
-        act = activation_fn
-        return RoutedLowRankLayer(mlp_a, mlp_b, expert_cols, expert_rows, scale, act)
-
-    @named_call
-    def __call__(self, x: NamedArray, expert_mask: Optional[NamedArray], *, key=None) -> NamedArray:
-        z_mlp = self.mlp_a(x)
-        z_mlp = self.act(z_mlp)
-        z_mlp = self.mlp_b(z_mlp)
-        
-        z_routed = self.expert_cols(x)
-        z_routed = self.act(z_routed)
-        if expert_mask is not None:
-            z_routed *= expert_mask
-        z_routed = self.expert_rows(z_routed)
-
-        return z_mlp * self.scale + z_routed
-
-def routed_mlp_trainable_params_filter(model: eqx.Module) -> Dict[str, jnp.ndarray]:
-    def is_routed_mlp_param(x):
-        return isinstance(x, RoutedLowRankLayer) or isinstance(x, Router)
-
-    return jax.tree_util.tree_map(is_routed_mlp_param, model, is_leaf=is_routed_mlp_param)
-
-
-class RoutedMlpLayer(ModuleWithStateDictSerialization):
-    """Layer with a base Linear and a low-rank MLP with routing to column-row experts"""
-
-    routed_low_rank_layer: RoutedLowRankLayer
-    linear: hnn.Linear
-
-    @staticmethod
-    def init(
-        In: AxisSpec,
-        Out: AxisSpec,
-        Inter: AxisSpec,
-        Expert: AxisSpec,
-        *,
-        key: PRNGKey,
-        scale: float = 1.0,
-        use_bias: bool = True,
-        out_first: bool = True,
-        dot_general: Optional[DotGeneralOp] = None,
-        init_scale: float = 1.0,
-    ) -> "RoutedMlpLayer":
-        k_low_rank, k_linear = jrandom.split(key, 2)
-        linear = hnn.Linear.init(
-            In=In,
-            Out=Out,
-            key=k_linear,
-            use_bias=use_bias,
-            init_scale=init_scale,
-            out_first=out_first,
-            dot_general=dot_general,
-        )
-        routed_low_rank_layer = RoutedMlpLayer.init(
-            In=In, Inter=Inter, Expert=Expert, Out=Out, scale=scale, key=k_low_rank, out_first=out_first, dot_general=dot_general
-        )
-        return RoutedMlpLayer(routed_low_rank_layer, linear)
-
-    @named_call
-    def __call__(self, x: NamedArray, expert_mask: Optional[NamedArray], *, key=None) -> NamedArray:
-        k_linear, k_low_rank = maybe_rng_split(key, 2)
-        linear_out = self.linear(x, key=k_linear)
-        if expert_mask is not None:
-            routed_mlp_out = self.routed_low_rank_layer(x, expert_mask, key=k_low_rank)
-            output = linear_out + routed_mlp_out
-        else:
-            output = linear_out
-        return output
-
-    def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
-        return {"linear": None}
-
-    def from_state_dict(self, state_dict, prefix=None):
-        fsd = ModuleWithStateDictSerialization.from_state_dict
-        if prefix is not None and prefix + ".routed_low_rank_layer.mlp_a" not in state_dict:
-            print("Skipping lora load")
-            routed_low_rank_layer = self.routed_low_rank_layer
-            self = dataclasses.replace(self, routed_low_rank_layer=None)
-            self = fsd(self, state_dict, prefix)
-            self = dataclasses.replace(self, routed_low_rank_layer=routed_low_rank_layer)
-            return self
-        return fsd(self, state_dict, prefix)
-
-
 @LmConfig.register_subclass("routed_qwen")
 @dataclass(frozen=True)
 class RoutedQwenConfig(LlamaConfig):
@@ -165,14 +45,12 @@ class RoutedQwenConfig(LlamaConfig):
     max_window_layers: int = 0  # Only apply sliding window beyond this layer
 
     num_experts: int = 64
-    lora_rank: int = 16
     top_k: int = 4
     disable_expert_mask: bool = False
     ident_expert_mask: bool = False
     scale: float = 1.0
 
     Expert = property(lambda self: Axis("expert", self.num_experts))
-    LoraRank = property(lambda self: Axis("lora_rank", self.lora_rank))
 
     def __post_init__(self):
         assert (
@@ -251,118 +129,39 @@ class RoutedQwenConfig(LlamaConfig):
             glu=True,
         )
 
-
-# Modified attention class for Qwen
-class RoutedQwenAttention(eqx.Module):
-    config: RoutedQwenConfig = eqx.static_field()
-    q_proj: RoutedMlpLayer
-    k_proj: RoutedMlpLayer
-    v_proj: RoutedMlpLayer
-    o_proj: RoutedMlpLayer
-
+class RoutedExperts(ModuleWithStateDictSerialization):
+    "Set of column-row pairs that could be routedbased on the prefill."
+    
+    expert_cols: hnn.Linear
+    expert_rows: hnn.Linear
+    act: Callable = eqx.static_field()
+    
     @staticmethod
-    def init(config: RoutedQwenConfig, *, key) -> "RoutedQwenAttention":
-        Embed = config.Embed
-        QHeadsPerGroup = hax.Axis("q_heads_per_group", config.num_heads // config.num_kv_heads)
-
-        k_q, k_k, k_v, k_o = jrandom.split(key, 4)
-        q_proj = RoutedMlpLayer.init(
-            In=Embed,
-            Out=(config.KVHeads, QHeadsPerGroup, config.HeadSize),
-            Inter=config.LoraRank,
-            Expert=config.Expert,
-            scale=config.scale,
-            key=k_q,
-            use_bias=True,  # Qwen always uses bias in attention
-            out_first=True,
-        )
-        k_proj = RoutedMlpLayer.init(
-            In=Embed,
-            Out=(config.KVHeads, config.HeadSize),
-            Inter=config.LoraRank,
-            Expert=config.Expert,
-            scale=config.scale,
-            key=k_k,
-            use_bias=True,
-            out_first=True,
-        )
-        v_proj = RoutedMlpLayer.init(
-            In=Embed,
-            Out=(config.KVHeads, config.HeadSize),
-            Inter=config.LoraRank,
-            Expert=config.Expert,
-            scale=config.scale,
-            key=k_v,
-            use_bias=True,
-            out_first=True,
-        )
-        o_proj = RoutedMlpLayer.init(
-            In=(config.Heads, config.HeadSize),
-            Out=Embed,
-            Inter=config.LoraRank,
-            Expert=config.Expert,
-            scale=config.scale,
-            key=k_o,
-            use_bias=False,  # Qwen doesn't use bias in o_proj
-            out_first=True,
-        )
-        return RoutedQwenAttention(config, q_proj, k_proj, v_proj, o_proj)
-
+    def init(Embed: Axis, Expert: Axis, activation_fn: Union[str, Callable], *, key, use_bias: bool = False) -> "RoutedExperts":
+        k_cols, k_rows = jrandom.split(key, 2)
+        expert_cols = hnn.Linear.init(Out=Expert, In=Embed, key=k_cols, use_bias=use_bias, out_first=True)
+        expert_rows = hnn.Linear.init(Out=Embed, In=Expert, key=k_rows, use_bias=use_bias, out_first=True)
+        if isinstance(activation_fn, str):
+            activation_fn = ACT2FN[activation_fn]
+        act = activation_fn
+        return RoutedExperts(expert_cols, expert_rows, act)
+    
     @named_call
-    def __call__(
-        self,
-        x: NamedArray,
-        mask: Optional[NamedArray | AttentionMask],
-        expert_mask=Optional[NamedArray],
-        layer_idx: int = 0,
-        *,
-        key=None,
-    ) -> NamedArray:
-        key_q, key_k, key_v, key_o = maybe_rng_split(key, 4)
+    def __call__(self, x: NamedArray, expert_mask: Optional[NamedArray], *, key=None) -> NamedArray:
+        k_cols, k_rows = maybe_rng_split(key, 3)
+        hidden_states = self.expert_cols(x, key=k_cols)
+        hidden_states = self.act(hidden_states)
+        if expert_mask is not None:
+            hidden_states *= expert_mask
+        outputs = self.expert_rows(hidden_states, key=k_rows)
+        return outputs
+        
 
-        # QKV projections
-        q = self.q_proj(x, expert_mask, key=key_q).rearrange(
-            (..., "kv_heads", "q_heads_per_group", "position", "head_size")
-        )
-        k = self.k_proj(x, expert_mask, key=key_k).rearrange((..., "kv_heads", "position", "head_size"))
-        v = self.v_proj(x, expert_mask, key=key_v).rearrange((..., "kv_heads", "position", "head_size"))
+def routed_experts_trainable_params_filter(model: eqx.Module) -> Dict[str, jnp.ndarray]:
+    def is_routed_experts_param(x):
+        return isinstance(x, RoutedExperts) or isinstance(x, Router)
 
-        # Apply rotary embeddings
-        rot_embs = self.config.rope.build(self.config.HeadSize, q.resolve_axis("position"))
-        q, k = rot_embs(self.config.HeadSize, q, k)
-
-        k = k.rename({"position": "key_position"})
-        v = v.rename({"position": "key_position"})
-
-        # Apply sliding window attention if configured and past max_window_layers
-        if (
-            self.config.use_sliding_window
-            and self.config.sliding_window is not None
-            and layer_idx >= self.config.max_window_layers
-        ):
-            raise ValueError("Sliding Window Attention is not currently supported.")
-
-        # Perform attention
-        attn_output = dot_product_attention(
-            "position",
-            "key_position",
-            "head_size",
-            q,
-            k,
-            v,
-            mask,
-            attention_dtype=jnp.float32 if self.config.upcast_attn else x.dtype,
-            use_flash=self.config.use_flash_attention,
-            attn_backend=self.config.attn_backend,
-            flash_block_size=self.config.flash_attention_block_size,
-        )
-
-        attn_output = attn_output.flatten_axes(("kv_heads", "q_heads_per_group"), "heads")
-        attn_output = attn_output.astype(x.dtype)
-
-        attn_output = self.o_proj(attn_output, expert_mask, key=key_o)
-        return attn_output
-
+    return jax.tree_util.tree_map(is_routed_experts_param, model, is_leaf=is_routed_experts_param)
 
 class RoutedQwenMlp(eqx.Module):
     """Multi-layer Perceptron
@@ -370,52 +169,55 @@ class RoutedQwenMlp(eqx.Module):
     before down-proj.
     """
 
-    gate_proj: RoutedMlpLayer  # projection from Embed to Mlp
-    up_proj: RoutedMlpLayer  # projection from Embed to Mlp
-    down_proj: RoutedMlpLayer  # projection from Mlp to Embed
+    up_proj: hnn.Linear  # projection from Embed to Mlp
+    gate_proj: hnn.Linear  # projection from Embed to Mlp
+    down_proj: hnn.Linear  # projection from Mlp to Embed
     act: Callable = eqx.static_field()
+    expert_mlp: RoutedExperts # routing to specific subset of experts
 
     @staticmethod
     def init(
         Embed: Axis,
         Mlp: Axis,
-        Inter: AxisSpec,
         Expert: AxisSpec,
         activation_fn: Union[str, Callable],
         *,
         key,
         scale: float = 1.0,
         use_bias: bool = False,
-    ) -> "RoutedMlpLayer":
-        k_fc, k_up_proj, k_down_proj = jrandom.split(key, 3)
-        gate_proj = RoutedMlpLayer.init(
-            Out=Mlp, In=Embed, Inter=Inter, Expert=Expert, scale=scale, key=k_fc, use_bias=use_bias, out_first=True
+    ) -> "RoutedQwenMlp":
+        k_up_proj, k_fc ,k_down_proj, k_expert = jrandom.split(key, 4)
+        up_proj = hnn.Linear.init(
+            Out=Mlp, In=Embed, scale=scale, key=k_up_proj, use_bias=use_bias, out_first=True
         )
-        up_proj = RoutedMlpLayer.init(
-            Out=Mlp, In=Embed, Inter=Inter, Expert=Expert, scale=scale, key=k_up_proj, use_bias=use_bias, out_first=True
+        gate_proj = hnn.Linear.init(
+            Out=Mlp, In=Embed, scale=scale, key=k_fc, use_bias=use_bias, out_first=True
         )
-        down_proj = RoutedMlpLayer.init(
-            Out=Embed, In=Mlp, Inter=Inter, Expert=Expert, scale=scale, key=k_down_proj, use_bias=use_bias, out_first=True
+        down_proj = hnn.Linear.init(
+            Out=Embed, In=Mlp, scale=scale, key=k_down_proj, use_bias=use_bias, out_first=True
         )
         if isinstance(activation_fn, str):
             activation_fn = ACT2FN[activation_fn]
         act = activation_fn  # type: ignore
-        return RoutedQwenMlp(gate_proj, up_proj, down_proj, act)
+        expert_mlp = RoutedExperts.init(Embed, Expert, act, key=k_expert, use_bias=use_bias)
+        return RoutedQwenMlp(gate_proj, up_proj, down_proj, act, expert_mlp)
 
     @named_call
     def __call__(self, x: NamedArray, expert_mask: Optional[NamedArray], *, key=None) -> NamedArray:
-        k_gate, k_up, k_down = maybe_rng_split(key, 3)
-        hidden_states = self.gate_proj(x, expert_mask, key=k_gate)
+        k_gate, k_up, k_down, k_expert = maybe_rng_split(key, 4)
+        hidden_states = self.up_proj(x, key=k_gate)
         hidden_states = self.act(hidden_states)
-        hidden_states = hidden_states * self.up_proj(x, expert_mask, key=k_up)
-        outputs = self.down_proj(hidden_states, expert_mask, key=k_down)
-        return outputs
+        hidden_states = hidden_states * self.gate_proj(x, key=k_up)
+        base_outputs = self.down_proj(hidden_states, key=k_down)
+        
+        routed_outputs = self.expert_mlp(x, expert_mask, key=k_expert)
+        return base_outputs + routed_outputs
 
 
 # Modified decoder layer for Qwen
 class RoutedQwenDecoderLayer(eqx.Module):
     config: RoutedQwenConfig = eqx.static_field()
-    self_attn: RoutedQwenAttention
+    self_attn: QwenAttention
     mlp: RoutedQwenMlp  # Can reuse Llama MLP as structure is similar
     input_layernorm: LlamaRMSNorm
     post_attention_layernorm: LlamaRMSNorm
@@ -424,11 +226,10 @@ class RoutedQwenDecoderLayer(eqx.Module):
     def init(config: RoutedQwenConfig, *, key) -> "RoutedQwenDecoderLayer":
         k_attn, k_mlp = jrandom.split(key, 2)
 
-        attn = RoutedQwenAttention.init(config, key=k_attn)
+        attn = QwenAttention.init(config, key=k_attn)
         mlp = RoutedQwenMlp.init(
             config.Embed,
             config.Mlp,
-            config.LoraRank,
             config.Expert,
             config.activation_function,
             scale=config.scale,
@@ -750,18 +551,12 @@ def compute_next_token_loss_with_routing(
 
     return loss, extras
 
-def reinit_routed_mlp_weights(model: eqx.Module, *, key: jax.random.PRNGKey) -> eqx.Module:
+def reinit_routed_weights(model: eqx.Module, *, key: jax.random.PRNGKey) -> eqx.Module:
     """Re-initialize all LoRA weights in the model while preserving other weights."""
 
     def where(m: RoutedQwenLMHeadModel):
         return [
-            m.transformer.layers.stacked.mlp.down_proj.routed_low_rank_layer,
-            m.transformer.layers.stacked.mlp.up_proj.routed_low_rank_layer,
-            m.transformer.layers.stacked.mlp.gate_proj.routed_low_rank_layer,
-            m.transformer.layers.stacked.self_attn.q_proj.routed_low_rank_layer,
-            m.transformer.layers.stacked.self_attn.k_proj.routed_low_rank_layer,
-            m.transformer.layers.stacked.self_attn.v_proj.routed_low_rank_layer,
-            m.transformer.layers.stacked.self_attn.o_proj.routed_low_rank_layer,
+            m.transformer.layers.stacked.mlp.expert_mlp,
             m.router,
         ]
 
@@ -773,10 +568,10 @@ def reinit_routed_mlp_weights(model: eqx.Module, *, key: jax.random.PRNGKey) -> 
     keys = key_iterator(key)
 
     def replace_fn(x: eqx.Module):
-        if isinstance(x, RoutedLowRankLayer):
-            mlp_a = re_init_linear(x.mlp_a, init_scale=1.0, key=next(keys))
-            mlp_b = re_init_linear(x.mlp_b, init_scale=0.0, key=next(keys))
-            return RoutedLowRankLayer(mlp_a, mlp_b, x.scale)
+        if isinstance(x, RoutedExperts):
+            expert_cols = re_init_linear(x.expert_cols, init_scale=1.0, key=next(keys))
+            expert_rows = re_init_linear(x.expert_rows, init_scale=0.0, key=next(keys))
+            return RoutedExperts(expert_cols, expert_rows, x.scale)
         elif isinstance(x, Router):
             return re_init_linear(x, init_scale=1.0, key=next(keys))
         else:
