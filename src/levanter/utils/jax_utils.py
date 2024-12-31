@@ -361,7 +361,7 @@ def _zeros_like(mapping, dtype, n):
     elif is_jax_array_like(n):
         return jnp.zeros_like(n, dtype)
     else:
-        assert jnp.isscalar(n)
+        assert jnp.isscalar(n), f"Expected a scalar, got {n}"
         if dtype is None:
             # if it's a nan, we want to go to 0
             if n != n:

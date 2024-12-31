@@ -7,13 +7,13 @@ from typing_extensions import Self
 
 import haliax as hax
 
-from levanter.utils.types import Accumulatable
+from levanter.tracker.histogram import Histogram
 
 
 Arrayish: TypeAlias = hax.NamedArray | np.ndarray | jnp.ndarray
 
 
-class SumScalar(Accumulatable):
+class SumScalar(eqx.Module):
     value: jnp.ndarray
 
     def item(self) -> float:
@@ -36,6 +36,41 @@ class MeanScalar(eqx.Module):
 
     def __add__(self, other: Self) -> Self:
         return MeanScalar(self.sum + other.sum, self.total + other.total)
+
+
+class IndexCountHistogram(eqx.Module):
+    hist: Histogram
+
+    @staticmethod
+    def init(inds: Arrayish, axis: hax.Axis) -> "IndexCountHistogram":
+        counts = hax.zeros(axis, dtype=jnp.int32).at[axis, inds].add(1)
+        Bin = hax.Axis("bin", axis.size + 1)
+        limits = hax.arange(Bin)
+        hist = Histogram(
+            min=limits.min(),
+            max=limits.max() - 1,
+            num=inds.size,
+            sum=inds.sum(),
+            sum_squares=(inds**2).sum(),
+            bucket_limits=limits,
+            bucket_counts=counts,
+        )
+        return IndexCountHistogram(hist)
+
+    def item(self) -> Histogram:
+        return self.hist
+
+    def __add__(self, other: Self) -> Self:
+        new_hist = Histogram(
+            min=self.hist.min,
+            max=self.hist.max,
+            num=self.hist.num + other.hist.num,
+            sum=self.hist.sum + other.hist.sum,
+            sum_squares=self.hist.sum_squares + other.hist.sum_squares,
+            bucket_limits=self.hist.bucket_limits,
+            bucket_counts=self.hist.bucket_counts + other.hist.bucket_counts,
+        )
+        return IndexCountHistogram(new_hist)
 
 
 class RunningMean(eqx.Module):
