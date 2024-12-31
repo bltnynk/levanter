@@ -155,6 +155,7 @@ class RQwenConfig(LlamaConfig):
 
     Loras = property(lambda self: Axis("loras", self.num_loras))
     LoraRank = property(lambda self: Axis("lora_rank", self.lora_rank))
+    TopK = property(lambda self: Axis("top_k", self.top_k))
 
     def __post_init__(self):
         assert (
@@ -566,7 +567,7 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
     ) -> tuple[NamedArray, NamedArray, Extras]:
         k_head, k_rout = maybe_rng_split(key, 2)
         Loras, Pos = self.config.Loras, self.config.Pos
-        TopK = hax.Axis("top_k", self.config.top_k)
+        TopK: hax.Axis = self.config.TopK
         compute_dtype = self.embeddings.token_embeddings.weight.dtype
 
         # Softmax, topk
@@ -582,9 +583,14 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         else:
             router_logits = hax.zeros((Batch, Loras), dtype=jnp.float32)
 
-        sm = hax.nn.softmax(router_logits, Loras)
+        if TopK.size > 1:
+            # Softmax after topk if k > 1
+            elems, top_k_indices = hax.top_k(router_logits, Loras, TopK.size, TopK)
+            elems = hax.nn.softmax(elems, TopK)
+        else:
+            elems = hax.nn.softmax(router_logits, Loras)
+            elems, top_k_indices = hax.top_k(elems, Loras, TopK.size, TopK)
 
-        elems, top_k_indices = hax.top_k(sm, Loras, TopK.size, TopK)
         # Create a mask
         lora_mask = hax.zeros((Batch, Loras), dtype=compute_dtype)
         # Arrange batch indicies for a .at
