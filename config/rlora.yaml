@@ -1,6 +1,6 @@
 initialize_from_hf: "Qwen/Qwen2.5-Coder-1.5B"
 full_ft: false
-embedding_router_token_ft: true
+embedding_router_token_ft: false
 data:
   train_urls:
     - gs://usc-stack-v2/shard1_150_flat.jsonl.gz
@@ -14,6 +14,7 @@ data:
   predict_prefix: false
   predict_router_token: false
   predict_fim_token: false
+  add_router_token: false
 model:
   seq_len: 8192
   hidden_dim: 1536
@@ -32,8 +33,9 @@ model:
   flash_attention_block_size: 512
   use_bias: false
   use_layer_norm_weight: true
+
   disable_lora_mask: false
-  ident_lora_mask: true
+  ident_lora_mask: false
 
   num_loras: 64
   lora_rank: 8
