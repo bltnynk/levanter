@@ -15,7 +15,7 @@ from jaxtyping import PyTree
 
 import haliax as hax
 import haliax.nn as hnn
-from haliax import Axis, NamedArray
+from haliax import Axis
 from haliax.partitioning import named_jit, round_axis_for_partitioning
 
 import levanter
@@ -34,7 +34,8 @@ from levanter.models.routed_lora_model import (
 from levanter.optim import AdamConfig, OptimizerConfig
 from levanter.trainer import Trainer, TrainerConfig
 from levanter.utils.jax_utils import key_iterator, parameter_count
-from levanter.utils.types import FilterSpec
+from levanter.utils.stat_utils import MeanScalar
+from levanter.utils.types import Extras, FilterSpec
 
 
 logger = logging.getLogger(__name__)
@@ -89,15 +90,11 @@ def compute_next_token_loss(
     example: LmExample,
     *,
     key=None,
-    reduction: Optional[hax.ReductionFunction] = hax.mean,
-    reduction_axis: Optional[hax.AxisSelection] = None,
-    batch_num_elements: Optional[int] = None,
-    batch_completion_num_elements: Optional[int] = None,
     logsumexp_weight: Optional[float] = None,
     loss_dtype: Optional[Type[jnp.dtype]] = jnp.float32,
     router_zloss_weight: float = 0.0,
     stop_grad: bool = True,
-) -> tuple[jnp.ndarray | NamedArray, dict]:
+) -> tuple[hax.NamedArray, hax.NamedArray, Extras]:
     """
     Computes the cross-entropy loss for a language modeling example. If reduction is not None, the loss is reduced
     across the reduction axis (with reduction_axis=None meaning all axes). If reduction is None, the loss is not
@@ -119,7 +116,7 @@ def compute_next_token_loss(
         router_stop_grad=stop_grad,
     )
 
-    loss = maybe_fused_next_token_loss(
+    losses, mask = maybe_fused_next_token_loss(
         model.Pos,
         model.Embed,
         model.Vocab,
@@ -127,39 +124,27 @@ def compute_next_token_loss(
         model.get_lm_head(),
         example.tokens,
         loss_mask=example.loss_mask,
-        batch_num_elements=batch_num_elements,
-        reduction=reduction,
-        reduction_axis=reduction_axis,
         logsumexp_weight=logsumexp_weight,
         dtype=loss_dtype,
         block_size=model.config.cross_entropy_block_size,
     )
 
-    completion_loss = maybe_fused_next_token_loss(
-        model.Pos,
-        model.Embed,
-        model.Vocab,
-        activations,
-        model.get_lm_head(),
-        example.tokens,
-        loss_mask=example.completion_mask,  # only looking at completion
-        reduction=reduction,
-        reduction_axis=reduction_axis,
-        batch_num_elements=batch_completion_num_elements,
-        logsumexp_weight=logsumexp_weight,
-        dtype=loss_dtype,
-        block_size=model.config.cross_entropy_block_size,
-    )
+    if example.completion_mask is not None:
+        n_completion = example.completion_mask.sum()
+        extras["completion_loss"] = MeanScalar.init(losses.mean(where=example.completion_mask), n_completion)
 
-    extras["all_lm_loss"] = loss
-    extras["lm_loss"] = completion_loss
+    extras["all_lm_loss"] = MeanScalar.init(losses.mean(where=mask), mask.sum())
+
     if router_zloss_weight > 0.0:
         z_loss = hax.nn.logsumexp(rlogits, model.config.Loras)
-        z_loss = hax.mean(hax.square(z_loss), batch_axis)
-        loss += router_zloss_weight * z_loss
-        extras["router/z_loss"] = z_loss
+        z_loss = hax.square(z_loss)  # [batch,]
+        tokens_per_seq = mask.sum(axis=model.Pos)  # [batch,]
+        # This reweights the z_loss to be better balanced based on the number of tokens in the sequence
+        per_token = router_zloss_weight * z_loss / tokens_per_seq
+        extras["router/z_loss"] = MeanScalar.init(per_token.sum(), tokens_per_seq.sum())
+        losses += per_token.broadcast_to(losses.axes)
 
-    return loss, extras
+    return losses, mask, extras
 
 
 def reinit_lora_weights(model: eqx.Module, *, key: jax.random.PRNGKey) -> eqx.Module:

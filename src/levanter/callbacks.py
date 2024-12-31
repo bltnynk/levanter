@@ -7,7 +7,7 @@ import threading
 import time
 from abc import ABC
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Callable, Generic, Optional, TypeVar
 
@@ -56,7 +56,6 @@ class StepInfo(Generic[S]):
     state: S
     loss: float
     step_duration: float
-    extras: dict[str, float] = field(default_factory=dict)
 
     model = property(lambda self: self.state.model)
     opt_state = property(lambda self: self.state.opt_state)
@@ -212,9 +211,7 @@ def compute_validation_loss(
 
 def log_step_info(total_steps: Optional[int]):
     def log_step_info_inner(step: StepInfo):
-        metrics = {"train/loss": step.loss, "global_step": step.step} | {
-            f"train/{k}": v for k, v in step.extras.items()
-        }
+        metrics = {"train/loss": step.loss, "global_step": step.step}
         if total_steps:
             metrics["run_progress"] = step.step / total_steps
         log_optimizer_hyperparams(step.opt_state, step=step.step, prefix="optim")

@@ -188,12 +188,7 @@ class Trainer:
         def fn(model, *batch, **batch_kwargs):
             with hax.axis_mapping(self.compute_axis_mapping):
                 model = self.mp.cast_to_compute(model)
-                res = self._raw_loss_function(model, *batch, **batch_kwargs)
-                if isinstance(res, tuple):
-                    loss, aux = res
-                else:
-                    loss, aux = res, {}
-                return _ensure_scalar(loss), {k: _ensure_scalar(v) for k, v in aux.items()}
+                return self._raw_loss_function(model, *batch, **batch_kwargs)
 
         return fn
 
@@ -397,7 +392,7 @@ class Trainer:
                 loss, new_state, extras = self._jit_train_step_fn_no_hook(state, batch, batch_kwargs)
             loss = loss.item()  # type: ignore
 
-            info = StepInfo(new_state, loss, step_time(), extras)
+            info = StepInfo(new_state, loss, step_time())
 
             with capture_time() as hook_time:
                 self.run_hooks(info)
@@ -539,6 +534,7 @@ class Trainer:
                 hook_infos = self.hooks.run_jit_hooks(state, grads, force=False)
 
         # Sophia needs to be able to access the loss function in the optimizer
+        # TODO: make sophia deal with microbatching?
         def obj_fun(trainable_model):
             model = eqx.combine(trainable_model, state.model)
             with hax.axis_mapping(self.compute_axis_mapping):

@@ -23,6 +23,21 @@ class SumScalar(Accumulatable):
         return SumScalar(self.value + other.value)
 
 
+class MeanScalar(eqx.Module):
+    total: jnp.ndarray
+    sum: jnp.ndarray
+
+    @staticmethod
+    def init(asum: Arrayish, total: Arrayish) -> "MeanScalar":
+        return MeanScalar(asum.astype(jnp.float32), total.astype(jnp.float32))
+
+    def item(self) -> float:
+        return self.sum.item() / self.total.item()
+
+    def __add__(self, other: Self) -> Self:
+        return MeanScalar(self.sum + other.sum, self.total + other.total)
+
+
 class RunningMean(eqx.Module):
     mean: Arrayish
     total: Arrayish

@@ -134,9 +134,7 @@ def microbatched(
             return (loss, (total, {k: v + extras_mb[k] for k, v in extras.items()})), grads
 
         with jax.named_scope("microbatched"):
-            (loss, (total, extras)), grads, = hax.fold(
-                loop, AccumStep
-            )(acc, (args, kwargs, key))
+            (loss, (total, extras)), grads = hax.fold(loop, AccumStep)(acc, (args, kwargs, key))
             grads = jax.tree_util.tree_map(lambda x: x / total, grads)
             loss /= total
             extras["seen_tokens"] = total
