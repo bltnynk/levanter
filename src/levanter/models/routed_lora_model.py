@@ -24,7 +24,7 @@ from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.models.rotary import RotaryEmbeddingsConfig
 from levanter.utils.flop_utils import lm_flops_per_token
 from levanter.utils.logging import silence_transformer_nag
-from levanter.utils.stat_utils import IndexCountHistogram
+from levanter.utils.stat_utils import IndexCountHistogram, IndexCountUnique
 from levanter.utils.types import Extras
 
 
@@ -614,10 +614,11 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
             res = self(input_ids, attn_mask=attn_mask, lora_mask=lora_mask, key=k_head)
 
         index_hist = IndexCountHistogram.init(top_k_indices, Loras)
+        index_count = IndexCountUnique.init(top_k_indices, Loras)
         return (
             res,
             router_logits,
-            {"router/index_hist": index_hist},
+            {"router/index_hist": index_hist, "router/used_count": index_count},
         )
 
     def get_lm_head(self) -> hax.NamedArray:

@@ -28,9 +28,9 @@ def test_rlora_train():
         hidden_dim=32,
         intermediate_dim=64,
         attn_backend="jax_flash",
-        num_loras=2,
-        lora_rank=4,
-        top_k=2,
+        num_loras=16,
+        lora_rank=1,
+        top_k=4,
         tie_word_embeddings=True,
         disable_lora_mask=False,
         use_layer_norm_weight=True,
@@ -61,7 +61,7 @@ def test_rlora_train():
                 model=model_cfg,
                 trainer=rlora_train.TrainerConfig(
                     num_train_steps=16,
-                    train_batch_size=2,
+                    train_batch_size=8,
                     per_device_parallelism=1,  # test out grad accum
                     max_eval_batches=1,
                     steps_per_eval=2,

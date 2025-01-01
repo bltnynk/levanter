@@ -175,7 +175,7 @@ def eval_loss_loop(loss_fn, model, dataset, max_batches: Optional[int] = None, n
             else:
                 extras[k] += v
 
-        pbar.set_postfix(loss=loss.mean.item())
+        pbar.set_postfix(loss=loss.item())
 
         if max_batches is not None and n >= max_batches:
             break

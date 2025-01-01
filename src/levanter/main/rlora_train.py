@@ -130,10 +130,9 @@ def compute_next_token_loss(
     )
 
     if example.completion_mask is not None:
-        n_completion = example.completion_mask.sum()
-        extras["completion_loss"] = MeanScalar.init(losses.mean(where=example.completion_mask), n_completion)
+        extras["completion_loss"] = MeanScalar.init(losses, where=example.completion_mask)
 
-    extras["all_lm_loss"] = MeanScalar.init(losses.mean(where=mask), mask.sum())
+    extras["all_lm_loss"] = MeanScalar.init(losses, where=mask)
 
     if router_zloss_weight > 0.0:
         z_loss = hax.nn.logsumexp(rlogits, model.config.Loras)
@@ -141,8 +140,9 @@ def compute_next_token_loss(
         tokens_per_seq = mask.sum(axis=model.Pos)  # [batch,]
         # This reweights the z_loss to be better balanced based on the number of tokens in the sequence
         per_token = router_zloss_weight * z_loss / tokens_per_seq
-        extras["router/z_loss"] = MeanScalar.init(per_token.sum(), tokens_per_seq.sum())
-        losses += per_token.broadcast_to(losses.axes)
+        per_token = per_token.broadcast_to(losses.axes)
+        extras["router/z_loss"] = MeanScalar.init(per_token, where=mask)
+        losses += per_token
 
     return losses, mask, extras
 

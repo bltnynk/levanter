@@ -1,8 +1,9 @@
 import jax.numpy as jnp
+from jax.random import PRNGKey
 
 import haliax as hax
 
-from levanter.utils.stat_utils import IndexCountHistogram
+from levanter.utils.stat_utils import IndexCountHistogram, IndexCountUnique, MeanScalar
 
 
 def test_topk_selected():
@@ -20,3 +21,27 @@ def test_topk_selected():
     assert acc2.hist.bucket_counts.tolist() == [1, 1, 1, 1]
     acc3 = acc1 + acc2
     assert acc3.hist.bucket_counts.tolist() == [3, 2, 2, 1]
+
+    acc1 = IndexCountUnique.init(inds1, Ax)
+    assert acc1.item() == 3
+    acc2 = IndexCountUnique.init(inds2, Ax)
+    assert acc2.item() == 4
+    acc3 = acc1 + acc2
+    assert acc3.item() == 4
+
+
+def test_mean_scalar():
+
+    AccumStep = hax.Axis("Accum", 8)
+    MicroBatch = hax.Axis("MB", 2)
+    Ax = hax.Axis("X", 4)
+
+    arr = hax.random.normal(PRNGKey(0), (AccumStep, MicroBatch, Ax))
+
+    acc = MeanScalar.zero()
+
+    for i in range(AccumStep.size):
+        mean_scalar = MeanScalar.init(arr[AccumStep, i], where=None)
+        acc += mean_scalar
+
+    assert jnp.allclose(acc.item(), arr.mean().item())

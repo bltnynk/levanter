@@ -400,6 +400,7 @@ class Trainer:
                     self.hooks.run_jit_hooks_outside_step(info, cb_states)
 
             log_items = {k: v.item() for k, v in extras.items()} | {"throughput/hook_time": hook_time()}
+            log_items = {f"train/{k}": v for k, v in log_items.items()}
             levanter.tracker.log(log_items, step=info.step)
 
         return info

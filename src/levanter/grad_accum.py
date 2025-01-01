@@ -14,6 +14,7 @@ from haliax.partitioning import ResourceAxis
 from haliax.util import is_named_array
 
 from levanter.utils.jax_utils import zeros_like_tree
+from levanter.utils.stat_utils import SumScalar
 from levanter.utils.types import ComputeLossFunction
 
 
@@ -78,8 +79,7 @@ def microbatched(
         @functools.wraps(loss_fn)
         def no_accum_loss_fn(*args, **kwargs):
             losses, where, extras = loss_fn(*args, **kwargs)
-            seen_tokens = where.sum().scalar()
-            extras["seen_tokens"] = seen_tokens
+            extras["seen_tokens"] = SumScalar(where.sum().scalar())
             return hax.mean(losses, where=where).scalar(), extras
 
         return eqx.filter_value_and_grad(no_accum_loss_fn, has_aux=True)

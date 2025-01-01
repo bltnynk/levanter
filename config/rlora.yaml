@@ -6,8 +6,6 @@ data:
     - gs://usc-stack-v2/shard1_150_flat.jsonl.gz
   validation_urls:
     - gs://usc-stack-v2/shard1_215_220_flat.jsonl.gz
-  #train_urls:
-  #  - gs://usc-stack-v2/shard1_215_220_flat.jsonl.gz
   cache_dir: "gs://usc2-datacache/shard1"
   tokenizer: "Qwen/Qwen2.5-Coder-1.5B"
   shuffle: true
@@ -46,12 +44,14 @@ trainer:
   tracker:
     type: wandb
     project: "levanter-rlora"
-    tags: ["full_ft_sweep_v4"]
+    tags: ["high_batch_rlora"]
   mp: p=f32,c=bfloat16
-  train_batch_size: 8
-  num_train_steps: 3000
-  steps_per_eval: 100
-  max_eval_batches: 100
+  train_batch_size: 256
+  per_device_parallelism: 2
+  num_train_steps: 200
+  steps_per_eval: 10
+  max_eval_batches: 64
+  per_device_eval_parallelism: 4
   tensor_parallel_axes: ["mlp", "heads"]
   fsdp_axis: "embed"
   batch_axis: "batch"

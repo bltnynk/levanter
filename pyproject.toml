@@ -25,7 +25,8 @@ classifiers = [
     "Intended Audience :: Science/Research",
 ]
 dependencies = [
-    "haliax>=1.4.dev324",
+    "haliax==1.4.dev327",
+    "jax==0.4.35",
     "equinox>=0.11.7",
     "jaxtyping>=0.2.34",
     "tokenizers>=0.15.2",
@@ -108,7 +109,7 @@ test = [
     "pytest-asyncio",
     "flake8",
     "soundfile",
-    "librosa",
+    #"librosa",
 ]
 
 [tool.setuptools.packages.find]
