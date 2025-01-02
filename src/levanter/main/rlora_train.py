@@ -32,6 +32,7 @@ from levanter.models.routed_lora_model import (
     lora_trainable_params_filter,
 )
 from levanter.optim import AdamConfig, OptimizerConfig
+from levanter.optim.util import filter_embedding_grads
 from levanter.trainer import Trainer, TrainerConfig
 from levanter.utils.jax_utils import key_iterator, parameter_count
 from levanter.utils.types import FilterSpec
@@ -61,27 +62,6 @@ class TrainLmConfig:
             raise ValueError("Can't have both full_ft and embedding_router_token_ft")
         if self.embedding_router_token_ft and not self.data.add_router_token:
             raise ValueError("Can't have embedding_router_token_ft without add_router_token")
-
-
-def filter_embedding_grads(optimizer: optax.GradientTransformation, Embed, Vocab, token_mask: hax.NamedArray):
-    def where(m: RQwenLMHeadModel):
-        return [m.embeddings]
-
-    def replace_fn(x):
-        assert hasattr(x, 'token_embeddings') and isinstance(x.token_embeddings, hnn.Embedding) and x.token_embeddings.weight is not None
-        new_grads = x.token_embeddings.weight * token_mask.broadcast_to((Vocab, Embed))
-        new_token_embeddings = dataclasses.replace(x.token_embeddings, weight=new_grads)
-        return dataclasses.replace(x, token_embeddings=new_token_embeddings)
-
-    def update_fn(updates, state, params=None):
-        del params
-        updates = eqx.tree_at(where, updates, replace_fn=replace_fn)
-        return updates, state
-
-    mask_transform = optax.GradientTransformation(lambda _: optax.EmptyState(), update_fn)
-
-    return optax.chain(optimizer, mask_transform)
-
 
 def compute_next_token_loss(
     model: RQwenLMHeadModel,

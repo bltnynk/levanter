@@ -1,5 +1,9 @@
 import equinox as eqx
 import jax
+import optax
+import haliax as hax
+import haliax.nn as hnn
+import dataclasses
 
 from levanter.utils.jax_utils import is_inexact_arrayish
 
@@ -21,3 +25,22 @@ def tree_gaussian_like(key, tree):
     g = jax.tree_util.tree_unflatten(structure, g)
 
     return g
+
+def filter_embedding_grads(optimizer: optax.GradientTransformation, Embed, Vocab, token_mask: hax.NamedArray):
+    def where(m):
+        return [m.embeddings]
+
+    def replace_fn(x):
+        assert hasattr(x, 'token_embeddings') and isinstance(x.token_embeddings, hnn.Embedding) and x.token_embeddings.weight is not None
+        new_grads = x.token_embeddings.weight * token_mask.broadcast_to((Vocab, Embed))
+        new_token_embeddings = dataclasses.replace(x.token_embeddings, weight=new_grads)
+        return dataclasses.replace(x, token_embeddings=new_token_embeddings)
+
+    def update_fn(updates, state, params=None):
+        del params
+        updates = eqx.tree_at(where, updates, replace_fn=replace_fn)
+        return updates, state
+
+    mask_transform = optax.GradientTransformation(lambda _: optax.EmptyState(), update_fn)
+
+    return optax.chain(optimizer, mask_transform)

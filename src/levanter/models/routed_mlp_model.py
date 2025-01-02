@@ -48,7 +48,6 @@ class RoutedQwenConfig(LlamaConfig):
     top_k: int = 4
     disable_expert_mask: bool = False
     ident_expert_mask: bool = False
-    scale: float = 1.0
 
     Expert = property(lambda self: Axis("expert", self.num_experts))
 
@@ -148,7 +147,7 @@ class RoutedExperts(ModuleWithStateDictSerialization):
     
     @named_call
     def __call__(self, x: NamedArray, expert_mask: Optional[NamedArray], *, key=None) -> NamedArray:
-        k_cols, k_rows = maybe_rng_split(key, 3)
+        k_cols, k_rows = maybe_rng_split(key, 2)
         hidden_states = self.expert_cols(x, key=k_cols)
         hidden_states = self.act(hidden_states)
         if expert_mask is not None:
@@ -183,18 +182,17 @@ class RoutedQwenMlp(eqx.Module):
         activation_fn: Union[str, Callable],
         *,
         key,
-        scale: float = 1.0,
         use_bias: bool = False,
     ) -> "RoutedQwenMlp":
         k_up_proj, k_fc ,k_down_proj, k_expert = jrandom.split(key, 4)
         up_proj = hnn.Linear.init(
-            Out=Mlp, In=Embed, scale=scale, key=k_up_proj, use_bias=use_bias, out_first=True
+            Out=Mlp, In=Embed, key=k_up_proj, use_bias=use_bias, out_first=True
         )
         gate_proj = hnn.Linear.init(
-            Out=Mlp, In=Embed, scale=scale, key=k_fc, use_bias=use_bias, out_first=True
+            Out=Mlp, In=Embed, key=k_fc, use_bias=use_bias, out_first=True
         )
         down_proj = hnn.Linear.init(
-            Out=Embed, In=Mlp, scale=scale, key=k_down_proj, use_bias=use_bias, out_first=True
+            Out=Embed, In=Mlp, key=k_down_proj, use_bias=use_bias, out_first=True
         )
         if isinstance(activation_fn, str):
             activation_fn = ACT2FN[activation_fn]
@@ -213,6 +211,19 @@ class RoutedQwenMlp(eqx.Module):
         routed_outputs = self.expert_mlp(x, expert_mask, key=k_expert)
         return base_outputs + routed_outputs
 
+    def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
+        return {"expert_mlp": None}
+
+    def from_state_dict(self, state_dict, prefix=None):
+        fsd = ModuleWithStateDictSerialization.from_state_dict
+        if prefix is not None and prefix + ".expert_mlp.expert_cols" not in state_dict:
+            print("Skipping expert_mlp load")
+            expert_mlp = self.expert_mlp
+            self = dataclasses.replace(self, expert_mlp=None)
+            self = fsd(self, state_dict, prefix)
+            self = dataclasses.replace(self, expert_mlp=expert_mlp)
+            return self
+        return fsd(self, state_dict, prefix)
 
 # Modified decoder layer for Qwen
 class RoutedQwenDecoderLayer(eqx.Module):
@@ -232,7 +243,6 @@ class RoutedQwenDecoderLayer(eqx.Module):
             config.Mlp,
             config.Expert,
             config.activation_function,
-            scale=config.scale,
             key=k_mlp,
             use_bias=config.use_bias,
         )
@@ -249,7 +259,7 @@ class RoutedQwenDecoderLayer(eqx.Module):
 
         residual = x
         x = self.input_layernorm(x)
-        attn_output = self.self_attn(x=x, mask=mask, expert_mask=expert_mask, key=k_attn)
+        attn_output = self.self_attn(x=x, mask=mask, key=k_attn)
         x = residual + attn_output
 
         residual = x
@@ -544,7 +554,7 @@ def compute_next_token_loss_with_routing(
     extras["all_lm_loss"] = loss
     extras["lm_loss"] = completion_loss
     if router_zloss_weight > 0.0:
-        z_loss = hax.nn.logsumexp(rlogits, model.config.Loras)
+        z_loss = hax.nn.logsumexp(rlogits, model.config.Expert)
         z_loss = hax.mean(hax.square(z_loss), batch_axis)
         loss += router_zloss_weight * z_loss
         extras["router/z_loss"] = z_loss
@@ -571,7 +581,7 @@ def reinit_routed_weights(model: eqx.Module, *, key: jax.random.PRNGKey) -> eqx.
         if isinstance(x, RoutedExperts):
             expert_cols = re_init_linear(x.expert_cols, init_scale=1.0, key=next(keys))
             expert_rows = re_init_linear(x.expert_rows, init_scale=0.0, key=next(keys))
-            return RoutedExperts(expert_cols, expert_rows, x.scale)
+            return RoutedExperts(expert_cols, expert_rows, x.act)
         elif isinstance(x, Router):
             return re_init_linear(x, init_scale=1.0, key=next(keys))
         else:

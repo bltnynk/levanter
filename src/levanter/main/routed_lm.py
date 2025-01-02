@@ -27,10 +27,11 @@ from levanter.models.lm_model import LmConfig, LmExample, RoutableLmExample
 from levanter.models.routed_mlp_model import (
     RoutedQwenConfig,
     compute_next_token_loss_with_routing,
-    reinit_routed_weights
-    
+    reinit_routed_weights,
+    routed_experts_trainable_params_filter
 )
 from levanter.optim import AdamConfig, OptimizerConfig
+from levanter.optim.util import filter_embedding_grads
 from levanter.trainer import Trainer, TrainerConfig
 from levanter.utils.jax_utils import parameter_count
 from levanter.utils.types import FilterSpec
@@ -150,19 +151,12 @@ def main(config: RoutedLMConfig):
         if config.full_ft:
             is_trainable = True
         else:
-            is_trainable = reinit_routed_weights(model_shape)
+            is_trainable = routed_experts_trainable_params_filter(model_shape)
             if config.embedding_router_token_ft:
-
                 token_mask = hax.nn.one_hot(
-                    tokenizer.convert_tokens_to_ids(config.data.router_token), Vocab, dtype=jnp.bool
-                ).broadcast_to((Vocab, Embed))
-
-                def replace_fn(x):
-                    assert hasattr(x, 'token_embeddings') and isinstance(x.token_embeddings, hnn.Embedding) and x.token_embeddings.weight.shape == token_mask.shape
-                    new_token_embeddings = dataclasses.replace(x.token_embeddings, weight=token_mask)
-                    return dataclasses.replace(x, token_embeddings=new_token_embeddings)
-
-                is_trainable = eqx.tree_at(lambda x: x.embeddings, is_trainable, replace=replace_fn)
+                    tokenizer.convert_tokens_to_ids(config.data.router_token), Vocab, dtype=jnp.float32
+                )
+        optimizer = filter_embedding_grads(optimizer, config.model.Embed, Vocab, token_mask)
 
         state = trainer.initial_state(training_key, model_init=model_init, is_trainable=is_trainable)
 
