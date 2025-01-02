@@ -64,16 +64,15 @@ class TrainLmConfig:
             raise ValueError("Can't have embedding_router_token_ft without add_router_token")
 
 
-def filter_embedding_grads(optimizer: optax.GradientTransformation, Embed, Vocab, token_mask: hax.NamedArray):
+def filter_embedding_grads(Embed, Vocab, token_mask: hax.NamedArray):
     def where(m: RQwenLMHeadModel):
-        return [m.embeddings]
+        return [m.embeddings.token_embeddings]
 
     def replace_fn(x):
-        if isinstance(x, hnn.Embedding):
-            assert x.weight is not None, "No embedding updates, is embedding_ft True?"
-            new_grads = x.weight * token_mask.broadcast_to((Vocab, Embed))
-            return dataclasses.replace(x, weight=new_grads)
-        return x
+        assert isinstance(x, hnn.Embedding), f"Expected Embedding, got {type(x)}"
+        assert x.weight is not None, "No embedding updates, is embedding_ft True?"
+        new_grads = x.weight * token_mask.broadcast_to((Vocab, Embed))
+        return dataclasses.replace(x, weight=new_grads)
 
     def update_fn(updates, state, params=None):
         del params
@@ -82,7 +81,7 @@ def filter_embedding_grads(optimizer: optax.GradientTransformation, Embed, Vocab
 
     mask_transform = optax.GradientTransformation(lambda _: optax.EmptyState(), update_fn)
 
-    return optax.chain(optimizer, mask_transform)
+    return mask_transform
 
 
 def compute_next_token_loss(
@@ -210,7 +209,7 @@ def main(config: TrainLmConfig):
         token_mask = hax.nn.one_hot(
             tokenizer.convert_tokens_to_ids(config.data.router_token), Vocab, dtype=jnp.float32
         )
-        optimizer = filter_embedding_grads(optimizer, config.model.Embed, Vocab, token_mask)
+        optimizer = optax.chain(optimizer, filter_embedding_grads(config.model.Embed, Vocab, token_mask))
 
     # some axes we need
     Batch = config.trainer.TrainBatch
