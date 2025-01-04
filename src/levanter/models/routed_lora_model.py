@@ -24,6 +24,8 @@ from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.models.rotary import RotaryEmbeddingsConfig
 from levanter.utils.flop_utils import lm_flops_per_token
 from levanter.utils.logging import silence_transformer_nag
+from levanter.utils.stat_utils import IndexCountHistogram, IndexCountUnique
+from levanter.utils.types import Extras
 
 
 silence_transformer_nag()
@@ -153,6 +155,7 @@ class RQwenConfig(LlamaConfig):
 
     Loras = property(lambda self: Axis("loras", self.num_loras))
     LoraRank = property(lambda self: Axis("lora_rank", self.lora_rank))
+    TopK = property(lambda self: Axis("top_k", self.top_k))
 
     def __post_init__(self):
         assert (
@@ -561,10 +564,10 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         key=None,
         router_stop_grad: bool = True,
         activations: bool = False,
-    ) -> tuple[NamedArray, NamedArray, dict]:
+    ) -> tuple[NamedArray, NamedArray, Extras]:
         k_head, k_rout = maybe_rng_split(key, 2)
         Loras, Pos = self.config.Loras, self.config.Pos
-        TopK = hax.Axis("top_k", self.config.top_k)
+        TopK: hax.Axis = self.config.TopK
         compute_dtype = self.embeddings.token_embeddings.weight.dtype
 
         # Softmax, topk
@@ -580,20 +583,19 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         else:
             router_logits = hax.zeros((Batch, Loras), dtype=jnp.float32)
 
-        sm = hax.nn.softmax(router_logits, Loras)
-        ent = hax.sum(-sm * hax.log2(sm), Loras)
-        mean_ent = hax.mean(ent, Batch)
-        std_ent = hax.std(ent, Batch)
+        if TopK.size > 1:
+            # Softmax after topk if k > 1
+            elems, top_k_indices = hax.top_k(router_logits, Loras, TopK.size, TopK)
+            elems = hax.nn.softmax(elems, TopK)
+        else:
+            elems = hax.nn.softmax(router_logits, Loras)
+            elems, top_k_indices = hax.top_k(elems, Loras, TopK.size, TopK)
 
-        batch_sm = sm.mean(Batch)
-        batch_ent = hax.sum(-batch_sm * hax.log2(batch_sm), Loras)
-
-        elems, inds = hax.top_k(sm, Loras, TopK.size, TopK)
         # Create a mask
         lora_mask = hax.zeros((Batch, Loras), dtype=compute_dtype)
         # Arrange batch indicies for a .at
         batch_indices = hax.arange(Batch).broadcast_to((Batch, TopK))
-        lora_mask = lora_mask.array.at[batch_indices.array, inds.array].set(elems.array.astype(compute_dtype))
+        lora_mask = lora_mask.array.at[batch_indices.array, top_k_indices.array].set(elems.array.astype(compute_dtype))
         lora_mask = hax.NamedArray(lora_mask, [Batch, Loras])
 
         # Broadcast the mask to the almost full shape
@@ -610,10 +612,13 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
             res = self.activations(input_ids, attn_mask=attn_mask, lora_mask=lora_mask, key=k_head)
         else:
             res = self(input_ids, attn_mask=attn_mask, lora_mask=lora_mask, key=k_head)
+
+        index_hist = IndexCountHistogram.init(top_k_indices, Loras)
+        index_count = IndexCountUnique.init(top_k_indices, Loras)
         return (
             res,
             router_logits,
-            {"router/mean_ent": mean_ent, "router/std_ent": std_ent, "router/batch_ent": batch_ent},
+            {"router/index_hist": index_hist, "router/used_count": index_count},
         )
 
     def get_lm_head(self) -> hax.NamedArray:

@@ -1,5 +1,7 @@
-from typing import Any, Callable, Optional, Protocol, Tuple, TypeVar, Union
+from typing import Any, Callable, Dict, Protocol, Tuple, TypeAlias, TypeVar, Union
 
+import equinox as eqx
+import jax
 from jaxtyping import PyTree
 
 import haliax as hax
@@ -9,6 +11,9 @@ from haliax.types import Scalar
 M = TypeVar("M")  # Model
 M_con = TypeVar("M_con", contravariant=True)  # Model
 X = TypeVar("X", contravariant=True)  # Input
+
+
+Extras: TypeAlias = Dict[str, jax.Array | eqx.Module]
 
 try:
     from haliax.nn.scan import BlockFoldable
@@ -52,9 +57,6 @@ class ComputeLossFunction(Protocol[M_con, X]):
         self,
         model: M_con,
         input: X,
-        reduction: Optional[hax.ReductionFunction] = hax.mean,
-        reduction_axis: Optional[hax.AxisSelection] = None,
-        batch_num_elements: Optional[int] = None,
         **kwargs,
-    ) -> Scalar | hax.NamedArray:
+    ) -> tuple[hax.NamedArray, hax.NamedArray, Extras]:
         ...

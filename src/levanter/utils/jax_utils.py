@@ -1,3 +1,4 @@
+import abc
 import contextlib
 import functools
 import json
@@ -355,13 +356,21 @@ def zeros_like_tree(tree: T, axis_mapping: Optional[ResourceMapping] = None, dty
     return acc
 
 
+class Zeroable(abc.ABC):
+    @abc.abstractmethod
+    def zeros_like(self) -> "Zeroable":
+        pass
+
+
 def _zeros_like(mapping, dtype, n):
     if isinstance(n, hax.NamedArray):
         return hax.shard(hax.zeros_like(n, dtype=dtype), mapping)
     elif is_jax_array_like(n):
         return jnp.zeros_like(n, dtype)
+    elif isinstance(n, Zeroable):
+        return n.zeros_like()
     else:
-        assert jnp.isscalar(n)
+        assert jnp.isscalar(n), f"Expected a scalar, got {n}"
         if dtype is None:
             # if it's a nan, we want to go to 0
             if n != n:
