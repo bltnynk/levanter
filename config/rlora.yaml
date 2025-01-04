@@ -32,11 +32,11 @@ model:
   use_bias: false
   use_layer_norm_weight: true
 
-  disable_lora_mask: false
-  ident_lora_mask: false
+  disable_expert_mask: false
+  ident_expert_mask: false
 
-  num_loras: 64
-  lora_rank: 8
+  num_experts: 64
+  expert_rank: 8
   top_k: 8
   scale: 1.0
 

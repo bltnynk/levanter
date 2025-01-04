@@ -115,7 +115,7 @@ def compute_next_token_loss(
     extras["all_lm_loss"] = MeanScalar.init(losses, where=mask)
 
     if router_zloss_weight > 0.0:
-        z_loss = hax.nn.logsumexp(rlogits, model.config.Loras)
+        z_loss = hax.nn.logsumexp(rlogits, model.config.Experts)
         z_loss = hax.square(z_loss)  # [batch,]
         tokens_per_seq = mask.sum(axis=model.Pos)  # [batch,]
         # This reweights the z_loss to be better balanced based on the number of tokens in the sequence

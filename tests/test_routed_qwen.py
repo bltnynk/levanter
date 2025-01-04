@@ -31,8 +31,8 @@ def test_routed_qwen_forward():
     inds = hax.random.randint(key, Batch, 0, config.Pos.size - 1)
     _ = model.routed_forward(Batch, x, inds)
 
-    # test with num_loras=1
-    config = dataclasses.replace(config, num_loras=1, top_k=1)
+    # test with num_experts=1
+    config = dataclasses.replace(config, num_experts=1, top_k=1)
     model = RQwenLMHeadModel.init(Vocab, config, key=key)
     _ = model.routed_forward(Batch, x, inds)
 
@@ -51,7 +51,7 @@ def test_rqwen_consistent_with_base_qwen():
         hidden_dim=16,
         intermediate_dim=32,
         tie_word_embeddings=True,
-        disable_lora_mask=True,  # disable lora mask to keep consistency
+        disable_expert_mask=True,  # disable lora mask to keep consistency
     )
     Vocab = hax.Axis("vocab", 1000)
     hf_config = config.to_hf_config(Vocab.size)

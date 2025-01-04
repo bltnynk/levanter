@@ -23,11 +23,11 @@ def small_model_cfg():
         hidden_dim=32,
         intermediate_dim=64,
         attn_backend="jax_flash",
-        num_loras=16,
-        lora_rank=1,
+        num_experts=16,
+        expert_rank=1,
         top_k=4,
         tie_word_embeddings=True,
-        disable_lora_mask=False,
+        disable_expert_mask=False,
         use_layer_norm_weight=True,
         rope=DefaultRotaryEmbeddingsConfig(theta=1000000.0),
     )
@@ -64,8 +64,9 @@ def test_rlora_train():
                 data=data_cfg,
                 model=model_cfg,
                 trainer=rlora_train.TrainerConfig(
+                    seed=42,
                     num_train_steps=16,
-                    train_batch_size=8,
+                    train_batch_size=2,
                     per_device_parallelism=1,  # test out grad accum
                     max_eval_batches=1,
                     steps_per_eval=2,

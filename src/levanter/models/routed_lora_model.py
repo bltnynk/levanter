@@ -1,5 +1,6 @@
 import dataclasses
 from dataclasses import dataclass
+from enum import Enum
 from typing import Callable, Dict, Optional, Type, Union
 
 import equinox as eqx
@@ -31,6 +32,15 @@ from levanter.utils.types import Extras
 silence_transformer_nag()
 from transformers import PretrainedConfig as HfConfig  # noqa: E402
 from transformers import Qwen2Config as HfQwenConfig  # noqa: E402
+
+
+class ModelRouting(Enum):
+    """Model routing options"""
+
+    NONE = "none"
+    LORA = "lora"
+    MLP = "mlp"
+    MLP_GLU = "mlp_glu"
 
 
 class LowRankLinear(ModuleWithStateDictSerialization):
@@ -146,15 +156,15 @@ class RQwenConfig(LlamaConfig):
     sliding_window: Optional[int] = None
     max_window_layers: int = 0  # Only apply sliding window beyond this layer
 
-    num_loras: int = 64
-    lora_rank: int = 16
+    num_experts: int = 64
+    expert_rank: int = 16
     top_k: int = 4
-    disable_lora_mask: bool = False
-    ident_lora_mask: bool = False
+    disable_expert_mask: bool = False
+    ident_expert_mask: bool = False
     scale: float = 1.0
 
-    Loras = property(lambda self: Axis("loras", self.num_loras))
-    LoraRank = property(lambda self: Axis("lora_rank", self.lora_rank))
+    Experts = property(lambda self: Axis("loras", self.num_experts))
+    ExpertRank = property(lambda self: Axis("lora_rank", self.expert_rank))
     TopK = property(lambda self: Axis("top_k", self.top_k))
 
     def __post_init__(self):
@@ -252,7 +262,7 @@ class RQwenAttention(eqx.Module):
         q_proj = RLoraLinear.init(
             In=Embed,
             Out=(config.KVHeads, QHeadsPerGroup, config.HeadSize),
-            Inter=(config.Loras, config.LoraRank),
+            Inter=(config.Experts, config.ExpertRank),
             scale=config.scale,
             key=k_q,
             use_bias=True,  # Qwen always uses bias in attention
@@ -261,7 +271,7 @@ class RQwenAttention(eqx.Module):
         k_proj = RLoraLinear.init(
             In=Embed,
             Out=(config.KVHeads, config.HeadSize),
-            Inter=(config.Loras, config.LoraRank),
+            Inter=(config.Experts, config.ExpertRank),
             scale=config.scale,
             key=k_k,
             use_bias=True,
@@ -270,7 +280,7 @@ class RQwenAttention(eqx.Module):
         v_proj = RLoraLinear.init(
             In=Embed,
             Out=(config.KVHeads, config.HeadSize),
-            Inter=(config.Loras, config.LoraRank),
+            Inter=(config.Experts, config.ExpertRank),
             scale=config.scale,
             key=k_v,
             use_bias=True,
@@ -279,7 +289,7 @@ class RQwenAttention(eqx.Module):
         o_proj = RLoraLinear.init(
             In=(config.Heads, config.HeadSize),
             Out=Embed,
-            Inter=(config.Loras, config.LoraRank),
+            Inter=(config.Experts, config.ExpertRank),
             scale=config.scale,
             key=k_o,
             use_bias=False,  # Qwen doesn't use bias in o_proj
@@ -406,7 +416,7 @@ class RQwenDecoderLayer(eqx.Module):
         mlp = RQwenMlp.init(
             config.Embed,
             config.Mlp,
-            (config.Loras, config.LoraRank),
+            (config.Experts, config.ExpertRank),
             config.activation_function,
             scale=config.scale,
             key=k_mlp,
@@ -489,7 +499,7 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         else:
             lm_head = hnn.Linear.init(In=config.Embed, Out=Vocab, key=k_emb, use_bias=False, out_first=True)
 
-        router = Router.init(In=config.Embed, Out=config.Loras, key=k_rout, use_bias=False, out_first=True)
+        router = Router.init(In=config.Embed, Out=config.Experts, key=k_rout, use_bias=False, out_first=True)
 
         return RQwenLMHeadModel(transformer, embeddings, lm_head, router)
 
@@ -566,12 +576,12 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         activations: bool = False,
     ) -> tuple[NamedArray, NamedArray, Extras]:
         k_head, k_rout = maybe_rng_split(key, 2)
-        Loras, Pos = self.config.Loras, self.config.Pos
+        Experts, Pos = self.config.Experts, self.config.Pos
         TopK: hax.Axis = self.config.TopK
         compute_dtype = self.embeddings.token_embeddings.weight.dtype
 
         # Softmax, topk
-        if Loras.size > 1:
+        if Experts.size > 1:
             x = self.activations(input_ids, attn_mask=attn_mask, key=k_head)
             # Get the hidden states for the idxs we select
             router_inputs = x.take(Pos, router_hs_idxs)
@@ -581,40 +591,40 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
             router_logits = self.router(router_inputs, key=k_rout)
             router_logits = router_logits.astype(jnp.float32)
         else:
-            router_logits = hax.zeros((Batch, Loras), dtype=jnp.float32)
+            router_logits = hax.zeros((Batch, Experts), dtype=jnp.float32)
 
         if TopK.size > 1:
             # Softmax after topk if k > 1
-            elems, top_k_indices = hax.top_k(router_logits, Loras, TopK.size, TopK)
+            elems, top_k_indices = hax.top_k(router_logits, Experts, TopK.size, TopK)
             elems = hax.nn.softmax(elems, TopK)
         else:
-            elems = hax.nn.softmax(router_logits, Loras)
-            elems, top_k_indices = hax.top_k(elems, Loras, TopK.size, TopK)
+            elems = hax.nn.softmax(router_logits, Experts)
+            elems, top_k_indices = hax.top_k(elems, Experts, TopK.size, TopK)
 
         # Create a mask
-        lora_mask = hax.zeros((Batch, Loras), dtype=compute_dtype)
+        lora_mask = hax.zeros((Batch, Experts), dtype=compute_dtype)
         # Arrange batch indicies for a .at
         batch_indices = hax.arange(Batch).broadcast_to((Batch, TopK))
         lora_mask = lora_mask.array.at[batch_indices.array, top_k_indices.array].set(elems.array.astype(compute_dtype))
-        lora_mask = hax.NamedArray(lora_mask, [Batch, Loras])
+        lora_mask = hax.NamedArray(lora_mask, [Batch, Experts])
 
         # Broadcast the mask to the almost full shape
-        lora_mask = lora_mask.broadcast_to([Batch, Pos, Loras])
+        lora_mask = lora_mask.broadcast_to([Batch, Pos, Experts])
         seq_mask = hax.arange(Pos).broadcast_to((Batch, Pos)) > router_hs_idxs.broadcast_to((Batch, Pos))
-        seq_mask = seq_mask.broadcast_to([Batch, Pos, Loras])
+        seq_mask = seq_mask.broadcast_to([Batch, Pos, Experts])
         lora_mask = lora_mask * seq_mask
 
-        if self.config.disable_lora_mask:
+        if self.config.disable_expert_mask:
             lora_mask = None
-        elif self.config.ident_lora_mask:
-            lora_mask = hax.ones((Batch, Pos, Loras), dtype=compute_dtype)
+        elif self.config.ident_expert_mask:
+            lora_mask = hax.ones((Batch, Pos, Experts), dtype=compute_dtype)
         if activations:
             res = self.activations(input_ids, attn_mask=attn_mask, lora_mask=lora_mask, key=k_head)
         else:
             res = self(input_ids, attn_mask=attn_mask, lora_mask=lora_mask, key=k_head)
 
-        index_hist = IndexCountHistogram.init(top_k_indices, Loras)
-        index_count = IndexCountUnique.init(top_k_indices, Loras)
+        index_hist = IndexCountHistogram.init(top_k_indices, Experts)
+        index_count = IndexCountUnique.init(top_k_indices, Experts)
         return (
             res,
             router_logits,
