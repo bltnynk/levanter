@@ -32,6 +32,7 @@ from levanter.models.routed_lora_model import (
     lora_trainable_params_filter,
 )
 from levanter.optim import AdamConfig, OptimizerConfig
+from levanter.optim.util import filter_embedding_grads
 from levanter.trainer import Trainer, TrainerConfig
 from levanter.utils.jax_utils import key_iterator, parameter_count
 from levanter.utils.stat_utils import MeanScalar
@@ -62,26 +63,6 @@ class TrainLmConfig:
             raise ValueError("Can't have both full_ft and embedding_router_token_ft")
         if self.embedding_router_token_ft and not self.data.add_router_token:
             raise ValueError("Can't have embedding_router_token_ft without add_router_token")
-
-
-def filter_embedding_grads(Embed, Vocab, token_mask: hax.NamedArray):
-    def where(m: RQwenLMHeadModel):
-        return [m.embeddings.token_embeddings]
-
-    def replace_fn(x):
-        assert isinstance(x, hnn.Embedding), f"Expected Embedding, got {type(x)}"
-        assert x.weight is not None, "No embedding updates, is embedding_ft True?"
-        new_grads = x.weight * token_mask.broadcast_to((Vocab, Embed))
-        return dataclasses.replace(x, weight=new_grads)
-
-    def update_fn(updates, state, params=None):
-        del params
-        updates = eqx.tree_at(where, updates, replace_fn=replace_fn)
-        return updates, state
-
-    mask_transform = optax.GradientTransformation(lambda _: optax.EmptyState(), update_fn)
-
-    return mask_transform
 
 
 def compute_next_token_loss(
