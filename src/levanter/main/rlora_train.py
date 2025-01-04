@@ -130,18 +130,6 @@ def compute_next_token_loss(
 def reinit_lora_weights(model: eqx.Module, *, key: jax.random.PRNGKey) -> eqx.Module:
     """Re-initialize all LoRA weights in the model while preserving other weights."""
 
-    def where(m: RQwenLMHeadModel):
-        return [
-            m.transformer.layers.stacked.mlp.down_proj.low_rank_linear,
-            m.transformer.layers.stacked.mlp.up_proj.low_rank_linear,
-            m.transformer.layers.stacked.mlp.gate_proj.low_rank_linear,
-            m.transformer.layers.stacked.self_attn.q_proj.low_rank_linear,
-            m.transformer.layers.stacked.self_attn.k_proj.low_rank_linear,
-            m.transformer.layers.stacked.self_attn.v_proj.low_rank_linear,
-            m.transformer.layers.stacked.self_attn.o_proj.low_rank_linear,
-            m.router,
-        ]
-
     def re_init_linear(x: hnn.Linear, init_scale=1.0, *, key):
         input_size = hax.axis_size(x.In)
         weight = hax.random.truncated_normal(key, x.weight.axes, -3, 3) * (init_scale / math.sqrt(input_size))
@@ -159,7 +147,7 @@ def reinit_lora_weights(model: eqx.Module, *, key: jax.random.PRNGKey) -> eqx.Mo
         else:
             return x
 
-    return eqx.tree_at(where, model, replace_fn=replace_fn)
+    return jax.tree.map(replace_fn, model, is_leaf=lambda x: isinstance(x, (LowRankLinear, Router)))
 
 
 def main(config: TrainLmConfig):

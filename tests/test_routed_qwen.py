@@ -6,6 +6,7 @@ import numpy as np
 
 import haliax as hax
 
+from levanter.main.rlora_train import reinit_lora_weights
 from levanter.models.attention import AttentionMask
 from levanter.models.routed_lora_model import ExpertType, RQwenConfig, RQwenLMHeadModel
 from test_utils import skip_if_no_torch
@@ -104,3 +105,31 @@ def test_rqwen_consistent_with_base_qwen():
         assert torch_out.shape == jax_out.shape, f"{torch_out.shape} != {jax_out.shape}"
         # Since we 0 init the A layer this might not hold actually
         # assert not np.isclose(torch_out, np.array(jax_out), rtol=1e-4, atol=1e-4).all(), f"{torch_out} == {jax_out} with lora mask"
+
+
+def test_rqwen_reinit():
+    config = RQwenConfig(
+        seq_len=512,
+        num_layers=2,
+        hidden_dim=256,
+        intermediate_dim=512,
+        tie_word_embeddings=True,
+        expert_type=ExpertType.LORA,
+    )
+    model = RQwenLMHeadModel.init(hax.Axis("vocab", 100), config, key=jax.random.PRNGKey(0))
+    model: RQwenLMHeadModel = jax.tree.map(
+        lambda x: 5 * hax.ones_like(x), model, is_leaf=lambda x: isinstance(x, hax.NamedArray)
+    )
+    assert hax.all(
+        model.transformer.layers.stacked.mlp.down_proj.low_rank_linear.lora_a.weight == 5.0
+    ).item(), "Model not reinitialized"
+
+    key = jax.random.PRNGKey(0)
+    model = reinit_lora_weights(model, key=key)
+    assert not hax.all(
+        model.transformer.layers.stacked.mlp.down_proj.low_rank_linear.lora_a.weight == 5.0
+    ).item(), "Model not reinitialized"
+    assert hax.all(
+        model.transformer.layers.stacked.mlp.down_proj.low_rank_linear.lora_b.weight == 0.0
+    ).item(), "Model not reinitialized"
+    assert not hax.all(model.router.weight == 5.0).item(), "Model not reinitialized"
