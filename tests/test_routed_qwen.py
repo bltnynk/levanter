@@ -7,7 +7,7 @@ import numpy as np
 import haliax as hax
 
 from levanter.models.attention import AttentionMask
-from levanter.models.routed_lora_model import RQwenConfig, RQwenLMHeadModel
+from levanter.models.routed_lora_model import ExpertType, RQwenConfig, RQwenLMHeadModel
 from test_utils import skip_if_no_torch
 
 
@@ -52,6 +52,7 @@ def test_rqwen_consistent_with_base_qwen():
         intermediate_dim=32,
         tie_word_embeddings=True,
         disable_expert_mask=True,  # disable lora mask to keep consistency
+        expert_type=ExpertType.LORA,
     )
     Vocab = hax.Axis("vocab", 1000)
     hf_config = config.to_hf_config(Vocab.size)
@@ -83,12 +84,13 @@ def test_rqwen_consistent_with_base_qwen():
             model_output = model.routed_forward(Batch, input, router_hs_idxs=seq_inds, attn_mask=attn_mask)
             return model_output
 
-        jax_out = compute(model, input).array
+        token_pred, mask, extras = compute(model, input)
+        jax_out = token_pred.array
 
         assert torch_out.shape == jax_out.shape, f"{torch_out.shape} != {jax_out.shape}"
         assert np.isclose(torch_out, np.array(jax_out), rtol=1e-4, atol=1e-4).all(), f"{torch_out} != {jax_out}"
 
-        cfg_with_lora = dataclasses.replace(config, disable_lora_mask=False)
+        cfg_with_lora = dataclasses.replace(config, disable_expert_mask=False)
         model = dataclasses.replace(model, transformer=dataclasses.replace(model.transformer, config=cfg_with_lora))
 
         @hax.named_jit
@@ -96,7 +98,8 @@ def test_rqwen_consistent_with_base_qwen():
             model_output = model.routed_forward(Batch, input, router_hs_idxs=seq_inds, attn_mask=attn_mask)
             return model_output
 
-        jax_out = compute(model, input).array
+        token_pred, mask, extras = compute(model, input)
+        jax_out = token_pred.array
 
         assert torch_out.shape == jax_out.shape, f"{torch_out.shape} != {jax_out.shape}"
         # Since we 0 init the A layer this might not hold actually

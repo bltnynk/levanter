@@ -34,7 +34,7 @@ from transformers import PretrainedConfig as HfConfig  # noqa: E402
 from transformers import Qwen2Config as HfQwenConfig  # noqa: E402
 
 
-class ModelRouting(Enum):
+class ExpertType(Enum):
     """Model routing options"""
 
     NONE = "none"
@@ -71,11 +71,11 @@ class LowRankLinear(ModuleWithStateDictSerialization):
         return LowRankLinear(lora_a, lora_b, scale)
 
     @named_call
-    def __call__(self, x: NamedArray, lora_mask: Optional[NamedArray], *, key=None) -> NamedArray:
+    def __call__(self, x: NamedArray, expert_mask: Optional[NamedArray], *, key=None) -> NamedArray:
         k_a, k_b = maybe_rng_split(key, 2)
         lora_a = self.lora_a(x, key=k_a)
-        if lora_mask is not None:
-            lora_a *= lora_mask
+        if expert_mask is not None:
+            lora_a *= expert_mask
         lora_b = self.lora_b(lora_a, key=k_b)
         return lora_b * self.scale
 
@@ -122,11 +122,11 @@ class RLoraLinear(ModuleWithStateDictSerialization):
         return RLoraLinear(low_rank_linear, linear)
 
     @named_call
-    def __call__(self, x: NamedArray, lora_mask: Optional[NamedArray], *, key=None) -> NamedArray:
+    def __call__(self, x: NamedArray, expert_mask: Optional[NamedArray], *, key=None) -> NamedArray:
         k_linear, k_low_rank = maybe_rng_split(key, 2)
         linear_out = self.linear(x, key=k_linear)
-        if lora_mask is not None:
-            lora_out = self.low_rank_linear(x, lora_mask, key=k_low_rank)
+        if expert_mask is not None:
+            lora_out = self.low_rank_linear(x, expert_mask, key=k_low_rank)
             output = linear_out + lora_out
         else:
             output = linear_out
@@ -147,6 +147,58 @@ class RLoraLinear(ModuleWithStateDictSerialization):
         return fsd(self, state_dict, prefix)
 
 
+class Linear(eqx.Module):
+    linear: hnn.Linear
+
+    def __call__(self, x: NamedArray, expert_mask: Optional[NamedArray], *, key=None) -> NamedArray:
+        return self.linear(x, key=key)
+
+    def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
+        return {"linear": None}
+
+
+MaybeRoutedLinear = Union[RLoraLinear, Linear]
+
+
+def make_linear(
+    config: "RQwenConfig",
+    In: AxisSpec,
+    Out: AxisSpec,
+    Inter: AxisSpec,
+    *,
+    key: PRNGKey,
+    scale: float = 1.0,
+    use_bias: bool = True,
+    out_first: bool = True,
+    dot_general: Optional[DotGeneralOp] = None,
+    init_scale: float = 1.0,
+) -> MaybeRoutedLinear:
+    if config.expert_type == ExpertType.LORA:
+        return RLoraLinear.init(
+            In=In,
+            Out=Out,
+            Inter=Inter,
+            key=key,
+            scale=scale,
+            use_bias=use_bias,
+            out_first=out_first,
+            dot_general=dot_general,
+            init_scale=init_scale,
+        )
+    else:
+        return Linear(
+            hnn.Linear.init(
+                In=In,
+                Out=Out,
+                key=key,
+                use_bias=use_bias,
+                out_first=out_first,
+                dot_general=dot_general,
+                init_scale=init_scale,
+            )
+        )
+
+
 @LmConfig.register_subclass("rlora_qwen")
 @dataclass(frozen=True)
 class RQwenConfig(LlamaConfig):
@@ -162,6 +214,7 @@ class RQwenConfig(LlamaConfig):
     disable_expert_mask: bool = False
     ident_expert_mask: bool = False
     scale: float = 1.0
+    expert_type: ExpertType = ExpertType.LORA
 
     Experts = property(lambda self: Axis("loras", self.num_experts))
     ExpertRank = property(lambda self: Axis("lora_rank", self.expert_rank))
@@ -248,10 +301,10 @@ class RQwenConfig(LlamaConfig):
 # Modified attention class for Qwen
 class RQwenAttention(eqx.Module):
     config: RQwenConfig = eqx.static_field()
-    q_proj: RLoraLinear
-    k_proj: RLoraLinear
-    v_proj: RLoraLinear
-    o_proj: RLoraLinear
+    q_proj: MaybeRoutedLinear
+    k_proj: MaybeRoutedLinear
+    v_proj: MaybeRoutedLinear
+    o_proj: MaybeRoutedLinear
 
     @staticmethod
     def init(config: RQwenConfig, *, key) -> "RQwenAttention":
@@ -259,7 +312,8 @@ class RQwenAttention(eqx.Module):
         QHeadsPerGroup = hax.Axis("q_heads_per_group", config.num_heads // config.num_kv_heads)
 
         k_q, k_k, k_v, k_o = jrandom.split(key, 4)
-        q_proj = RLoraLinear.init(
+        q_proj = make_linear(
+            config,
             In=Embed,
             Out=(config.KVHeads, QHeadsPerGroup, config.HeadSize),
             Inter=(config.Experts, config.ExpertRank),
@@ -268,7 +322,8 @@ class RQwenAttention(eqx.Module):
             use_bias=True,  # Qwen always uses bias in attention
             out_first=True,
         )
-        k_proj = RLoraLinear.init(
+        k_proj = make_linear(
+            config,
             In=Embed,
             Out=(config.KVHeads, config.HeadSize),
             Inter=(config.Experts, config.ExpertRank),
@@ -277,7 +332,8 @@ class RQwenAttention(eqx.Module):
             use_bias=True,
             out_first=True,
         )
-        v_proj = RLoraLinear.init(
+        v_proj = make_linear(
+            config,
             In=Embed,
             Out=(config.KVHeads, config.HeadSize),
             Inter=(config.Experts, config.ExpertRank),
@@ -286,7 +342,8 @@ class RQwenAttention(eqx.Module):
             use_bias=True,
             out_first=True,
         )
-        o_proj = RLoraLinear.init(
+        o_proj = make_linear(
+            config,
             In=(config.Heads, config.HeadSize),
             Out=Embed,
             Inter=(config.Experts, config.ExpertRank),
@@ -302,7 +359,7 @@ class RQwenAttention(eqx.Module):
         self,
         x: NamedArray,
         mask: Optional[NamedArray | AttentionMask],
-        lora_mask=Optional[NamedArray],
+        expert_mask=Optional[NamedArray],
         layer_idx: int = 0,
         *,
         key=None,
@@ -310,11 +367,11 @@ class RQwenAttention(eqx.Module):
         key_q, key_k, key_v, key_o = maybe_rng_split(key, 4)
 
         # QKV projections
-        q = self.q_proj(x, lora_mask, key=key_q).rearrange(
+        q = self.q_proj(x, expert_mask, key=key_q).rearrange(
             (..., "kv_heads", "q_heads_per_group", "position", "head_size")
         )
-        k = self.k_proj(x, lora_mask, key=key_k).rearrange((..., "kv_heads", "position", "head_size"))
-        v = self.v_proj(x, lora_mask, key=key_v).rearrange((..., "kv_heads", "position", "head_size"))
+        k = self.k_proj(x, expert_mask, key=key_k).rearrange((..., "kv_heads", "position", "head_size"))
+        v = self.v_proj(x, expert_mask, key=key_v).rearrange((..., "kv_heads", "position", "head_size"))
 
         # Apply rotary embeddings
         rot_embs = self.config.rope.build(self.config.HeadSize, q.resolve_axis("position"))
@@ -349,7 +406,7 @@ class RQwenAttention(eqx.Module):
         attn_output = attn_output.flatten_axes(("kv_heads", "q_heads_per_group"), "heads")
         attn_output = attn_output.astype(x.dtype)
 
-        attn_output = self.o_proj(attn_output, lora_mask, key=key_o)
+        attn_output = self.o_proj(attn_output, expert_mask, key=key_o)
         return attn_output
 
 
@@ -359,13 +416,14 @@ class RQwenMlp(eqx.Module):
     before down-proj.
     """
 
-    gate_proj: RLoraLinear  # projection from Embed to Mlp
-    up_proj: RLoraLinear  # projection from Embed to Mlp
-    down_proj: RLoraLinear  # projection from Mlp to Embed
+    gate_proj: MaybeRoutedLinear  # projection from Embed to Mlp
+    up_proj: MaybeRoutedLinear  # projection from Embed to Mlp
+    down_proj: MaybeRoutedLinear  # projection from Mlp to Embed
     act: Callable = eqx.static_field()
 
     @staticmethod
     def init(
+        config: RQwenConfig,
         Embed: Axis,
         Mlp: Axis,
         Inter: AxisSpec,
@@ -376,14 +434,14 @@ class RQwenMlp(eqx.Module):
         use_bias: bool = False,
     ) -> "RLoraLinear":
         k_fc, k_up_proj, k_down_proj = jrandom.split(key, 3)
-        gate_proj = RLoraLinear.init(
-            Out=Mlp, In=Embed, Inter=Inter, scale=scale, key=k_fc, use_bias=use_bias, out_first=True
+        gate_proj = make_linear(
+            config, Out=Mlp, In=Embed, Inter=Inter, scale=scale, key=k_fc, use_bias=use_bias, out_first=True
         )
-        up_proj = RLoraLinear.init(
-            Out=Mlp, In=Embed, Inter=Inter, scale=scale, key=k_up_proj, use_bias=use_bias, out_first=True
+        up_proj = make_linear(
+            config, Out=Mlp, In=Embed, Inter=Inter, scale=scale, key=k_up_proj, use_bias=use_bias, out_first=True
         )
-        down_proj = RLoraLinear.init(
-            Out=Embed, In=Mlp, Inter=Inter, scale=scale, key=k_down_proj, use_bias=use_bias, out_first=True
+        down_proj = make_linear(
+            config, Out=Embed, In=Mlp, Inter=Inter, scale=scale, key=k_down_proj, use_bias=use_bias, out_first=True
         )
         if isinstance(activation_fn, str):
             activation_fn = ACT2FN[activation_fn]
@@ -391,12 +449,12 @@ class RQwenMlp(eqx.Module):
         return RQwenMlp(gate_proj, up_proj, down_proj, act)
 
     @named_call
-    def __call__(self, x: NamedArray, lora_mask: Optional[NamedArray], *, key=None) -> NamedArray:
+    def __call__(self, x: NamedArray, expert_mask: Optional[NamedArray], *, key=None) -> NamedArray:
         k_gate, k_up, k_down = maybe_rng_split(key, 3)
-        hidden_states = self.gate_proj(x, lora_mask, key=k_gate)
+        hidden_states = self.gate_proj(x, expert_mask, key=k_gate)
         hidden_states = self.act(hidden_states)
-        hidden_states = hidden_states * self.up_proj(x, lora_mask, key=k_up)
-        outputs = self.down_proj(hidden_states, lora_mask, key=k_down)
+        hidden_states = hidden_states * self.up_proj(x, expert_mask, key=k_up)
+        outputs = self.down_proj(hidden_states, expert_mask, key=k_down)
         return outputs
 
 
@@ -404,7 +462,7 @@ class RQwenMlp(eqx.Module):
 class RQwenDecoderLayer(eqx.Module):
     config: RQwenConfig = eqx.static_field()
     self_attn: RQwenAttention
-    mlp: RQwenMlp  # Can reuse Llama MLP as structure is similar
+    mlp: RQwenMlp
     input_layernorm: LlamaRMSNorm
     post_attention_layernorm: LlamaRMSNorm
 
@@ -414,6 +472,7 @@ class RQwenDecoderLayer(eqx.Module):
 
         attn = RQwenAttention.init(config, key=k_attn)
         mlp = RQwenMlp.init(
+            config,
             config.Embed,
             config.Mlp,
             (config.Experts, config.ExpertRank),
@@ -429,18 +488,18 @@ class RQwenDecoderLayer(eqx.Module):
 
     @named_call
     def __call__(
-        self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], lora_mask: Optional[NamedArray], *, key=None
+        self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], expert_mask: Optional[NamedArray], *, key=None
     ) -> NamedArray:
         k_attn, k_mlp = maybe_rng_split(key, 2)
 
         residual = x
         x = self.input_layernorm(x)
-        attn_output = self.self_attn(x=x, mask=mask, lora_mask=lora_mask, key=k_attn)
+        attn_output = self.self_attn(x=x, mask=mask, expert_mask=expert_mask, key=k_attn)
         x = residual + attn_output
 
         residual = x
         x = self.post_attention_layernorm(x)
-        mlp_output = self.mlp(x, lora_mask=lora_mask, key=k_mlp)
+        mlp_output = self.mlp(x, expert_mask=expert_mask, key=k_mlp)
         output = residual + mlp_output
         return output
 
@@ -466,10 +525,10 @@ class RQwenTransformer(eqx.Module):
 
     @named_call
     def __call__(
-        self, x: NamedArray, attn_mask: Optional[NamedArray | AttentionMask], lora_mask: Optional[NamedArray], *, key
+        self, x: NamedArray, attn_mask: Optional[NamedArray | AttentionMask], expert_mask: Optional[NamedArray], *, key
     ) -> NamedArray:
         keys = maybe_rng_split(key, self.config.num_layers) if key is not None else None
-        x = self.layers.fold(x, mask=attn_mask, lora_mask=lora_mask, key=keys)
+        x = self.layers.fold(x, mask=attn_mask, expert_mask=expert_mask, key=keys)
         x = self.norm(x)
 
         return x
@@ -519,7 +578,7 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         self,
         input_ids: NamedArray,
         attn_mask: Optional[Union[NamedArray, AttentionMask]] = None,
-        lora_mask: Optional[NamedArray] = None,
+        expert_mask: Optional[NamedArray] = None,
         *,
         key=None,
     ) -> NamedArray:
@@ -533,7 +592,7 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         """
         k_t, k_head = maybe_rng_split(key, 2)
         x = self.embeddings.embed(input_ids)
-        x = self.transformer(x, attn_mask=attn_mask, lora_mask=lora_mask, key=k_t)
+        x = self.transformer(x, attn_mask=attn_mask, expert_mask=expert_mask, key=k_t)
         if self.lm_head:
             lm_logits = self.lm_head(x, key=k_head)
         else:
@@ -544,7 +603,7 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         self,
         input_ids: NamedArray,
         attn_mask: Optional[AttentionMask | NamedArray] = None,
-        lora_mask: Optional[NamedArray] = None,
+        expert_mask: Optional[NamedArray] = None,
         *,
         key=None,
     ) -> NamedArray:
@@ -560,7 +619,7 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
 
         """
         x = self.embeddings.embed(input_ids)
-        x = self.transformer(x, attn_mask=attn_mask, lora_mask=lora_mask, key=key)
+        x = self.transformer(x, attn_mask=attn_mask, expert_mask=expert_mask, key=key)
 
         return x
 
@@ -602,26 +661,28 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
             elems, top_k_indices = hax.top_k(elems, Experts, TopK.size, TopK)
 
         # Create a mask
-        lora_mask = hax.zeros((Batch, Experts), dtype=compute_dtype)
+        expert_mask = hax.zeros((Batch, Experts), dtype=compute_dtype)
         # Arrange batch indicies for a .at
         batch_indices = hax.arange(Batch).broadcast_to((Batch, TopK))
-        lora_mask = lora_mask.array.at[batch_indices.array, top_k_indices.array].set(elems.array.astype(compute_dtype))
-        lora_mask = hax.NamedArray(lora_mask, [Batch, Experts])
+        expert_mask = expert_mask.array.at[batch_indices.array, top_k_indices.array].set(
+            elems.array.astype(compute_dtype)
+        )
+        expert_mask = hax.NamedArray(expert_mask, [Batch, Experts])
 
         # Broadcast the mask to the almost full shape
-        lora_mask = lora_mask.broadcast_to([Batch, Pos, Experts])
+        expert_mask = expert_mask.broadcast_to([Batch, Pos, Experts])
         seq_mask = hax.arange(Pos).broadcast_to((Batch, Pos)) > router_hs_idxs.broadcast_to((Batch, Pos))
         seq_mask = seq_mask.broadcast_to([Batch, Pos, Experts])
-        lora_mask = lora_mask * seq_mask
+        expert_mask = expert_mask * seq_mask
 
         if self.config.disable_expert_mask:
-            lora_mask = None
+            expert_mask = None
         elif self.config.ident_expert_mask:
-            lora_mask = hax.ones((Batch, Pos, Experts), dtype=compute_dtype)
+            expert_mask = hax.ones((Batch, Pos, Experts), dtype=compute_dtype)
         if activations:
-            res = self.activations(input_ids, attn_mask=attn_mask, lora_mask=lora_mask, key=k_head)
+            res = self.activations(input_ids, attn_mask=attn_mask, expert_mask=expert_mask, key=k_head)
         else:
-            res = self(input_ids, attn_mask=attn_mask, lora_mask=lora_mask, key=k_head)
+            res = self(input_ids, attn_mask=attn_mask, expert_mask=expert_mask, key=k_head)
 
         index_hist = IndexCountHistogram.init(top_k_indices, Experts)
         index_count = IndexCountUnique.init(top_k_indices, Experts)
