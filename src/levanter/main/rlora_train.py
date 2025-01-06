@@ -2,19 +2,16 @@ import dataclasses
 import functools
 import gc
 import logging
-import math
 from dataclasses import dataclass, field
 from typing import Optional, Type
 
 import equinox as eqx
-import jax
 import jax.numpy as jnp
 import jax.random as jrandom
 import optax
 from jaxtyping import PyTree
 
 import haliax as hax
-import haliax.nn as hnn
 from haliax import Axis
 from haliax.partitioning import named_jit, round_axis_for_partitioning
 
@@ -25,16 +22,15 @@ from levanter.data.text import FIMUrlSourceConfig, mk_fim_dataset
 from levanter.models.lm_model import LmExample, RoutableLmExample
 from levanter.models.loss import maybe_fused_next_token_loss
 from levanter.models.routed_lora_model import (
-    LowRankLinear,
-    Router,
     RQwenConfig,
     RQwenLMHeadModel,
-    lora_trainable_params_filter,
+    reinit_expert_weights,
+    routed_experts_trainable_params_filter,
 )
 from levanter.optim import AdamConfig, OptimizerConfig
 from levanter.optim.util import filter_embedding_grads
 from levanter.trainer import Trainer, TrainerConfig
-from levanter.utils.jax_utils import key_iterator, parameter_count
+from levanter.utils.jax_utils import parameter_count
 from levanter.utils.stat_utils import MeanScalar
 from levanter.utils.types import Extras, FilterSpec
 
@@ -127,29 +123,6 @@ def compute_next_token_loss(
     return losses, mask, extras
 
 
-def reinit_lora_weights(model: eqx.Module, *, key: jax.random.PRNGKey) -> eqx.Module:
-    """Re-initialize all LoRA weights in the model while preserving other weights."""
-
-    def re_init_linear(x: hnn.Linear, init_scale=1.0, *, key):
-        input_size = hax.axis_size(x.In)
-        weight = hax.random.truncated_normal(key, x.weight.axes, -3, 3) * (init_scale / math.sqrt(input_size))
-        return dataclasses.replace(x, weight=weight)
-
-    keys = key_iterator(key)
-
-    def replace_fn(x: eqx.Module):
-        if isinstance(x, LowRankLinear):
-            lora_a = re_init_linear(x.lora_a, init_scale=1.0, key=next(keys))
-            lora_b = re_init_linear(x.lora_b, init_scale=0.0, key=next(keys))
-            return LowRankLinear(lora_a, lora_b, x.scale)
-        elif isinstance(x, Router):
-            return re_init_linear(x, init_scale=1.0, key=next(keys))
-        else:
-            return x
-
-    return jax.tree.map(replace_fn, model, is_leaf=lambda x: isinstance(x, (LowRankLinear, Router)))
-
-
 def main(config: TrainLmConfig):
     tokenizer = config.data.the_tokenizer
 
@@ -238,8 +211,11 @@ def main(config: TrainLmConfig):
         if config.full_ft:
             is_trainable = True
         else:
-            is_trainable = lora_trainable_params_filter(model_shape)
+            is_trainable = routed_experts_trainable_params_filter(model_shape)
             if config.embedding_router_token_ft:
+                assert isinstance(
+                    is_trainable.embeddings, eqx.Module
+                ), f"Expected embeddings to be a module, got {type(is_trainable.embeddings)}"
                 is_trainable = eqx.tree_at(lambda x: x.embeddings, is_trainable, replace=True)
         state = trainer.initial_state(training_key, model_init=model_init, is_trainable=is_trainable)
 
@@ -267,7 +243,7 @@ def main(config: TrainLmConfig):
                 )
                 # Loading from HF zeros out all missing weights so...
                 model = named_jit(
-                    lambda m: trainer.mp.cast_to_param(reinit_lora_weights(m, key=model_key)), parameter_axis_mapping
+                    lambda m: trainer.mp.cast_to_param(reinit_expert_weights(m, key=model_key)), parameter_axis_mapping
                 )(model)
                 state = dataclasses.replace(state, model=model)
             else:

@@ -9,12 +9,13 @@ import tiny_test_corpus
 from levanter.data.text import FIMUrlSourceConfig
 from levanter.distributed import RayConfig
 from levanter.models.rotary import DefaultRotaryEmbeddingsConfig
+from levanter.models.routed_lora_model import ExpertType
 from levanter.optim.config import AdamConfig
 from levanter.tracker.wandb import WandbConfig
 from test_utils import skip_if_no_torch
 
 
-def small_model_cfg():
+def small_model_cfg(expert_type=ExpertType.LORA):
     return rlora_train.RQwenConfig(
         num_layers=4,
         num_heads=2,
@@ -29,17 +30,19 @@ def small_model_cfg():
         tie_word_embeddings=True,
         disable_expert_mask=False,
         use_layer_norm_weight=True,
+        expert_type=expert_type,
         rope=DefaultRotaryEmbeddingsConfig(theta=1000000.0),
     )
 
 
 @pytest.mark.entry
+@pytest.mark.parametrize("expert_type", [ExpertType.LORA, ExpertType.MLP, ExpertType.MLP_GLU])
 @skip_if_no_torch
-def test_rlora_train():
+def test_rlora_train(expert_type):
     from transformers import Qwen2ForCausalLM
 
     # just testing if train_lm has a pulse
-    model_cfg = small_model_cfg()
+    model_cfg = small_model_cfg(expert_type=expert_type)
     with tempfile.TemporaryDirectory() as tmpdir:
         test_data_jsonl = tiny_test_corpus.write_fim_data(tmpdir + "/test_data.jsonl", len=2048)
         test_validation_jsonl = tiny_test_corpus.write_fim_data(tmpdir + "/test_data_valid.jsonl", len=2048)
@@ -78,7 +81,7 @@ def test_rlora_train():
                     tensor_parallel_axes=["mlp", "heads"],
                     mp=jmp.get_policy("p=f32,c=bf16"),
                 ),
-                optimizer=AdamConfig(learning_rate=0.001, weight_decay=0.1, warmup=0.00, lr_schedule="constant"),
+                optimizer=AdamConfig(learning_rate=0.01, weight_decay=0.01, warmup=0.00, lr_schedule="constant"),
                 router_z_loss_weight=0.001,
                 full_ft=False,
                 embedding_router_token_ft=True,

@@ -1,14 +1,21 @@
 import dataclasses
 import tempfile
 
+import equinox as eqx
 import jax
 import numpy as np
+import pytest
 
 import haliax as hax
 
-from levanter.main.rlora_train import reinit_lora_weights
 from levanter.models.attention import AttentionMask
-from levanter.models.routed_lora_model import ExpertType, RQwenConfig, RQwenLMHeadModel
+from levanter.models.routed_lora_model import (
+    ExpertType,
+    RQwenConfig,
+    RQwenLMHeadModel,
+    reinit_expert_weights,
+    routed_experts_trainable_params_filter,
+)
 from test_utils import skip_if_no_torch
 
 
@@ -107,29 +114,68 @@ def test_rqwen_consistent_with_base_qwen():
         # assert not np.isclose(torch_out, np.array(jax_out), rtol=1e-4, atol=1e-4).all(), f"{torch_out} == {jax_out} with lora mask"
 
 
-def test_rqwen_reinit():
+@pytest.mark.parametrize("expert_type", [ExpertType.LORA, ExpertType.MLP, ExpertType.MLP_GLU])
+def test_rqwen_reinit(expert_type):
     config = RQwenConfig(
         seq_len=512,
         num_layers=2,
         hidden_dim=256,
         intermediate_dim=512,
         tie_word_embeddings=True,
-        expert_type=ExpertType.LORA,
+        expert_type=expert_type,
     )
     model = RQwenLMHeadModel.init(hax.Axis("vocab", 100), config, key=jax.random.PRNGKey(0))
     model: RQwenLMHeadModel = jax.tree.map(
         lambda x: 5 * hax.ones_like(x), model, is_leaf=lambda x: isinstance(x, hax.NamedArray)
     )
-    assert hax.all(
-        model.transformer.layers.stacked.mlp.down_proj.low_rank_linear.lora_a.weight == 5.0
-    ).item(), "Model not reinitialized"
+
+    def get_weight(model: RQwenLMHeadModel):
+        if expert_type == ExpertType.LORA:
+            return model.transformer.layers.stacked.mlp.down_proj.low_rank_linear.lora_a.weight
+        elif expert_type == ExpertType.MLP:
+            return model.transformer.layers.stacked.mlp.experts.down_proj.weight
+        elif expert_type == ExpertType.MLP_GLU:
+            return model.transformer.layers.stacked.mlp.experts.down_proj.weight
+
+    assert hax.all(get_weight(model) == 5.0).item(), "Model not reinitialized"
 
     key = jax.random.PRNGKey(0)
-    model = reinit_lora_weights(model, key=key)
-    assert not hax.all(
-        model.transformer.layers.stacked.mlp.down_proj.low_rank_linear.lora_a.weight == 5.0
-    ).item(), "Model not reinitialized"
-    assert hax.all(
-        model.transformer.layers.stacked.mlp.down_proj.low_rank_linear.lora_b.weight == 0.0
-    ).item(), "Model not reinitialized"
-    assert not hax.all(model.router.weight == 5.0).item(), "Model not reinitialized"
+    model = reinit_expert_weights(model, key=key)
+    assert not hax.all(get_weight(model) == 5.0).item(), "Model not reinitialized"
+    if expert_type == ExpertType.LORA:
+        assert hax.all(
+            model.transformer.layers.stacked.mlp.down_proj.low_rank_linear.lora_b.weight == 0.0
+        ).item(), "Lora B not set to 0"
+    assert not hax.all(model.router.weight == 5.0).item(), "Routed not reinitialized"
+
+
+@pytest.mark.parametrize("expert_type", [ExpertType.LORA, ExpertType.MLP, ExpertType.MLP_GLU])
+def test_rqwen_trainable_filt(expert_type):
+    config = RQwenConfig(
+        seq_len=512,
+        num_layers=2,
+        hidden_dim=256,
+        intermediate_dim=512,
+        tie_word_embeddings=True,
+        expert_type=expert_type,
+    )
+
+    def model_init():
+        return config.build(hax.Axis("vocab", 100), key=jax.random.PRNGKey(0))
+
+    model_shape = eqx.filter_eval_shape(model_init)
+    is_trainable: RQwenLMHeadModel = routed_experts_trainable_params_filter(model_shape)
+    tf = is_trainable.transformer.layers.stacked
+    assert is_trainable.router is True
+    if expert_type == ExpertType.LORA:
+        assert tf.mlp.down_proj.low_rank_linear is True
+        assert tf.mlp.up_proj.low_rank_linear is True
+        assert tf.mlp.gate_proj.low_rank_linear is True
+        assert tf.self_attn.k_proj.low_rank_linear is True
+        assert tf.self_attn.q_proj.low_rank_linear is True
+        assert tf.self_attn.v_proj.low_rank_linear is True
+        assert tf.self_attn.o_proj.low_rank_linear is True
+    elif expert_type == ExpertType.MLP:
+        assert tf.mlp.experts is True
+    elif expert_type == ExpertType.MLP_GLU:
+        assert tf.mlp.experts is True

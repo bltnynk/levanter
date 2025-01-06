@@ -3,6 +3,7 @@ import dataclasses
 import equinox as eqx
 import jax
 import optax
+
 import haliax as hax
 import haliax.nn as hnn
 

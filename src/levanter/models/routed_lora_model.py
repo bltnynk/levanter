@@ -1,4 +1,5 @@
 import dataclasses
+import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Dict, Optional, Type, Union
@@ -24,6 +25,7 @@ from levanter.models.llama import LlamaConfig, LlamaEmbedding, LlamaRMSNorm
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.models.rotary import RotaryEmbeddingsConfig
 from levanter.utils.flop_utils import lm_flops_per_token
+from levanter.utils.jax_utils import key_iterator
 from levanter.utils.logging import silence_transformer_nag
 from levanter.utils.stat_utils import IndexCountHistogram, IndexCountUnique
 from levanter.utils.types import Extras
@@ -80,11 +82,42 @@ class LowRankLinear(ModuleWithStateDictSerialization):
         return lora_b * self.scale
 
 
-def lora_trainable_params_filter(model: eqx.Module) -> Dict[str, jnp.ndarray]:
-    def is_lora_param(x):
-        return isinstance(x, LowRankLinear) or isinstance(x, Router)
+def routed_experts_trainable_params_filter(model: eqx.Module) -> Dict[str, jnp.ndarray]:
+    def is_routed_experts_param(x):
+        return isinstance(x, (RQwenMlpExperts, Router, LowRankLinear))
 
-    return jax.tree_util.tree_map(is_lora_param, model, is_leaf=is_lora_param)
+    return jax.tree_util.tree_map(is_routed_experts_param, model, is_leaf=is_routed_experts_param)
+
+
+def re_init_linear(x: hnn.Linear, init_scale=1.0, *, key):
+    input_size = hax.axis_size(x.In)
+    weight = hax.random.truncated_normal(key, x.weight.axes, -3, 3) * (init_scale / math.sqrt(input_size))
+    return dataclasses.replace(x, weight=weight)
+
+
+def reinit_expert_weights(model: eqx.Module, *, key: jax.random.PRNGKey) -> eqx.Module:
+    """Re-initialize all LoRA weights in the model while preserving other weights."""
+
+    keys = key_iterator(key)
+
+    def replace_fn(x: eqx.Module):
+        if isinstance(x, LowRankLinear):
+            lora_a = re_init_linear(x.lora_a, init_scale=1.0, key=next(keys))
+            lora_b = re_init_linear(x.lora_b, init_scale=0.0, key=next(keys))
+            return LowRankLinear(lora_a, lora_b, x.scale)
+        elif isinstance(x, Router):
+            return re_init_linear(x, init_scale=1.0, key=key)
+        elif isinstance(x, RQwenMlpExperts):
+            gate_proj = None
+            if x.gate_proj is not None:
+                gate_proj = re_init_linear(x.gate_proj, init_scale=1.0, key=next(keys))
+            up_proj = re_init_linear(x.up_proj, init_scale=1.0, key=next(keys))
+            down_proj = re_init_linear(x.down_proj, init_scale=1.0, key=next(keys))
+            return RQwenMlpExperts(gate_proj, up_proj, down_proj, x.act)
+        else:
+            return x
+
+    return jax.tree.map(replace_fn, model, is_leaf=lambda x: isinstance(x, (LowRankLinear, Router, RQwenMlpExperts)))
 
 
 class RLoraLinear(ModuleWithStateDictSerialization):
@@ -410,6 +443,60 @@ class RQwenAttention(eqx.Module):
         return attn_output
 
 
+class RQwenMlpExperts(eqx.Module):
+    gate_proj: Optional[hnn.Linear]
+    up_proj: hnn.Linear
+    down_proj: hnn.Linear
+    act: Callable = eqx.static_field()
+
+    @staticmethod
+    def init(
+        config: RQwenConfig,
+        *,
+        key,
+    ) -> "RQwenMlpExperts":
+        assert config.expert_type in [ExpertType.MLP, ExpertType.MLP_GLU]
+        k_gate, k_up_proj, k_down_proj = jrandom.split(key, 3)
+        Inter = (config.Experts, config.ExpertRank)
+        gate_proj = None
+        if config.expert_type == ExpertType.MLP_GLU:
+            gate_proj = hnn.Linear.init(
+                In=config.Embed,
+                Out=Inter,
+                key=k_gate,
+                use_bias=False,
+                out_first=True,
+            )
+        up_proj = hnn.Linear.init(
+            In=config.Embed,
+            Out=Inter,
+            key=k_up_proj,
+            use_bias=False,
+            out_first=True,
+        )
+        down_proj = hnn.Linear.init(
+            In=Inter,
+            Out=config.Embed,
+            key=k_down_proj,
+            use_bias=False,
+            out_first=True,
+        )
+        act = ACT2FN[config.activation_function]
+        return RQwenMlpExperts(gate_proj, up_proj, down_proj, act)
+
+    @named_call
+    def __call__(self, x: NamedArray, expert_mask: Optional[NamedArray], *, key=None) -> NamedArray:
+        k_gate, k_up, k_down = maybe_rng_split(key, 3)
+        hidden_states = x
+        hidden_states = self.act(self.up_proj(hidden_states, key=k_up))
+        if self.gate_proj is not None:
+            hidden_states *= self.gate_proj(hidden_states, key=k_gate)
+        if expert_mask is not None:
+            hidden_states *= expert_mask
+        outputs = self.down_proj(hidden_states, key=k_down)
+        return outputs
+
+
 class RQwenMlp(eqx.Module):
     """Multi-layer Perceptron
     In comparison with GPT2, LlamaMlp adds an up-proj that multiplies with activated gate_proj,
@@ -419,6 +506,7 @@ class RQwenMlp(eqx.Module):
     gate_proj: MaybeRoutedLinear  # projection from Embed to Mlp
     up_proj: MaybeRoutedLinear  # projection from Embed to Mlp
     down_proj: MaybeRoutedLinear  # projection from Mlp to Embed
+    experts: Optional[RQwenMlpExperts]
     act: Callable = eqx.static_field()
 
     @staticmethod
@@ -433,7 +521,7 @@ class RQwenMlp(eqx.Module):
         scale: float = 1.0,
         use_bias: bool = False,
     ) -> "RLoraLinear":
-        k_fc, k_up_proj, k_down_proj = jrandom.split(key, 3)
+        k_fc, k_up_proj, k_down_proj, k_mlp_exp = jrandom.split(key, 4)
         gate_proj = make_linear(
             config, Out=Mlp, In=Embed, Inter=Inter, scale=scale, key=k_fc, use_bias=use_bias, out_first=True
         )
@@ -446,7 +534,11 @@ class RQwenMlp(eqx.Module):
         if isinstance(activation_fn, str):
             activation_fn = ACT2FN[activation_fn]
         act = activation_fn  # type: ignore
-        return RQwenMlp(gate_proj, up_proj, down_proj, act)
+        experts = None
+        if config.expert_type in [ExpertType.MLP, ExpertType.MLP_GLU]:
+            experts = RQwenMlpExperts.init(config, key=k_mlp_exp)
+
+        return RQwenMlp(gate_proj, up_proj, down_proj, experts, act)
 
     @named_call
     def __call__(self, x: NamedArray, expert_mask: Optional[NamedArray], *, key=None) -> NamedArray:
@@ -455,7 +547,23 @@ class RQwenMlp(eqx.Module):
         hidden_states = self.act(hidden_states)
         hidden_states = hidden_states * self.up_proj(x, expert_mask, key=k_up)
         outputs = self.down_proj(hidden_states, expert_mask, key=k_down)
+        if self.experts is not None:
+            outputs += self.experts(x, expert_mask, key=key)
         return outputs
+
+    def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
+        return {"expert_mlp": None}
+
+    def from_state_dict(self, state_dict, prefix=None):
+        fsd = ModuleWithStateDictSerialization.from_state_dict
+        if self.experts is not None and prefix is not None and prefix + ".experts.up_proj" not in state_dict:
+            print("Skipping expert_mlp load")
+            experts = self.experts
+            self = dataclasses.replace(self, experts=None)
+            self = fsd(self, state_dict, prefix)
+            self = dataclasses.replace(self, experts=experts)
+            return self
+        return fsd(self, state_dict, prefix)
 
 
 # Modified decoder layer for Qwen
