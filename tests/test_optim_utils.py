@@ -7,7 +7,7 @@ from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
 
 
 def test_embedding_grad_filter():
-    from levanter.main.rlora_train import filter_embedding_grads
+    from levanter.main.routed_lm import filter_embedding_grads
 
     config = LlamaConfig(
         seq_len=128,

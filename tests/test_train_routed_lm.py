@@ -4,19 +4,19 @@ import tempfile
 import jmp
 import pytest
 
-import levanter.main.rlora_train as rlora_train
+import levanter.main.routed_lm as routed_lm
 import tiny_test_corpus
 from levanter.data.text import FIMUrlSourceConfig
 from levanter.distributed import RayConfig
 from levanter.models.rotary import DefaultRotaryEmbeddingsConfig
-from levanter.models.routed_lora_model import ExpertType
+from levanter.models.routed_qwen_model import ExpertType
 from levanter.optim.config import AdamConfig
 from levanter.tracker.wandb import WandbConfig
 from test_utils import skip_if_no_torch
 
 
 def small_model_cfg(expert_type=ExpertType.LORA):
-    return rlora_train.RQwenConfig(
+    return routed_lm.RQwenConfig(
         num_layers=4,
         num_heads=2,
         num_kv_heads=2,
@@ -38,7 +38,7 @@ def small_model_cfg(expert_type=ExpertType.LORA):
 @pytest.mark.entry
 @pytest.mark.parametrize("expert_type", [ExpertType.LORA, ExpertType.MLP, ExpertType.MLP_GLU])
 @skip_if_no_torch
-def test_rlora_train(expert_type):
+def test_routed_train(expert_type):
     from transformers import Qwen2ForCausalLM
 
     # just testing if train_lm has a pulse
@@ -62,11 +62,11 @@ def test_rlora_train(expert_type):
         torch_model.save_pretrained(torch_model_dir)
 
         try:
-            config = rlora_train.TrainLmConfig(
+            config = routed_lm.TrainLmConfig(
                 initialize_from_hf=torch_model_dir,
                 data=data_cfg,
                 model=model_cfg,
-                trainer=rlora_train.TrainerConfig(
+                trainer=routed_lm.TrainerConfig(
                     seed=42,
                     num_train_steps=16,
                     train_batch_size=2,
@@ -86,7 +86,7 @@ def test_rlora_train(expert_type):
                 full_ft=False,
                 embedding_router_token_ft=True,
             )
-            rlora_train.main(config)
+            routed_lm.main(config)
         finally:
             try:
                 os.unlink("wandb")

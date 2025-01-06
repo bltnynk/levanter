@@ -2,52 +2,52 @@ import dataclasses
 import functools
 import gc
 import logging
-import math
 from dataclasses import dataclass, field
 from typing import Optional, Type
 
 import equinox as eqx
-import jax
 import jax.numpy as jnp
 import jax.random as jrandom
 import optax
 from jaxtyping import PyTree
 
 import haliax as hax
-import haliax.nn as hnn
-from haliax import Axis, NamedArray
+from haliax import Axis
 from haliax.partitioning import named_jit, round_axis_for_partitioning
 
 import levanter
 from levanter import callbacks
 from levanter.checkpoint import EpochCheckpointer, load_checkpoint
-from levanter.compat.hf_checkpoints import HFCompatConfig
 from levanter.data.text import FIMUrlSourceConfig, mk_fim_dataset
-from levanter.models.lm_model import LmConfig, LmExample, RoutableLmExample
-from levanter.models.routed_mlp_model import (
-    RoutedQwenConfig,
-    compute_next_token_loss_with_routing,
-    reinit_routed_weights,
-    routed_experts_trainable_params_filter
+from levanter.models.lm_model import LmExample, RoutableLmExample
+from levanter.models.loss import maybe_fused_next_token_loss
+from levanter.models.routed_qwen_model import (
+    RQwenConfig,
+    RQwenLMHeadModel,
+    reinit_expert_weights,
+    routed_experts_trainable_params_filter,
 )
 from levanter.optim import AdamConfig, OptimizerConfig
 from levanter.optim.util import filter_embedding_grads
 from levanter.trainer import Trainer, TrainerConfig
 from levanter.utils.jax_utils import parameter_count
-from levanter.utils.types import FilterSpec
+from levanter.utils.stat_utils import MeanScalar
+from levanter.utils.types import Extras, FilterSpec
 
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class RoutedLMConfig:
+class TrainLmConfig:
     data: FIMUrlSourceConfig = field(default_factory=FIMUrlSourceConfig)
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
-    model: LmConfig = field(default_factory=RoutedQwenConfig)
+    model: RQwenConfig = field(default_factory=RQwenConfig)
     optimizer: OptimizerConfig = field(default_factory=AdamConfig)
     initialize_from_hf: Optional[str] = None
     initialize_from_checkpoint_path: Optional[str] = None
+
+    # if provided, will initialize from this checkpoint, used for llama style data mixture
     epoch: int = 0
     z_loss_weight: float = 0.0
     router_z_loss_weight: float = 0.0
@@ -60,7 +60,70 @@ class RoutedLMConfig:
         if self.embedding_router_token_ft and not self.data.add_router_token:
             raise ValueError("Can't have embedding_router_token_ft without add_router_token")
 
-def main(config: RoutedLMConfig):
+
+def compute_next_token_loss(
+    model: RQwenLMHeadModel,
+    example: LmExample,
+    *,
+    key=None,
+    logsumexp_weight: Optional[float] = None,
+    loss_dtype: Optional[Type[jnp.dtype]] = jnp.float32,
+    router_zloss_weight: float = 0.0,
+    stop_grad: bool = True,
+) -> tuple[hax.NamedArray, hax.NamedArray, Extras]:
+    """
+    Computes the cross-entropy loss for a language modeling example. If reduction is not None, the loss is reduced
+    across the reduction axis (with reduction_axis=None meaning all axes). If reduction is None, the loss is not
+    reduced, and the result is a named array with axes (*batch axes, sequence_length).
+    """
+    assert isinstance(example, RoutableLmExample)
+    # This is problematic, we don't get correctly batched ones so...
+    idxs = jnp.squeeze(example.router_hs_idxs, axis=1)
+    batch_axis = example.tokens.resolve_axis("batch")
+    idxs = hax.NamedArray(idxs, (batch_axis,))
+    example = dataclasses.replace(example, router_hs_idxs=idxs)
+    activations, rlogits, extras = model.routed_forward(
+        batch_axis,
+        example.tokens,
+        example.router_hs_idxs,
+        example.attn_mask,
+        key=key,
+        activations=True,
+        router_stop_grad=stop_grad,
+    )
+
+    losses, mask = maybe_fused_next_token_loss(
+        model.Pos,
+        model.Embed,
+        model.Vocab,
+        activations,
+        model.get_lm_head(),
+        example.tokens,
+        loss_mask=example.loss_mask,
+        logsumexp_weight=logsumexp_weight,
+        dtype=loss_dtype,
+        block_size=model.config.cross_entropy_block_size,
+    )
+
+    if example.completion_mask is not None:
+        extras["completion_loss"] = MeanScalar.init(losses, where=example.completion_mask)
+
+    extras["all_lm_loss"] = MeanScalar.init(losses, where=mask)
+
+    if router_zloss_weight > 0.0:
+        z_loss = hax.nn.logsumexp(rlogits, model.config.Experts)
+        z_loss = hax.square(z_loss)  # [batch,]
+        tokens_per_seq = mask.sum(axis=model.Pos)  # [batch,]
+        # This reweights the z_loss to be better balanced based on the number of tokens in the sequence
+        per_token = router_zloss_weight * z_loss / tokens_per_seq
+        per_token = per_token.broadcast_to(losses.axes)
+        extras["router/z_loss"] = MeanScalar.init(per_token, where=mask)
+        losses += per_token
+
+    return losses, mask, extras
+
+
+def main(config: TrainLmConfig):
     tokenizer = config.data.the_tokenizer
 
     # this is some unpleasant code to allow us to initialize from a hf checkpoint. If this is your first read through,
@@ -73,23 +136,29 @@ def main(config: RoutedLMConfig):
         if hasattr(tokenizer, "vocab") and tokenizer.vocab != converter.tokenizer.vocab:
             logger.warning("The tokenizers appear to be different. You may want to check this.")
 
-        if isinstance(config.initialize_from_hf, str):
-            converter = converter.replaced(reference_checkpoint=config.initialize_from_hf, tokenizer=tokenizer)
-        else:
-            converter = converter.replaced(tokenizer=tokenizer)
-    elif isinstance(config.model, HFCompatConfig):
-        converter = config.model.hf_checkpoint_converter()
-        converter = converter.replaced(tokenizer=tokenizer)
-    else:
-        converter = None
+        converter = converter.replaced(reference_checkpoint=config.initialize_from_hf, tokenizer=tokenizer)
 
     levanter.initialize(config)
 
-    # init the optimizer, especially decides to full-finetune or only router-token-finetune the embedding layer
+    vocab_size = len(tokenizer)
+    parameter_axis_mapping = config.trainer.parameter_axis_mapping
+    Vocab = round_axis_for_partitioning(Axis("vocab", vocab_size), parameter_axis_mapping)
+    if vocab_size != Vocab.size:
+        logger.info(f"Rounding vocab size from {vocab_size} to {Vocab.size} for partitioning")
+
     optimizer = config.optimizer.build(config.trainer.num_train_steps)
+    if config.embedding_router_token_ft:
+        token_mask = hax.nn.one_hot(
+            tokenizer.convert_tokens_to_ids(config.data.router_token), Vocab, dtype=jnp.float32
+        )
+        optimizer = optax.chain(optimizer, filter_embedding_grads(config.model.Embed, Vocab, token_mask))
+
+    # some axes we need
+    Batch = config.trainer.TrainBatch
+    Pos = config.model.Pos
 
     loss_function = functools.partial(
-        compute_next_token_loss_with_routing,
+        compute_next_token_loss,
         logsumexp_weight=config.z_loss_weight,
         router_zloss_weight=config.router_z_loss_weight,
         stop_grad=not (config.full_ft or config.embedding_router_token_ft),
@@ -108,19 +177,6 @@ def main(config: RoutedLMConfig):
         # We have two axis_mappings: one for storing the model and optimizer states, and one for compute
         # This allows Zero-3-style parameter sharding, where we shard the parameters and optimizer state across the mesh
         parameter_axis_mapping = trainer.parameter_axis_mapping
-        
-        # some axes we need
-        Batch = config.trainer.TrainBatch
-        Pos = config.model.Pos
-        Embed = config.model.Embed
-        
-        # to do partitioning, our dimensions have to be divisible by the size of the physical axes they're mapped to
-        # For most things, we just insist you specify the config right, but tokenizers often have strange numbers of
-        # tokens: gpt-2 has 50257, for example. So we round up.
-        vocab_size = len(tokenizer)
-        Vocab = round_axis_for_partitioning(Axis("vocab", vocab_size), parameter_axis_mapping)
-        if vocab_size != Vocab.size:
-            logger.info(f"Rounding vocab size from {vocab_size} to {Vocab.size} for partitioning")
 
         train_dataset = mk_fim_dataset(config.data, "train", tokenizer, Pos, key=data_key)
 
@@ -142,7 +198,11 @@ def main(config: RoutedLMConfig):
                 batch_size=trainer.config.train_batch_size,
             )
             trainer.add_hook(epoch_checkpointer, every=1)
-        
+
+        # to do partitioning, our dimensions have to be divisible by the size of the physical axes they're mapped to
+        # For most things, we just insist you specify the config right, but tokenizers often have strange numbers of
+        # tokens: gpt-2 has 50257, for example. So we round up.
+
         def model_init():
             return config.model.build(Vocab, key=model_key)
 
@@ -153,11 +213,10 @@ def main(config: RoutedLMConfig):
         else:
             is_trainable = routed_experts_trainable_params_filter(model_shape)
             if config.embedding_router_token_ft:
-                token_mask = hax.nn.one_hot(
-                    tokenizer.convert_tokens_to_ids(config.data.router_token), Vocab, dtype=jnp.float32
-                )
-        optimizer = filter_embedding_grads(optimizer, config.model.Embed, Vocab, token_mask)
-
+                assert isinstance(
+                    is_trainable.embeddings, eqx.Module
+                ), f"Expected embeddings to be a module, got {type(is_trainable.embeddings)}"
+                is_trainable = eqx.tree_at(lambda x: x.embeddings, is_trainable, replace=True)
         state = trainer.initial_state(training_key, model_init=model_init, is_trainable=is_trainable)
 
         seek_dataloader = True
@@ -184,7 +243,7 @@ def main(config: RoutedLMConfig):
                 )
                 # Loading from HF zeros out all missing weights so...
                 model = named_jit(
-                    lambda m: trainer.mp.cast_to_param(reinit_routed_weights(m, key=model_key)), parameter_axis_mapping
+                    lambda m: trainer.mp.cast_to_param(reinit_expert_weights(m, key=model_key)), parameter_axis_mapping
                 )(model)
                 state = dataclasses.replace(state, model=model)
             else:

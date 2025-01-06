@@ -9,7 +9,7 @@ import pytest
 import haliax as hax
 
 from levanter.models.attention import AttentionMask
-from levanter.models.routed_lora_model import (
+from levanter.models.routed_qwen_model import (
     ExpertType,
     RQwenConfig,
     RQwenLMHeadModel,
