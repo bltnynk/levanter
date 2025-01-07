@@ -426,6 +426,10 @@ class Trainer:
         Performs training until the number of steps is reached.
         """
         for info in self.training_steps(state, train_loader):
+            if self.config.abort_if_loss_above is not None and info.loss > self.config.abort_if_loss_above:
+                logger.error(f"Loss is above threshold {self.config.abort_if_loss_above}. Aborting training.")
+                levanter.tracker.log({"aborted": True}, step=info.step)
+                break
             pass
 
         # force hooks to run at the end
@@ -644,6 +648,8 @@ class TrainerConfig:
 
     # whether or not to shutdown the tpu at exit. If a float, shutdown after that many seconds. True = 5 minutes
     shutdown_at_exit: Union[bool, float] = False
+
+    abort_if_loss_above: Optional[float] = None  # if loss is above this, abort training
 
     @property
     def TrainBatch(self):

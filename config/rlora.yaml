@@ -36,7 +36,7 @@ model:
   ident_expert_mask: false
 
   num_experts: 64
-  expert_rank: 8
+  expert_rank: 16
   top_k: 8
   scale: 1.0
 
@@ -44,7 +44,7 @@ trainer:
   tracker:
     type: wandb
     project: "levanter-rlora"
-    tags: ["high_batch_rlora"]
+    tags: ["mlp_glu_sweep"]
   mp: p=f32,c=bfloat16
   train_batch_size: 256
   per_device_parallelism: 2
@@ -58,6 +58,7 @@ trainer:
   checkpointer:
     base_path: gs://usc2-ckpt
     save_interval: 15m
+  abort_if_loss_above: 2.0
 
 optimizer:
   type: adam
