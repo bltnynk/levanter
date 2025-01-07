@@ -1,5 +1,4 @@
 import dataclasses
-import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Dict, Optional, Type, Union
@@ -39,7 +38,6 @@ from transformers import Qwen2Config as HfQwenConfig  # noqa: E402
 class ExpertType(Enum):
     """Model routing options"""
 
-    NONE = "none"
     LORA = "lora"
     MLP = "mlp"
     MLP_GLU = "mlp_glu"
@@ -90,34 +88,48 @@ def routed_experts_trainable_params_filter(model: eqx.Module) -> Dict[str, jnp.n
 
 
 def re_init_linear(x: hnn.Linear, init_scale=1.0, *, key):
-    input_size = hax.axis_size(x.In)
-    weight = hax.random.truncated_normal(key, x.weight.axes, -3, 3) * (init_scale / math.sqrt(input_size))
+    weight = init_scale * hax.random.normal(key, x.weight.axes, dtype=x.weight.dtype)
     return dataclasses.replace(x, weight=weight)
 
 
-def reinit_expert_weights(model: eqx.Module, *, key: jax.random.PRNGKey) -> eqx.Module:
+def reinit_expert_weights(config: "RQwenConfig", model: eqx.Module, *, key: jax.random.PRNGKey) -> eqx.Module:
     """Re-initialize all LoRA weights in the model while preserving other weights."""
 
     keys = key_iterator(key)
+    init_scale = config.expert_init_scale
+    init = config.expert_init
 
     def replace_fn(x: eqx.Module):
         if isinstance(x, LowRankLinear):
-            lora_a = re_init_linear(x.lora_a, init_scale=1.0, key=next(keys))
-            lora_b = re_init_linear(x.lora_b, init_scale=0.0, key=next(keys))
+            lora_a = re_init_linear(
+                x.lora_a, init_scale=0.0 if init == ExpertInit.LORA_ZERO_A else init_scale, key=next(keys)
+            )
+            lora_b = re_init_linear(
+                x.lora_b, init_scale=0.0 if init == ExpertInit.LORA_ZERO_B else init_scale, key=next(keys)
+            )
             return LowRankLinear(lora_a, lora_b, x.scale)
         elif isinstance(x, Router):
             return re_init_linear(x, init_scale=1.0, key=key)
         elif isinstance(x, RQwenMlpExperts):
             gate_proj = None
             if x.gate_proj is not None:
-                gate_proj = re_init_linear(x.gate_proj, init_scale=1.0, key=next(keys))
-            up_proj = re_init_linear(x.up_proj, init_scale=1.0, key=next(keys))
-            down_proj = re_init_linear(x.down_proj, init_scale=1.0, key=next(keys))
+                gate_proj = re_init_linear(
+                    x.gate_proj, init_scale=0.0 if init == ExpertInit.MLP_ZERO_GATE else init_scale, key=next(keys)
+                )
+            up_proj = re_init_linear(
+                x.up_proj, init_scale=0.0 if init == ExpertInit.MLP_ZERO_UP else init_scale, key=next(keys)
+            )
+            down_proj = re_init_linear(
+                x.down_proj, init_scale=0.0 if init == ExpertInit.MLP_ZERO_DOWN else init_scale, key=next(keys)
+            )
             return RQwenMlpExperts(gate_proj, up_proj, down_proj, x.act)
         else:
             return x
 
-    return jax.tree.map(replace_fn, model, is_leaf=lambda x: isinstance(x, (LowRankLinear, Router, RQwenMlpExperts)))
+    def is_leaf(x):
+        return isinstance(x, (LowRankLinear, Router, RQwenMlpExperts))
+
+    return jax.tree.map(replace_fn, model, is_leaf=is_leaf)
 
 
 class RLoraLinear(ModuleWithStateDictSerialization):
@@ -232,6 +244,17 @@ def make_linear(
         )
 
 
+class ExpertInit(Enum):
+    """Expert initialization options"""
+
+    LORA_ZERO_A = "lora_zero_a"
+    LORA_ZERO_B = "lora_zero_b"
+    MLP_ZERO_UP = "mlp_zero_up"
+    MLP_ZERO_DOWN = "mlp_zero_down"
+    MLP_ZERO_GATE = "mlp_zero_gate"
+    NONZERO = "nonzero"
+
+
 @LmConfig.register_subclass("rlora_qwen")
 @dataclass(frozen=True)
 class RQwenConfig(LlamaConfig):
@@ -248,15 +271,37 @@ class RQwenConfig(LlamaConfig):
     ident_expert_mask: bool = False
     scale: float = 1.0
     expert_type: ExpertType = ExpertType.LORA
+    expert_init: ExpertInit = ExpertInit.LORA_ZERO_B
+    expert_init_scale: float = 0.02
 
-    Experts = property(lambda self: Axis("loras", self.num_experts))
-    ExpertRank = property(lambda self: Axis("lora_rank", self.expert_rank))
+    Experts = property(lambda self: Axis("experts", self.num_experts))
+    ExpertRank = property(lambda self: Axis("expert_rank", self.expert_rank))
     TopK = property(lambda self: Axis("top_k", self.top_k))
 
     def __post_init__(self):
         assert (
             self.num_heads % self.num_kv_heads == 0
         ), f"num_heads={self.num_heads} not divisible by num_kv_heads={self.num_kv_heads}."
+
+        if self.expert_type == ExpertType.LORA:
+            assert self.expert_init in [
+                ExpertInit.LORA_ZERO_A,
+                ExpertInit.LORA_ZERO_B,
+                ExpertInit.NONZERO,
+            ], self.expert_init
+        elif self.expert_type == ExpertType.MLP:
+            assert self.expert_init in [
+                ExpertInit.MLP_ZERO_UP,
+                ExpertInit.MLP_ZERO_DOWN,
+                ExpertInit.NONZERO,
+            ], self.expert_init
+        elif self.expert_type == ExpertType.MLP_GLU:
+            assert self.expert_init in [
+                ExpertInit.MLP_ZERO_UP,
+                ExpertInit.MLP_ZERO_DOWN,
+                ExpertInit.MLP_ZERO_GATE,
+                ExpertInit.NONZERO,
+            ], self.expert_init
 
     def hf_checkpoint_converter(self) -> HFCheckpointConverter["RQwenConfig"]:  # type: ignore
         return HFCheckpointConverter(
@@ -497,7 +542,7 @@ class RQwenMlpExperts(eqx.Module):
         return outputs
 
 
-class RQwenMlp(eqx.Module):
+class RQwenMlp(ModuleWithStateDictSerialization):
     """Multi-layer Perceptron
     In comparison with GPT2, LlamaMlp adds an up-proj that multiplies with activated gate_proj,
     before down-proj.

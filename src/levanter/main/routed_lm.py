@@ -243,7 +243,8 @@ def main(config: TrainLmConfig):
                 )
                 # Loading from HF zeros out all missing weights so...
                 model = named_jit(
-                    lambda m: trainer.mp.cast_to_param(reinit_expert_weights(m, key=model_key)), parameter_axis_mapping
+                    lambda m: trainer.mp.cast_to_param(reinit_expert_weights(config.model, m, key=model_key)),
+                    parameter_axis_mapping,
                 )(model)
                 state = dataclasses.replace(state, model=model)
             else:
@@ -263,7 +264,7 @@ def main(config: TrainLmConfig):
             trainer.add_eval_hook(eval_dataset)
 
         flops_per_token = config.model.flops_per_token(vocab_size)
-        # Doing 3x the flops: 1 to get the router set, 1 w/the loras, 1 for the backprop (+ the loras but that's small)
+        # Doing 3x the flops: 1 to get the router set, 1 w/the experts, 1 for the backprop (+ the experts but that's small)
         flops_per_example = 3 * flops_per_token * Pos.size if flops_per_token is not None else None
         trainer.add_hook(
             callbacks.log_performance_stats(Pos.size, trainer.config.train_batch_size, flops_per_example), every=1

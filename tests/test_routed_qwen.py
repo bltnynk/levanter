@@ -10,7 +10,9 @@ import haliax as hax
 
 from levanter.models.attention import AttentionMask
 from levanter.models.routed_qwen_model import (
+    ExpertInit,
     ExpertType,
+    RLoraLinear,
     RQwenConfig,
     RQwenLMHeadModel,
     reinit_expert_weights,
@@ -46,9 +48,20 @@ def test_routed_qwen_forward():
 
 
 @skip_if_no_torch
-def test_rqwen_consistent_with_base_qwen():
+@pytest.mark.parametrize("expert_type", [t for t in ExpertType])
+@pytest.mark.parametrize("expert_init", [t for t in ExpertInit])
+def test_rqwen_consistent_with_base_qwen(expert_type, expert_init):
     import torch
     from transformers import Qwen2ForCausalLM
+
+    inits = {
+        ExpertType.LORA: [ExpertInit.LORA_ZERO_A, ExpertInit.LORA_ZERO_B],
+        ExpertType.MLP: [ExpertInit.MLP_ZERO_DOWN, ExpertInit.MLP_ZERO_UP],
+        ExpertType.MLP_GLU: [ExpertInit.MLP_ZERO_DOWN, ExpertInit.MLP_ZERO_UP, ExpertInit.MLP_ZERO_GATE],
+    }
+
+    if expert_init not in inits[expert_type]:
+        pytest.skip(f"Expert type {expert_type} does not support expert init {expert_init}")
 
     converter = RQwenConfig().hf_checkpoint_converter()
     config = RQwenConfig(
@@ -59,8 +72,9 @@ def test_rqwen_consistent_with_base_qwen():
         hidden_dim=16,
         intermediate_dim=32,
         tie_word_embeddings=True,
-        disable_expert_mask=True,  # disable lora mask to keep consistency
-        expert_type=ExpertType.LORA,
+        disable_expert_mask=True,  # disable expert mask to keep consistency
+        expert_type=expert_type,
+        expert_init=expert_init,
     )
     Vocab = hax.Axis("vocab", 1000)
     hf_config = config.to_hf_config(Vocab.size)
@@ -78,13 +92,12 @@ def test_rqwen_consistent_with_base_qwen():
 
     torch_out = torch_model(input_torch)
     torch_out = torch_out.logits.detach().cpu().numpy()
-    # torch_out = jax.nn.softmax(torch_out, axis=-1)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         torch_model.save_pretrained(f"{tmpdir}/torch_model")
 
         model = converter.load_pretrained(
-            Qwen2ForCausalLM, ref=f"{tmpdir}/torch_model", resize_vocab_to_match_tokenizer=False
+            Qwen2ForCausalLM, ref=f"{tmpdir}/torch_model", config=config, resize_vocab_to_match_tokenizer=False
         )
 
         @hax.named_jit
@@ -98,8 +111,8 @@ def test_rqwen_consistent_with_base_qwen():
         assert torch_out.shape == jax_out.shape, f"{torch_out.shape} != {jax_out.shape}"
         assert np.isclose(torch_out, np.array(jax_out), rtol=1e-4, atol=1e-4).all(), f"{torch_out} != {jax_out}"
 
-        cfg_with_lora = dataclasses.replace(config, disable_expert_mask=False)
-        model = dataclasses.replace(model, transformer=dataclasses.replace(model.transformer, config=cfg_with_lora))
+        cfg_with_expert = dataclasses.replace(config, disable_expert_mask=False)
+        model = dataclasses.replace(model, transformer=dataclasses.replace(model.transformer, config=cfg_with_expert))
 
         @hax.named_jit
         def compute(model: RQwenLMHeadModel, input):
@@ -110,12 +123,13 @@ def test_rqwen_consistent_with_base_qwen():
         jax_out = token_pred.array
 
         assert torch_out.shape == jax_out.shape, f"{torch_out.shape} != {jax_out.shape}"
-        # Since we 0 init the A layer this might not hold actually
-        # assert not np.isclose(torch_out, np.array(jax_out), rtol=1e-4, atol=1e-4).all(), f"{torch_out} == {jax_out} with lora mask"
+        should_be_close = expert_init != ExpertInit.NONZERO
+        assert (
+            should_be_close == np.isclose(torch_out, np.array(jax_out), rtol=1e-4, atol=1e-4).all()
+        ), f"{torch_out} == {jax_out} with lora mask"
 
 
-@pytest.mark.parametrize("expert_type", [ExpertType.LORA, ExpertType.MLP, ExpertType.MLP_GLU])
-def test_rqwen_reinit(expert_type):
+def init_const_model(expert_type: ExpertType, expert_init: ExpertInit, const_val=5.0):
     config = RQwenConfig(
         seq_len=512,
         num_layers=2,
@@ -123,30 +137,98 @@ def test_rqwen_reinit(expert_type):
         intermediate_dim=512,
         tie_word_embeddings=True,
         expert_type=expert_type,
+        expert_init=expert_init,
     )
-    model = RQwenLMHeadModel.init(hax.Axis("vocab", 100), config, key=jax.random.PRNGKey(0))
-    model: RQwenLMHeadModel = jax.tree.map(
-        lambda x: 5 * hax.ones_like(x), model, is_leaf=lambda x: isinstance(x, hax.NamedArray)
+    model: RQwenLMHeadModel = RQwenLMHeadModel.init(hax.Axis("vocab", 100), config, key=jax.random.PRNGKey(0))
+    const_model = jax.tree.map(
+        lambda x: const_val * hax.ones_like(x), model, is_leaf=lambda x: isinstance(x, hax.NamedArray)
+    )
+    del model
+
+    def check_weight(x):
+        if isinstance(x, hax.NamedArray):
+            assert hax.all(x == const_val).item()
+        return x
+
+    jax.tree.map(check_weight, const_model, is_leaf=lambda x: isinstance(x, hax.NamedArray))
+    return const_model, config
+
+
+def test_rqwen_reinit():
+    def case(expert_type: ExpertType, expert_init: ExpertInit, zero_getter, nonzero_getter):
+        model, config = init_const_model(expert_type, expert_init, const_val=5.0)
+
+        model = reinit_expert_weights(config, model, key=jax.random.PRNGKey(0))
+
+        stacked = model.transformer.layers.stacked
+        for weight in zero_getter(stacked):
+            assert hax.all(weight == 0.0).item(), "Weight not zero-initialized"
+        for weight in nonzero_getter(stacked):
+            assert not hax.all(weight == 0.0).item(), "Incorrect weight zero-initialized"
+
+    case(
+        ExpertType.MLP,
+        ExpertInit.NONZERO,
+        lambda x: (),
+        lambda x: (x.mlp.experts.down_proj.weight, x.mlp.experts.up_proj.weight),
+    )
+    case(
+        ExpertType.MLP_GLU,
+        ExpertInit.NONZERO,
+        lambda x: (),
+        lambda x: (x.mlp.experts.down_proj.weight, x.mlp.experts.up_proj.weight, x.mlp.experts.gate_proj.weight),
+    )
+    case(
+        ExpertType.LORA,
+        ExpertInit.NONZERO,
+        lambda x: (),
+        lambda x: (x.mlp.down_proj.low_rank_linear.lora_a.weight, x.mlp.down_proj.low_rank_linear.lora_b.weight),
     )
 
-    def get_weight(model: RQwenLMHeadModel):
-        if expert_type == ExpertType.LORA:
-            return model.transformer.layers.stacked.mlp.down_proj.low_rank_linear.lora_a.weight
-        elif expert_type == ExpertType.MLP:
-            return model.transformer.layers.stacked.mlp.experts.down_proj.weight
-        elif expert_type == ExpertType.MLP_GLU:
-            return model.transformer.layers.stacked.mlp.experts.down_proj.weight
+    case(
+        ExpertType.MLP,
+        ExpertInit.MLP_ZERO_DOWN,
+        lambda x: (x.mlp.experts.down_proj.weight,),
+        lambda x: (x.mlp.experts.up_proj.weight,),
+    )
+    case(
+        ExpertType.MLP,
+        ExpertInit.MLP_ZERO_UP,
+        lambda x: (x.mlp.experts.up_proj.weight,),
+        lambda x: (x.mlp.experts.down_proj.weight,),
+    )
 
-    assert hax.all(get_weight(model) == 5.0).item(), "Model not reinitialized"
+    case(
+        ExpertType.MLP_GLU,
+        ExpertInit.MLP_ZERO_DOWN,
+        lambda x: (x.mlp.experts.down_proj.weight,),
+        lambda x: (x.mlp.experts.up_proj.weight, x.mlp.experts.gate_proj.weight),
+    )
+    case(
+        ExpertType.MLP_GLU,
+        ExpertInit.MLP_ZERO_UP,
+        lambda x: (x.mlp.experts.up_proj.weight,),
+        lambda x: (x.mlp.experts.down_proj.weight, x.mlp.experts.gate_proj.weight),
+    )
+    case(
+        ExpertType.MLP_GLU,
+        ExpertInit.MLP_ZERO_GATE,
+        lambda x: (x.mlp.experts.gate_proj.weight,),
+        lambda x: (x.mlp.experts.up_proj.weight, x.mlp.experts.down_proj.weight),
+    )
 
-    key = jax.random.PRNGKey(0)
-    model = reinit_expert_weights(model, key=key)
-    assert not hax.all(get_weight(model) == 5.0).item(), "Model not reinitialized"
-    if expert_type == ExpertType.LORA:
-        assert hax.all(
-            model.transformer.layers.stacked.mlp.down_proj.low_rank_linear.lora_b.weight == 0.0
-        ).item(), "Lora B not set to 0"
-    assert not hax.all(model.router.weight == 5.0).item(), "Routed not reinitialized"
+    case(
+        ExpertType.LORA,
+        ExpertInit.LORA_ZERO_A,
+        lambda x: (x.mlp.down_proj.low_rank_linear.lora_a.weight,),
+        lambda x: (x.mlp.down_proj.low_rank_linear.lora_b.weight,),
+    )
+    case(
+        ExpertType.LORA,
+        ExpertInit.LORA_ZERO_B,
+        lambda x: (x.mlp.down_proj.low_rank_linear.lora_b.weight,),
+        lambda x: (x.mlp.down_proj.low_rank_linear.lora_a.weight,),
+    )
 
 
 @pytest.mark.parametrize("expert_type", [ExpertType.LORA, ExpertType.MLP, ExpertType.MLP_GLU])
@@ -158,6 +240,7 @@ def test_rqwen_trainable_filt(expert_type):
         intermediate_dim=512,
         tie_word_embeddings=True,
         expert_type=expert_type,
+        expert_init=ExpertInit.NONZERO,
     )
 
     def model_init():
@@ -179,3 +262,31 @@ def test_rqwen_trainable_filt(expert_type):
         assert tf.mlp.experts is True
     elif expert_type == ExpertType.MLP_GLU:
         assert tf.mlp.experts is True
+
+
+def test_rqwen_expert_type_init():
+    config = RQwenConfig(
+        seq_len=512,
+        num_layers=2,
+        hidden_dim=256,
+        intermediate_dim=512,
+        tie_word_embeddings=True,
+        expert_type=ExpertType.LORA,
+    )
+    model: RQwenLMHeadModel = config.build(hax.Axis("vocab", 100), key=jax.random.PRNGKey(0))
+    assert model.transformer.layers.stacked.mlp.experts is None
+    assert isinstance(model.transformer.layers.stacked.mlp.down_proj, RLoraLinear)
+
+    for expert_type in [ExpertType.MLP, ExpertType.MLP_GLU]:
+        config = RQwenConfig(
+            seq_len=512,
+            num_layers=2,
+            hidden_dim=256,
+            intermediate_dim=512,
+            tie_word_embeddings=True,
+            expert_type=expert_type,
+            expert_init=ExpertInit.NONZERO,
+        )
+        model: RQwenLMHeadModel = config.build(hax.Axis("vocab", 100), key=jax.random.PRNGKey(0))
+        assert not isinstance(model.transformer.layers.stacked.mlp.down_proj, RLoraLinear)
+        assert model.transformer.layers.stacked.mlp.experts is not None

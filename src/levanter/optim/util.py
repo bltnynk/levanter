@@ -33,7 +33,7 @@ def filter_embedding_grads(Embed, Vocab, token_mask: hax.NamedArray):
     def replace_fn(x):
         if isinstance(x, hnn.Embedding):
             assert x.weight is not None, "No embedding updates, is embedding_ft True?"
-            new_grads = x.weight * token_mask.broadcast_to((Vocab, Embed))
+            new_grads = x.weight * token_mask.broadcast_to((Vocab, Embed)).astype(x.weight.dtype)
             return dataclasses.replace(x, weight=new_grads)
         return x
 

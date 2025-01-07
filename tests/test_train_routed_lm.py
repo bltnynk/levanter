@@ -9,7 +9,7 @@ import tiny_test_corpus
 from levanter.data.text import FIMUrlSourceConfig
 from levanter.distributed import RayConfig
 from levanter.models.rotary import DefaultRotaryEmbeddingsConfig
-from levanter.models.routed_qwen_model import ExpertType
+from levanter.models.routed_qwen_model import ExpertInit, ExpertType
 from levanter.optim.config import AdamConfig
 from levanter.tracker.wandb import WandbConfig
 from test_utils import skip_if_no_torch
@@ -31,12 +31,13 @@ def small_model_cfg(expert_type=ExpertType.LORA):
         disable_expert_mask=False,
         use_layer_norm_weight=True,
         expert_type=expert_type,
+        expert_init=ExpertInit.NONZERO,  # supported by every type
         rope=DefaultRotaryEmbeddingsConfig(theta=1000000.0),
     )
 
 
 @pytest.mark.entry
-@pytest.mark.parametrize("expert_type", [ExpertType.LORA, ExpertType.MLP, ExpertType.MLP_GLU])
+@pytest.mark.parametrize("expert_type", [t for t in ExpertType])
 @skip_if_no_torch
 def test_routed_train(expert_type):
     from transformers import Qwen2ForCausalLM
@@ -73,7 +74,7 @@ def test_routed_train(expert_type):
                     per_device_parallelism=1,  # test out grad accum
                     max_eval_batches=1,
                     steps_per_eval=2,
-                    wandb=WandbConfig(mode="disabled"),
+                    tracker=WandbConfig(mode="disabled"),
                     require_accelerator=False,
                     ray=RayConfig(auto_start_cluster=False),
                     fsdp_axis="embed",
