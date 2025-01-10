@@ -104,8 +104,9 @@ class RoutableLmExample(LmExample):
         loss_mask: Optional[hax.NamedArray] = None,
         completion_mask: Optional[hax.NamedArray] = None,
         ignore_id: Optional[int] = None,
+        eos_id: Optional[int] = None,
     ) -> "RoutableLmExample":
-        lm_example = LmExample.causal(tokens, loss_mask=loss_mask, ignore_id=ignore_id)
+        lm_example = LmExample.causal(tokens, loss_mask=loss_mask, ignore_id=ignore_id, eos_id=eos_id)
         return RoutableLmExample(
             tokens=lm_example.tokens,
             loss_mask=lm_example.loss_mask,

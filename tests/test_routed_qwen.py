@@ -38,7 +38,7 @@ def test_routed_qwen_forward():
 
     Batch = hax.Axis("batch", 32)
     x = hax.random.randint(key, (Batch, config.Pos), 0, Vocab.size)
-    inds = hax.random.randint(key, Batch, 0, config.Pos.size - 1)
+    inds = hax.random.randint(key, (Batch, config.Pos), 0, config.Pos.size - 1)
     _ = model.routed_forward(Batch, x, inds)
 
     # test with num_experts=1
@@ -81,7 +81,7 @@ def test_rqwen_consistent_with_base_qwen(expert_type, expert_init):
 
     Batch = hax.Axis("batch", 2)
     input = hax.random.randint(jax.random.PRNGKey(0), (Batch, config.Pos), 0, Vocab.size)
-    seq_inds = hax.random.randint(jax.random.PRNGKey(0), Batch, 0, config.Pos.size - 1)
+    seq_inds = hax.random.randint(jax.random.PRNGKey(0), (Batch, config.Pos), 0, config.Pos.size - 1)
     attn_mask = AttentionMask.causal()
     input_torch = torch.from_numpy(np.array(input.array)).to(torch.int32)
 

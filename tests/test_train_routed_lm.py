@@ -55,6 +55,7 @@ def test_routed_train(expert_type):
             predict_fim_token=False,
             predict_router_token=False,
             predict_prefix=False,
+            pack=True,
         )
         tokenizer = data_cfg.the_tokenizer
         hf_config = model_cfg.to_hf_config(tokenizer.vocab_size)

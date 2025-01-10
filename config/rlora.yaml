@@ -13,6 +13,7 @@ data:
   predict_router_token: false
   predict_fim_token: false
   add_router_token: false
+  pack: true
 model:
   seq_len: 8192
   hidden_dim: 1536
@@ -44,7 +45,7 @@ trainer:
   tracker:
     type: wandb
     project: "levanter-rlora"
-    tags: ["mlp_glu_sweep"]
+    tags: ["packed_mlpdown"]
   mp: p=f32,c=bfloat16
   train_batch_size: 256
   per_device_parallelism: 2

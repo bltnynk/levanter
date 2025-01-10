@@ -276,7 +276,6 @@ class RQwenConfig(LlamaConfig):
 
     Experts = property(lambda self: Axis("experts", self.num_experts))
     ExpertRank = property(lambda self: Axis("expert_rank", self.expert_rank))
-    TopK = property(lambda self: Axis("top_k", self.top_k))
 
     def __post_init__(self):
         assert (
@@ -789,7 +788,6 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
     ) -> tuple[NamedArray, NamedArray, Extras]:
         k_head, k_rout = maybe_rng_split(key, 2)
         Experts, Pos = self.config.Experts, self.config.Pos
-        TopK: hax.Axis = self.config.TopK
         compute_dtype = self.embeddings.token_embeddings.weight.dtype
 
         # Softmax, topk
@@ -803,30 +801,25 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
             router_logits = self.router(router_inputs, key=k_rout)
             router_logits = router_logits.astype(jnp.float32)
         else:
-            router_logits = hax.zeros((Batch, Experts), dtype=jnp.float32)
+            router_logits = hax.zeros((Batch, Pos, Experts), dtype=jnp.float32)
 
-        if TopK.size > 1:
+        if self.config.top_k > 1:
             # Softmax after topk if k > 1
-            elems, top_k_indices = hax.top_k(router_logits, Experts, TopK.size, TopK)
-            elems = hax.nn.softmax(elems, TopK)
+            elems, top_k_indices = hax.top_k(router_logits, Experts, self.config.top_k)
+            elems = hax.nn.softmax(elems, Experts.resize(self.config.top_k))
         else:
             elems = hax.nn.softmax(router_logits, Experts)
-            elems, top_k_indices = hax.top_k(elems, Experts, TopK.size, TopK)
+            elems, top_k_indices = hax.top_k(elems, Experts, self.config.top_k)
 
         # Create a mask
-        expert_mask = hax.zeros((Batch, Experts), dtype=compute_dtype)
+        expert_mask = hax.zeros((Batch, Pos, Experts), dtype=compute_dtype)
         # Arrange batch indicies for a .at
-        batch_indices = hax.arange(Batch).broadcast_to((Batch, TopK))
-        expert_mask = expert_mask.array.at[batch_indices.array, top_k_indices.array].set(
-            elems.array.astype(compute_dtype)
+        batch_idx = hax.arange(Batch).broadcast_to(top_k_indices.axes)
+        pos_idx = hax.arange(Pos).broadcast_to(top_k_indices.axes)
+        expert_mask = expert_mask.at[Batch, batch_idx, Pos, pos_idx, Experts, top_k_indices].set(
+            elems.astype(compute_dtype)
         )
-        expert_mask = hax.NamedArray(expert_mask, [Batch, Experts])
-
-        # Broadcast the mask to the almost full shape
-        expert_mask = expert_mask.broadcast_to([Batch, Pos, Experts])
-        seq_mask = hax.arange(Pos).broadcast_to((Batch, Pos)) > router_hs_idxs.broadcast_to((Batch, Pos))
-        seq_mask = seq_mask.broadcast_to([Batch, Pos, Experts])
-        expert_mask = expert_mask * seq_mask
+        expert_mask *= router_hs_idxs != -1
 
         if self.config.disable_expert_mask:
             expert_mask = None

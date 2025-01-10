@@ -78,10 +78,7 @@ def compute_next_token_loss(
     """
     assert isinstance(example, RoutableLmExample)
     # This is problematic, we don't get correctly batched ones so...
-    idxs = jnp.squeeze(example.router_hs_idxs, axis=1)
     batch_axis = example.tokens.resolve_axis("batch")
-    idxs = hax.NamedArray(idxs, (batch_axis,))
-    example = dataclasses.replace(example, router_hs_idxs=idxs)
     activations, rlogits, extras = model.routed_forward(
         batch_axis,
         example.tokens,

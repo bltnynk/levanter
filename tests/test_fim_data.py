@@ -1,7 +1,7 @@
 import json
 import tempfile
 
-import jax
+import jax.numpy as jnp
 import pytest
 
 import haliax as hax
@@ -38,54 +38,50 @@ def write_test_data(path, len=128) -> str:
 
 
 @pytest.mark.asyncio
-async def test_fim_url_data():
+@pytest.mark.parametrize("predict_prefix", [True, False])
+@pytest.mark.parametrize("predict_fim_token", [True, False])
+async def test_fim_url_data(predict_prefix, predict_fim_token):
     with tempfile.TemporaryDirectory() as tmpdir:
         max_len = 128
         test_data_jsonl = "file://" + write_test_data(tmpdir + "/test_data.jsonl")
         cfg = FIMUrlSourceConfig(
             cache_dir=tmpdir + "/cache",
             train_urls=[test_data_jsonl],
-            predict_prefix=True,
-            predict_fim_token=False,
+            predict_prefix=predict_prefix,
+            predict_fim_token=predict_fim_token,
+            add_router_token=False,
             predict_router_token=False,
             shuffle=False,
+            pack=True,
         )
         tokenizer = cfg.the_tokenizer
         Pos = hax.Axis("Pos", max_len)
         dataset = mk_fim_dataset(cfg, "train", tokenizer, Pos)
         await dataset.wait_until_len_at_least(1)
         elem = await dataset.get_batch([0, 1, 2, 3])
+        elem0 = elem[0]
 
-        print("Check that for all the uppercase tokens, we want to predict the token after them")
-        print("MAIN MASK")
-        for e in elem:
-            # trim the padding
-            tokens = e.tokens.array
-            last_non_pad = jax.numpy.where(tokens != tokenizer.pad_token_id)[0][-1]
-            text = tokenizer.decode(e.tokens.array[: last_non_pad + 5])
-            chars = list(text)
-            remap = tokenizer(text)
-            for token_idx, masked in enumerate(e.loss_mask.array[: last_non_pad + 5]):
-                cs = remap.token_to_chars(token_idx)
-                if masked:
-                    chars[cs.start : cs.end] = [c.upper() for c in chars[cs.start : cs.end]]
-            print("idx token:", tokenizer.decode(e.tokens.array[e.router_hs_idxs]))
-            text = "".join(chars)
+        fim_token_id, eos_token_id, prefix_token, pad_token_id = tokenizer.convert_tokens_to_ids(
+            [cfg.middle_token, cfg.eos_token, cfg.prefix_token, tokenizer.pad_token]
+        )
 
-            print(text)
-
-        print("COMPLETION MASK")
-        for e in elem:
-            # trim the padding
-            tokens = e.tokens.array
-            last_non_pad = jax.numpy.where(tokens != tokenizer.pad_token_id)[0][-1]
-            text = tokenizer.decode(e.tokens.array[: last_non_pad + 5])
-            chars = list(text)
-            remap = tokenizer(text)
-            for token_idx, masked in enumerate(e.completion_mask.array[: last_non_pad + 5]):
-                cs = remap.token_to_chars(token_idx)
-                if masked:
-                    chars[cs.start : cs.end] = [c.upper() for c in chars[cs.start : cs.end]]
-            text = "".join(chars)
-
-            print(text)
+        starts = jnp.argwhere(elem0.tokens.array == prefix_token).flatten().tolist()
+        middles = jnp.argwhere(elem0.tokens.array == fim_token_id).flatten().tolist()
+        ends = jnp.argwhere(elem0.tokens.array == eos_token_id).flatten().tolist()
+        pads = jnp.argwhere(elem0.tokens.array == pad_token_id)
+        lm = elem0.loss_mask.array
+        assert not lm[pads].any().item(), "doesn' predict from any pad tokens"
+        assert len(starts) == len(ends)
+        assert len(starts) == len(middles)
+        for s, m, e in zip(starts, middles, ends):
+            # Loss mask testing
+            assert (
+                lm[s : m - 1].all().item() == predict_prefix
+            ), f"predict_prefix={predict_prefix}, prefix_mask={lm[s: m-1]}"
+            assert (
+                lm[m - 1].item() == predict_fim_token
+            ), f"predict_fim_token={predict_fim_token}, fim_token_mask={lm[m-1]}"
+            assert lm[m:e].all().item(), "should always predict completion"
+            assert not lm[e].all().item(), "should never predict after eos"
+            # hs idxs testing
+            assert (elem0.router_hs_idxs.array[m:e] == m - 1).all().item()

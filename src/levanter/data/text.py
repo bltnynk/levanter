@@ -1358,6 +1358,7 @@ class FIMUrlSourceConfig:
     train_urls: list[str] = dataclasses.field(default_factory=list)
     validation_urls: list[str] = dataclasses.field(default_factory=list)
     shuffle: bool | int = True
+    pack: bool = False
     add_router_token: bool = True
     predict_prefix: bool = False
     predict_router_token: bool = False
@@ -1434,70 +1435,79 @@ class FIMUrlSourceConfig:
         tokenizer = load_tokenizer(self.tokenizer)
         if self.add_router_token:
             tokenizer.add_special_tokens({"additional_special_tokens": [self.router_token]})
+        pad_token = tokenizer.pad_token
+        eos_token = tokenizer.eos_token
+        if pad_token is None or pad_token == eos_token:
+            pad_token = "<|padding|>"
+            tokenizer.add_special_tokens({"pad_token": pad_token})
         return tokenizer
 
 
 def _preprocess_fim_example(
-    batch: Sequence[str], tokenizer: PreTrainedTokenizerBase, middle_token_id: int, max_model_len=None
+    batch: Sequence[str],
+    tokenizer: PreTrainedTokenizerBase,
+    middle_token_id: int,
+    max_model_len: int,
+    pack: bool = False,
 ) -> dict:
     if max_model_len is None:
         max_model_len = tokenizer.model_max_length
-    tokenized = tokenizer(batch, padding=False)
-    tokenized = [np.array(ids, dtype=np.int32) for ids in tokenized["input_ids"]]
-    input_ids = []
-    middle_idxs = []
-    for i, elem in enumerate(tokenized):
-        if len(elem) > max_model_len:
-            continue
-        middle_idx = np.where(elem == middle_token_id)[0]
-        if len(middle_idx) == 0:
-            with open("fim_error.txt", "w") as f:
-                f.write(str(batch[i]))
-            raise ValueError(f"No middle token ({middle_token_id}) found in {batch[i]}")
-        if len(middle_idx) > 1:
-            raise ValueError(f"Multiple middle tokens ({middle_token_id}) found in {batch[i]}")
-        middle_idxs.append(middle_idx[0].astype(np.int32))
-        input_ids.append(elem)
-
-    return {
-        "input_ids": input_ids,
-        "middle_idxs": middle_idxs,
-        "lens": np.array([len(ids) for ids in input_ids], dtype=np.int32),
-    }
+    input_ids = tokenizer(batch, padding=False, truncation=True, max_length=max_model_len)
+    input_ids = [np.array(ids, dtype=np.int32) for ids in input_ids["input_ids"]]
+    assert input_ids[0].ndim == 1  # make sure it's not already batched
+    # Sometimes long files have the middle token idx after the max_model_len
+    input_ids = [ids for ids in input_ids if np.any(ids == middle_token_id)]
+    if pack:
+        concatted: List[np.array] = []
+        to_concat: List[np.array] = []
+        while len(input_ids) > 0:
+            # This is valid since each element is at most `max_model_len`
+            while len(input_ids) > 0 and (sum(len(ids) for ids in to_concat) + len(input_ids[0])) <= max_model_len:
+                to_concat.append(input_ids.pop(0))
+            concatted.append(np.concatenate(to_concat))
+            to_concat = []
+        return {"input_ids": concatted}
+    else:
+        return {"input_ids": input_ids}
 
 
-@functools.partial(jax.jit, static_argnums=(0, 4, 5, 6, 7))
+# @functools.partial(jax.jit, static_argnums=(0, 3, 4, 5, 6, 7, 8, 9, 10))
 def _mk_fim_example_jit(
     Pos: hax.Axis,
     input_ids: hax.NamedArray,
-    middle_idxs: np.ndarray,
-    lens: np.ndarray,
+    hs_idxs: hax.NamedArray,
+    middle_token_id: int,
+    eos_token_id: int,
+    pad_token_id: int,
+    router_token_id: Optional[int],
     has_router_token: bool,
     predict_prefix: bool,
     predict_router_token: bool,
     predict_fim_token: bool,
 ) -> RoutableLmExample:
-    loss_mask = ~hax.nn.one_hot(-1, Pos, dtype=jax.numpy.bool_)
     # loss_mask[i]=true => predict the (i+1)-th token from the i-th token
-    if has_router_token and not predict_router_token:
+    loss_mask = ~hax.nn.one_hot(-1, Pos, dtype=jax.numpy.bool_)
+    loss_mask &= input_ids != pad_token_id
+    loss_mask &= input_ids != eos_token_id  # don't predict after eos
+    completion_mask = hs_idxs != -1
+
+    if has_router_token and router_token_id is not None and not predict_router_token:
         # don't make the previous token predict the "<|router|>" token
         # loss_mask &= ~hax.nn.one_hot(middle_idxs - 2, Pos, dtype=jax.numpy.bool_)
-        loss_mask &= ~jax.nn.one_hot(middle_idxs - 2, Pos.size, dtype=jax.numpy.bool_)[0]
+        loss_mask &= hax.roll(input_ids != router_token_id, -1, Pos)
     if not predict_fim_token:
         # don't make the previous token predict the <|fim_middle|> token
-        loss_mask &= ~jax.nn.one_hot(middle_idxs - 1, Pos.size, dtype=jax.numpy.bool_)[0]
+        loss_mask &= hax.roll(input_ids != middle_token_id, -1, Pos)
     if not predict_prefix:
-        # 0 out everything before the <|fim_prefix|> or <|router|> token
-        idx = middle_idxs - 3 if has_router_token else middle_idxs - 2
-        loss_mask &= hax.arange(Pos) > idx  # all the tokens before the <|router|> token or the <|fim_middle|> token
-    # the lens-1 token is the eos token, so we don't predict the next after that
-    completion_mask = hax.arange(Pos) < lens - 1
-    completion_mask &= hax.arange(Pos) >= middle_idxs
-    loss_mask &= hax.arange(Pos) < lens - 1
-    if has_router_token:
-        middle_idxs = middle_idxs - 1
+        before_fim = hax.roll(input_ids == middle_token_id, -1, Pos)
+        loss_mask &= completion_mask | before_fim
     return RoutableLmExample.causal_with_hs_idxs(
-        input_ids, router_hs_idxs=middle_idxs, loss_mask=loss_mask, completion_mask=completion_mask
+        input_ids,
+        router_hs_idxs=hs_idxs,
+        loss_mask=loss_mask,
+        completion_mask=completion_mask,
+        eos_id=eos_token_id,
+        ignore_id=pad_token_id,
     )
 
 
@@ -1505,14 +1515,15 @@ def _prepare_fim_examples(
     ex: list[dict],
     tokenizer: PreTrainedTokenizerBase,
     Pos: hax.Axis,
+    middle_token_id: int,
+    eos_token_id: int,
+    pad_token_id: int,
+    router_token_id: Optional[int],
     has_router_token: bool,
     predict_prefix: bool,
     predict_fim_token: bool,
     predict_router_token: bool,
 ) -> list[RoutableLmExample]:
-    middles = np.array([ex["middle_idxs"] for ex in ex])
-    lens = np.array([ex["lens"] for ex in ex])
-
     ex_pad = tokenizer.pad(
         ex,
         padding="max_length",
@@ -1520,26 +1531,38 @@ def _prepare_fim_examples(
     )
 
     input_ids = ex_pad["input_ids"]
-    truncated = [ids[-Pos.size :] for ids in input_ids]
+    assert all(len(ids) == Pos.size for ids in input_ids)
+
+    hs_idx_selector = []
+    for seq_idx in range(input_ids.shape[0]):
+        mids = np.argwhere(input_ids[seq_idx] == middle_token_id).flatten()
+        ends = np.argwhere(input_ids[seq_idx] == eos_token_id).flatten()
+        assert len(mids) == len(ends), f"Mismatched num middle and ends, {(mids, ends)}"
+        hs_idx = -1 * np.ones(len(input_ids[seq_idx]), dtype=np.int32)
+        for m, e in zip(mids, ends):
+            hs_idx[m:e] = m - 1  # we use the hidden state which predicts the fim token
+        hs_idx_selector.append(hs_idx)
+    hs_idx_selector = np.vstack(hs_idx_selector)
 
     out = []
-    for ids, mids, lens in zip(truncated, middles, ex_pad["lens"]):
-        assert len(mids) == 1
-        assert len(lens) == 1
-        causal = _mk_fim_example_jit(
+    for ids, hs in zip(input_ids, hs_idx_selector):
+        causal: RoutableLmExample = _mk_fim_example_jit(
             Pos,
             hax.named(ids, Pos),
-            mids,
-            lens,
+            hax.named(hs, Pos),
+            middle_token_id=middle_token_id,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            router_token_id=router_token_id,
             has_router_token=has_router_token,
             predict_prefix=predict_prefix,
             predict_router_token=predict_router_token,
             predict_fim_token=predict_fim_token,
         )
-        if np.any(causal.router_hs_idxs >= Pos.size):
+        if causal.router_hs_idxs is not None and hax.any(causal.router_hs_idxs >= Pos.size).item():
             raise ValueError(
-                f"Middle token index {causal.router_hs_idxs} out of bounds for {Pos}. You need to regenerate your"
-                " cache after changing seq_len."
+                f"Middle token index {causal.router_hs_idxs.max()} out of bounds for {Pos}. You need to regenerate"
+                " your cache after changing seq_len."
             )
 
         out.append(causal)
@@ -1559,31 +1582,43 @@ def mk_fim_dataset(
 
     output_exemplar = {
         "input_ids": np.zeros((0,), dtype=np.int32),
-        "middle_idxs": np.zeros((0,), dtype=np.int32),
-        "lens": np.zeros((0,), dtype=np.int32),
     }
 
-    middle_token_id = tokenizer.convert_tokens_to_ids(config.middle_token)
+    pad_token = tokenizer.pad_token
+    eos_token = tokenizer.eos_token
+    assert pad_token is not None and eos_token is not None
+    assert pad_token != eos_token
+    pad_token_id, eos_token_id, middle_token_id = tokenizer.convert_tokens_to_ids(
+        [pad_token, eos_token, config.middle_token]
+    )
+
+    router_token_id = None
+    if config.add_router_token:
+        router_token_id = tokenizer.convert_tokens_to_ids(config.router_token)
+
     dataset = source.map_batches(  # type: ignore
-        lambda ex: _preprocess_fim_example(ex, tokenizer, middle_token_id, max_model_len=Pos.size),
-        batch_size=128,
+        lambda ex: _preprocess_fim_example(ex, tokenizer, middle_token_id, max_model_len=Pos.size, pack=config.pack),
+        batch_size=1024,
         num_cpus=num_cpus_used_by_tokenizer(tokenizer),
         output_exemplar=output_exemplar,
     )
 
     if config.add_router_token:
         split += "_with_router"
+    if config.pack:
+        split += "_packed"
     split_cache_dir = os.path.join(config.cache_dir, split)
     cached_dataset: AsyncDataset[dict] = dataset.build_or_load_cache(split_cache_dir, await_finished=True)
-
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
 
     ds = cached_dataset.map_batches(
         lambda ex: _prepare_fim_examples(
             ex,
             tokenizer,
             Pos,
+            middle_token_id=middle_token_id,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            router_token_id=router_token_id,
             has_router_token=config.add_router_token,
             predict_prefix=config.predict_prefix,
             predict_fim_token=config.predict_fim_token,
