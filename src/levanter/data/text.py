@@ -1537,7 +1537,11 @@ def _prepare_fim_examples(
     for seq_idx in range(input_ids.shape[0]):
         mids = np.argwhere(input_ids[seq_idx] == middle_token_id).flatten()
         ends = np.argwhere(input_ids[seq_idx] == eos_token_id).flatten()
-        assert len(mids) == len(ends), f"Mismatched num middle and ends, {(mids, ends)}"
+        if len(ends) == len(mids) - 1:  # we might not be able to fit a single long sequence in
+            ends = np.concat([ends, [Pos.size - 1]])
+        if len(mids) != len(ends):
+            print(f"Mismatched num middle and ends, {(mids, ends)}")
+            continue
         hs_idx = -1 * np.ones(len(input_ids[seq_idx]), dtype=np.int32)
         for m, e in zip(mids, ends):
             hs_idx[m:e] = m - 1  # we use the hidden state which predicts the fim token

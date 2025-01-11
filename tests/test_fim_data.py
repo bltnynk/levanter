@@ -1,4 +1,5 @@
 import json
+import random
 import tempfile
 
 import jax.numpy as jnp
@@ -19,6 +20,7 @@ from levanter.data.text import (
 
 def write_test_data(path, len=128) -> str:
     with open(path, "w") as f:
+        rand = random.Random(0)
         for i in range(len):
             output = {
                 CANONICAL_REPO_NAME_FIELD: f"repo{i}",
@@ -26,9 +28,7 @@ def write_test_data(path, len=128) -> str:
                     {
                         CANONICAL_ID_FIELD: f"file{i}",
                         CANONICAL_FILE_PATH_FIELD: f"file{i}.txt",
-                        CANONICAL_FILE_CONTENT_FIELD: (
-                            f"file{i}_content_a_b_c_d_e_f_g_h_i_j_k_l_m_n_o_p_q_r_s_t_u_v_w_x_y_z"
-                        ),
+                        CANONICAL_FILE_CONTENT_FIELD: ("a" * rand.randint(5, 128)),
                     }
                 ],
             }
