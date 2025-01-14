@@ -156,3 +156,5 @@ local_*.sh
 .aider*
 
 .benchmarks
+
+logs/
