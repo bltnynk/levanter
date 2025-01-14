@@ -28,7 +28,7 @@ model:
   tie_word_embeddings: true
 
   use_flash_attention: true
-  attn_backend: jax_flash
+  attn_backend: splash
   flash_attention_block_size: 512
   use_bias: false
   use_layer_norm_weight: true

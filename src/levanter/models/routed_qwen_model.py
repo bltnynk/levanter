@@ -276,6 +276,7 @@ class RQwenConfig(LlamaConfig):
 
     Experts = property(lambda self: Axis("experts", self.num_experts))
     ExpertRank = property(lambda self: Axis("expert_rank", self.expert_rank))
+    TopK = property(lambda self: Axis("top_k", self.top_k))
 
     def __post_init__(self):
         assert (
@@ -787,14 +788,14 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         activations: bool = False,
     ) -> tuple[NamedArray, NamedArray, Extras]:
         k_head, k_rout = maybe_rng_split(key, 2)
-        Experts, Pos = self.config.Experts, self.config.Pos
+        Experts, Pos, Embed, TopK = self.config.Experts, self.config.Pos, self.config.Embed, self.config.TopK
         compute_dtype = self.embeddings.token_embeddings.weight.dtype
 
         # Softmax, topk
         if Experts.size > 1:
             x = self.activations(input_ids, attn_mask=attn_mask, key=k_head)
             # Get the hidden states for the idxs we select
-            router_inputs = x.take(Pos, router_hs_idxs)
+            router_inputs = fast_gather(Batch, Pos, Embed, x, router_hs_idxs)
             # Get the logits from the router
             if router_stop_grad:
                 router_inputs = jax.lax.stop_gradient(router_inputs)
@@ -805,36 +806,30 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
 
         if self.config.top_k > 1:
             # Softmax after topk if k > 1
-            elems, top_k_indices = hax.top_k(router_logits, Experts, self.config.top_k)
-            elems = hax.nn.softmax(elems, Experts.resize(self.config.top_k))
+            elems, top_k_indices = hax.top_k(router_logits, Experts, TopK.size, TopK)
+            elems = hax.nn.softmax(elems, TopK)
         else:
             elems = hax.nn.softmax(router_logits, Experts)
-            elems, top_k_indices = hax.top_k(elems, Experts, self.config.top_k)
+            elems, top_k_indices = hax.top_k(elems, Experts, TopK.size, TopK)
 
-        # Create a mask
-        expert_mask = hax.zeros((Batch, Pos, Experts), dtype=compute_dtype)
-        # Arrange batch indicies for a .at
-        batch_idx = hax.arange(Batch).broadcast_to(top_k_indices.axes)
-        pos_idx = hax.arange(Pos).broadcast_to(top_k_indices.axes)
-        expert_mask = expert_mask.at[Batch, batch_idx, Pos, pos_idx, Experts, top_k_indices].set(
-            elems.astype(compute_dtype)
-        )
-        expert_mask *= router_hs_idxs != -1
+        expert_mask = create_expert_mask(Batch, Pos, TopK, Experts, top_k_indices, elems.astype(compute_dtype))
+        expert_mask = hax.where(router_hs_idxs < 0, 0.0, expert_mask).astype(compute_dtype)
 
         if self.config.disable_expert_mask:
             expert_mask = None
         elif self.config.ident_expert_mask:
             expert_mask = hax.ones((Batch, Pos, Experts), dtype=compute_dtype)
+
         if activations:
-            res = self.activations(input_ids, attn_mask=attn_mask, expert_mask=expert_mask, key=k_head)
+            res = self.activations(input_ids, attn_mask=attn_mask, key=k_head, expert_mask=expert_mask)
         else:
-            res = self(input_ids, attn_mask=attn_mask, expert_mask=expert_mask, key=k_head)
+            res = self(input_ids, attn_mask=attn_mask, key=k_head, expert_mask=expert_mask)
 
         index_hist = IndexCountHistogram.init(top_k_indices, Experts)
         index_count = IndexCountUnique.init(top_k_indices, Experts)
         return (
             res,
-            router_logits,
+            router_logits.astype(compute_dtype),
             {"router/index_hist": index_hist, "router/used_count": index_count},
         )
 
@@ -868,3 +863,69 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
             self = dataclasses.replace(self, router=router)
             return self
         return fsd(self, state_dict, prefix)
+
+
+def create_expert_mask(
+    Batch: hax.Axis,
+    Pos: hax.Axis,
+    TopK: hax.Axis,
+    Experts: hax.Axis,
+    indices: hax.NamedArray,
+    values: hax.NamedArray,
+):
+    def create_expert_mask_jax(indices, values):
+        """
+        Creates expert mask using one-hot encoding and matrix multiplication.
+
+        Args:
+            indices: Array of shape [batch, seq, top_k]
+            values: Array of shape [batch, seq, top_k]
+            num_experts: Total number of experts
+        """
+        # Create one-hot encoding: [batch, seq, top_k, num_experts]
+        one_hot = jax.nn.one_hot(indices, Experts.size)
+
+        # Multiply with values to place them in correct positions
+        # values: [batch, seq, top_k, 1]
+        # one_hot: [batch, seq, top_k, num_experts]
+        values_expanded = values[..., None]
+
+        # Result: [batch, seq, top_k, num_experts]
+        weighted = one_hot * values_expanded
+
+        # Sum over top_k dimension to get final mask
+        # Result: [batch, seq, num_experts]
+        return jax.numpy.sum(weighted, axis=2)
+
+    inds = indices.rearrange((Batch, Pos, TopK)).array
+    values = values.rearrange((Batch, Pos, TopK)).array
+    jres = create_expert_mask_jax(inds, values)
+    return hax.named(jres, (Batch, Pos, Experts))
+
+
+def fast_gather(
+    Batch: hax.Axis,
+    Pos: hax.Axis,
+    Embed: hax.Axis,
+    hidden_states: hax.NamedArray,
+    indices: hax.NamedArray,
+):
+    def fast_gather_jax(hidden_states, indices):
+        """
+        Args:
+            hidden_states: [batch, seq, embed]
+            indices: [batch, seq] with values in [0, seq-1]
+        Returns:
+            selected: [batch, seq, embed]
+        """
+        # Create one-hot: [batch, seq, seq]
+        one_hot = jax.nn.one_hot(indices, hidden_states.shape[1])
+
+        # Matmul to select the right hidden states
+        # [batch, seq, seq] @ [batch, seq, embed] -> [batch, seq, embed]
+        return jnp.einsum("bst,bte->bse", one_hot, hidden_states)
+
+    x = hidden_states.rearrange((Batch, Pos, Embed)).array
+    inds = indices.rearrange((Batch, Pos)).array
+    jres = fast_gather_jax(x, inds)
+    return hax.named(jres, (Batch, Pos, Embed))
