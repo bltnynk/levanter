@@ -109,7 +109,7 @@ def reinit_expert_weights(config: "RQwenConfig", model: eqx.Module, *, key: jax.
             )
             return LowRankLinear(lora_a, lora_b, x.scale)
         elif isinstance(x, Router):
-            return re_init_linear(x, init_scale=1.0, key=key)
+            return re_init_linear(x, init_scale=config.router_init_scale, key=key)
         elif isinstance(x, RQwenMlpExperts):
             gate_proj = None
             if x.gate_proj is not None:
@@ -273,6 +273,8 @@ class RQwenConfig(LlamaConfig):
     expert_type: ExpertType = ExpertType.LORA
     expert_init: ExpertInit = ExpertInit.LORA_ZERO_B
     expert_init_scale: float = 0.02
+    router_init_scale: float = 0.02
+    divide_by_topk: bool = False
 
     Experts = property(lambda self: Axis("experts", self.num_experts))
     ExpertRank = property(lambda self: Axis("expert_rank", self.expert_rank))
@@ -807,10 +809,13 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         if self.config.top_k > 1:
             # Softmax after topk if k > 1
             elems, top_k_indices = hax.top_k(router_logits, Experts, TopK.size, TopK)
-            elems = hax.nn.softmax(elems, TopK)
+            elems = hax.nn.sigmoid(elems, TopK)
         else:
             elems = hax.nn.softmax(router_logits, Experts)
             elems, top_k_indices = hax.top_k(elems, Experts, TopK.size, TopK)
+
+        if self.config.divide_by_topk:
+            elems /= TopK.size
 
         expert_mask = create_expert_mask(Batch, Pos, TopK, Experts, top_k_indices, elems.astype(compute_dtype))
         expert_mask = hax.where(router_hs_idxs < 0, 0.0, expert_mask).astype(compute_dtype)

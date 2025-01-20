@@ -37,15 +37,13 @@ model:
   ident_expert_mask: false
 
   num_experts: 512
-  expert_rank: 1
-  top_k: 128
+  expert_rank: 4
+  top_k: 64
   scale: 1.0
 
 trainer:
-  tracker:
-    type: wandb
-    project: "levanter-rlora"
-    tags: ["packed_mlpdown"]
+  wandb:
+    project: "levanter-seqmoe"
   mp: p=f32,c=bfloat16
   train_batch_size: 256
   per_device_parallelism: 4

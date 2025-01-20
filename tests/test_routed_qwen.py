@@ -129,7 +129,9 @@ def test_rqwen_consistent_with_base_qwen(expert_type, expert_init):
         ), f"{torch_out} == {jax_out} with lora mask"
 
 
-def init_const_model(expert_type: ExpertType, expert_init: ExpertInit, const_val=5.0):
+def init_const_model(
+    expert_type: ExpertType, expert_init: ExpertInit, const_val=5.0
+) -> tuple[RQwenLMHeadModel, RQwenConfig]:
     config = RQwenConfig(
         seq_len=512,
         num_layers=2,
@@ -165,6 +167,8 @@ def test_rqwen_reinit():
             assert hax.all(weight == 0.0).item(), "Weight not zero-initialized"
         for weight in nonzero_getter(stacked):
             assert not hax.all(weight == 0.0).item(), "Incorrect weight zero-initialized"
+
+        assert not hax.all(model.router.weight == 0.0).item(), "Router weight re-initialized"
 
     case(
         ExpertType.MLP,
