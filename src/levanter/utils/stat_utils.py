@@ -8,7 +8,7 @@ from typing_extensions import Self
 
 import haliax as hax
 
-from levanter.tracker.histogram import Histogram
+from levanter.tracker.histogram import Histogram, sharded_histogram
 from levanter.utils.jax_utils import Zeroable
 
 
@@ -67,20 +67,80 @@ class IndexCountUnique(eqx.Module):
         return IndexCountUnique(self.seen | other.seen)
 
 
+def combine_histograms(hist1: Histogram, hist2: Histogram) -> Histogram:
+    return Histogram(
+        min=jax.lax.min(hist1.min, hist2.min),
+        max=jax.lax.max(hist1.max, hist2.max),
+        num=hist1.num + hist2.num,
+        sum=hist1.sum + hist2.sum,
+        sum_squares=hist1.sum_squares + hist2.sum_squares,
+        # this is a hack so that when microbatching, we don't carry
+        # over 0 bucket limits from the zero init
+        bucket_limits=hist2.bucket_limits,
+        bucket_counts=hist1.bucket_counts + hist2.bucket_counts,
+    )
+
+
+def _logit_buckets():
+    return jnp.concatenate([-jnp.logspace(6, -7, 64), jnp.array([0]), jnp.logspace(-7, 6, 64)])
+
+
+class LogitHistogram(eqx.Module, Zeroable):
+    hist: Histogram
+
+    @staticmethod
+    def init(
+        data: Arrayish,
+    ) -> "LogitHistogram":
+        bins = _logit_buckets()
+        counts, edges = sharded_histogram(data, edges=bins)
+        return LogitHistogram(
+            Histogram(
+                min=data.min().scalar(),
+                max=data.max().scalar(),
+                num=data.size,
+                sum=data.sum().scalar(),
+                sum_squares=(data**2).sum().scalar(),
+                bucket_limits=edges,
+                bucket_counts=counts,
+            )
+        )
+
+    def item(self) -> Histogram:
+        return self.hist
+
+    def __add__(self, other: Self) -> Self:
+        return LogitHistogram(combine_histograms(self.hist, other.hist))
+
+    def zeros_like(self) -> "LogitHistogram":
+        return LogitHistogram(
+            Histogram(
+                min=jnp.zeros(()),
+                max=jnp.zeros(()),
+                num=jnp.zeros_like(self.hist.num),
+                sum=jnp.zeros_like(self.hist.sum),
+                sum_squares=jnp.zeros_like(self.hist.sum_squares),
+                bucket_limits=_logit_buckets(),
+                bucket_counts=jnp.zeros_like(self.hist.bucket_counts),
+            )
+        )
+
+
 class IndexCountHistogram(eqx.Module, Zeroable):
     hist: Histogram
 
     @staticmethod
-    def init(inds: Arrayish, axis: hax.Axis) -> "IndexCountHistogram":
-        counts = hax.zeros(axis, dtype=jnp.int32).at[axis, inds].add(1)
-        Bin = hax.Axis("bin", axis.size + 1)
+    def init(counts: Arrayish) -> "IndexCountHistogram":
+        Bin = hax.Axis("bin", counts.size + 1)
         limits = hax.arange(Bin)
+        sum = counts * hax.arange(counts.axes[0])
+        sum2 = counts * (hax.arange(counts.axes[0]) ** 2)
         hist = Histogram(
             min=limits.min().scalar(),
             max=(limits.max() - 1).scalar(),
-            num=jnp.array(inds.size),
-            sum=inds.sum().scalar(),
-            sum_squares=(inds**2).sum().scalar(),
+            num=jnp.array(counts.size),
+            sum=sum.sum().scalar(),
+            sum_squares=sum2.sum().scalar(),
             bucket_limits=limits.array,
             bucket_counts=counts.array,
         )
@@ -90,18 +150,7 @@ class IndexCountHistogram(eqx.Module, Zeroable):
         return self.hist
 
     def __add__(self, other: Self) -> Self:
-        new_hist = Histogram(
-            min=jax.lax.min(self.hist.min, other.hist.min),
-            max=jax.lax.max(self.hist.max, other.hist.max),
-            num=self.hist.num + other.hist.num,
-            sum=self.hist.sum + other.hist.sum,
-            sum_squares=self.hist.sum_squares + other.hist.sum_squares,
-            # this is a hack so that when microbatching, we don't carry
-            # over 0 bucket limits from the zero init
-            bucket_limits=other.hist.bucket_limits,
-            bucket_counts=self.hist.bucket_counts + other.hist.bucket_counts,
-        )
-        return IndexCountHistogram(new_hist)
+        return IndexCountHistogram(combine_histograms(self.hist, other.hist))
 
     def zeros_like(self) -> "IndexCountHistogram":
         return IndexCountHistogram(

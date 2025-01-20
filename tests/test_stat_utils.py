@@ -12,15 +12,16 @@ def test_topk_selected():
     logits1 = hax.NamedArray(jnp.array([[1, 1, 0, 0], [1, 0, 1, 0]]), axes=(Batch, Ax))
     logits2 = hax.NamedArray(jnp.array([[1, 0, 1, 0], [0, 1, 0, 1]]), axes=(Batch, Ax))
 
-    _, inds1 = hax.top_k(logits1, Ax, 2)
-    _, inds2 = hax.top_k(logits2, Ax, 2)
-    acc1 = IndexCountHistogram.init(inds1, Ax)
+    acc1 = IndexCountHistogram.init(logits1.sum(Batch))
     assert acc1.hist.bucket_counts.tolist() == [2, 1, 1, 0]
     assert acc1.hist.bucket_limits.tolist() == list(range(Ax.size + 1))
-    acc2 = IndexCountHistogram.init(inds2, Ax)
+    acc2 = IndexCountHistogram.init(logits2.sum(Batch))
     assert acc2.hist.bucket_counts.tolist() == [1, 1, 1, 1]
     acc3 = acc1 + acc2
     assert acc3.hist.bucket_counts.tolist() == [3, 2, 2, 1]
+
+    _, inds1 = hax.top_k(logits1, Ax, 2)
+    _, inds2 = hax.top_k(logits2, Ax, 2)
 
     acc1 = IndexCountUnique.init(inds1, Ax)
     assert acc1.item() == 3

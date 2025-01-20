@@ -26,7 +26,7 @@ from levanter.models.rotary import RotaryEmbeddingsConfig
 from levanter.utils.flop_utils import lm_flops_per_token
 from levanter.utils.jax_utils import key_iterator
 from levanter.utils.logging import silence_transformer_nag
-from levanter.utils.stat_utils import IndexCountHistogram, IndexCountUnique
+from levanter.utils.stat_utils import IndexCountHistogram, IndexCountUnique, LogitHistogram
 from levanter.utils.types import Extras
 
 
@@ -809,7 +809,7 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         if self.config.top_k > 1:
             # Softmax after topk if k > 1
             elems, top_k_indices = hax.top_k(router_logits, Experts, TopK.size, TopK)
-            elems = hax.nn.sigmoid(elems, TopK)
+            elems = hax.nn.softmax(elems, TopK)
         else:
             elems = hax.nn.softmax(router_logits, Experts)
             elems, top_k_indices = hax.top_k(elems, Experts, TopK.size, TopK)
@@ -830,12 +830,13 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         else:
             res = self(input_ids, attn_mask=attn_mask, key=k_head, expert_mask=expert_mask)
 
-        index_hist = IndexCountHistogram.init(top_k_indices, Experts)
+        index_hist = IndexCountHistogram.init((expert_mask > 0).sum(axis=(Batch, Pos)))
         index_count = IndexCountUnique.init(top_k_indices, Experts)
+        router_logit_hist = LogitHistogram.init(router_logits)
         return (
             res,
             router_logits.astype(compute_dtype),
-            {"router/index_hist": index_hist, "router/used_count": index_count},
+            {"router/index_hist": index_hist, "router/used_count": index_count, "router/logits": router_logit_hist},
         )
 
     def get_lm_head(self) -> hax.NamedArray:

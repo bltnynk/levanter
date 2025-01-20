@@ -1,4 +1,5 @@
 import functools
+from typing import Optional
 
 import equinox
 import jax
@@ -51,7 +52,9 @@ class Histogram(equinox.Module):
         return np.array(self.bucket_counts), np.array(self.bucket_limits)
 
 
-def sharded_histogram(a: NamedArray, bins: int | ArrayLike = 10) -> tuple[jnp.ndarray, jnp.ndarray]:
+def sharded_histogram(
+    a: NamedArray, bins: int | ArrayLike = 10, edges: Optional[ArrayLike] = None
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     As [jax.numpy.histogram](https://jax.readthedocs.io/en/latest/_autosummary/jax.numpy.histogram.html#jax.numpy.histogram),
     except:
@@ -62,7 +65,8 @@ def sharded_histogram(a: NamedArray, bins: int | ArrayLike = 10) -> tuple[jnp.nd
 
     Credit to @aphoh for the original implementation, though that one crashes on TPUs due to some kind of driver bug
     """
-    edges = jnp.histogram_bin_edges(a.array, bins=bins)
+    if edges is None:
+        edges = jnp.histogram_bin_edges(a.array, bins=bins)
     return _shardmap_histogram(a, edges), edges
 
 
