@@ -1,5 +1,6 @@
 import json
 import os
+import random
 
 import numpy
 import numpy as np
@@ -82,21 +83,29 @@ def construct_small_data_cache(
     return config, caches
 
 
-def write_fim_data(path, len=128) -> str:
+def write_fim_data(path, len=128, flattened=False) -> str:
     with open(path, "w") as f:
+        rand = random.Random(0)
         for i in range(len):
-            output = {
-                CANONICAL_REPO_NAME_FIELD: f"repo{i}",
-                CANONICAL_FILES_FIELD: [
-                    {
-                        CANONICAL_ID_FIELD: f"file{i}",
-                        CANONICAL_FILE_PATH_FIELD: f"file{i}.txt",
-                        CANONICAL_FILE_CONTENT_FIELD: (
-                            f"file{i}_content_a_b_c_d_e_f_g_h_i_j_k_l_m_n_o_p_q_r_s_t_u_v_w_x_y_z"
-                        ),
-                    }
-                ],
-            }
+            if flattened:
+                output = {  # type: ignore
+                    CANONICAL_REPO_NAME_FIELD: f"repo{i}",
+                    CANONICAL_ID_FIELD: f"file{i}",
+                    CANONICAL_FILE_PATH_FIELD: f"file{i}.txt",
+                    CANONICAL_FILE_CONTENT_FIELD: ("a" * rand.randint(5, 128)),
+                }
+            else:
+                output = {  # type: ignore
+                    CANONICAL_REPO_NAME_FIELD: f"repo{i}",
+                    CANONICAL_FILES_FIELD: [  # type: ignore
+                        {
+                            CANONICAL_ID_FIELD: f"file{i}",
+                            CANONICAL_FILE_PATH_FIELD: f"file{i}.txt",
+                            CANONICAL_FILE_CONTENT_FIELD: ("a" * rand.randint(5, 128)),
+                        }
+                    ],
+                }
+
             f.write(json.dumps(output) + "\n")
         f.flush()
     return path

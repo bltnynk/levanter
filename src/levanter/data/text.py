@@ -1627,6 +1627,7 @@ def mk_fim_dataset(
     tokenizer: HfTokenizer,
     Pos: hax.Axis,
     key: Optional[PRNGKeyArray] = None,
+    await_finished: bool = True,
 ) -> AsyncDataset[RoutableLmExample]:
 
     if config.data_format == "flatted":
@@ -1664,7 +1665,7 @@ def mk_fim_dataset(
     if config.pack:
         split += "_packed"
     split_cache_dir = os.path.join(config.cache_dir, split)
-    cached_dataset: AsyncDataset[dict] = dataset.build_or_load_cache(split_cache_dir, await_finished=True)
+    cached_dataset: AsyncDataset[dict] = dataset.build_or_load_cache(split_cache_dir, await_finished=await_finished)
 
     ds = cached_dataset.map_batches(
         lambda ex: _prepare_fim_examples(

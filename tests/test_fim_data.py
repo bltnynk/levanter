@@ -1,49 +1,23 @@
-import json
-import random
 import tempfile
 
 import jax.numpy as jnp
 import pytest
+from jax.random import PRNGKey
 
 import haliax as hax
 
-from levanter.data.text import (
-    CANONICAL_FILE_CONTENT_FIELD,
-    CANONICAL_FILE_PATH_FIELD,
-    CANONICAL_FILES_FIELD,
-    CANONICAL_ID_FIELD,
-    CANONICAL_REPO_NAME_FIELD,
-    FIMUrlSourceConfig,
-    mk_fim_dataset,
-)
-
-
-def write_test_data(path, len=128) -> str:
-    with open(path, "w") as f:
-        rand = random.Random(0)
-        for i in range(len):
-            output = {
-                CANONICAL_REPO_NAME_FIELD: f"repo{i}",
-                CANONICAL_FILES_FIELD: [
-                    {
-                        CANONICAL_ID_FIELD: f"file{i}",
-                        CANONICAL_FILE_PATH_FIELD: f"file{i}.txt",
-                        CANONICAL_FILE_CONTENT_FIELD: ("a" * rand.randint(5, 128)),
-                    }
-                ],
-            }
-            f.write(json.dumps(output) + "\n")
-        f.flush()
-    return path
+from levanter.data.text import FIMUrlSourceConfig, mk_fim_dataset
+from tiny_test_corpus import write_fim_data
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("flattened", [True, False])
 @pytest.mark.parametrize("predict_prefix", [True, False])
 @pytest.mark.parametrize("predict_fim_token", [True, False])
-async def test_fim_url_data(predict_prefix, predict_fim_token):
+async def test_fim_url_data(flattened, predict_prefix, predict_fim_token):
     with tempfile.TemporaryDirectory() as tmpdir:
         max_len = 128
-        test_data_jsonl = "file://" + write_test_data(tmpdir + "/test_data.jsonl")
+        test_data_jsonl = "file://" + write_fim_data(tmpdir + "/test_data.jsonl", flattened=flattened, len=1024)
         cfg = FIMUrlSourceConfig(
             cache_dir=tmpdir + "/cache",
             train_urls=[test_data_jsonl],
@@ -51,15 +25,16 @@ async def test_fim_url_data(predict_prefix, predict_fim_token):
             predict_fim_token=predict_fim_token,
             add_router_token=False,
             predict_router_token=False,
-            shuffle=False,
+            shuffle=True,
             pack=True,
+            data_format="flatted" if flattened else "repo_level",
         )
         tokenizer = cfg.the_tokenizer
         Pos = hax.Axis("Pos", max_len)
-        dataset = mk_fim_dataset(cfg, "train", tokenizer, Pos)
-        await dataset.wait_until_len_at_least(1)
-        elem = await dataset.get_batch([0, 1, 2, 3])
-        elem0 = elem[0]
+        dataset = mk_fim_dataset(cfg, "train", tokenizer, Pos, key=PRNGKey(0))
+        dset_len = await dataset.async_len()
+        last_elem = await dataset.get_batch([dset_len - 1])
+        elem0 = last_elem[0]
 
         fim_token_id, eos_token_id, prefix_token, pad_token_id = tokenizer.convert_tokens_to_ids(
             [cfg.middle_token, cfg.eos_token, cfg.prefix_token, tokenizer.pad_token]

@@ -45,8 +45,10 @@ def test_routed_train(expert_type):
     # just testing if train_lm has a pulse
     model_cfg = small_model_cfg(expert_type=expert_type)
     with tempfile.TemporaryDirectory() as tmpdir:
-        test_data_jsonl = tiny_test_corpus.write_fim_data(tmpdir + "/test_data.jsonl", len=2048)
-        test_validation_jsonl = tiny_test_corpus.write_fim_data(tmpdir + "/test_data_valid.jsonl", len=2048)
+        test_data_jsonl = tiny_test_corpus.write_fim_data(tmpdir + "/test_data.jsonl", len=2048, flattened=True)
+        test_validation_jsonl = tiny_test_corpus.write_fim_data(
+            tmpdir + "/test_data_valid.jsonl", len=2048, flattened=True
+        )
         data_cfg = FIMUrlSourceConfig(
             cache_dir=tmpdir + "/cache",
             train_urls=[test_data_jsonl],
@@ -56,6 +58,8 @@ def test_routed_train(expert_type):
             predict_router_token=False,
             predict_prefix=False,
             pack=True,
+            data_format="flatted",
+            shuffle=True,
         )
         tokenizer = data_cfg.the_tokenizer
         hf_config = model_cfg.to_hf_config(tokenizer.vocab_size)
