@@ -11,21 +11,7 @@ import warnings
 from dataclasses import dataclass
 from functools import cached_property
 from itertools import chain
-from typing import (
-    Any,
-    Dict,
-    Iterator,
-    List,
-    Literal,
-    Mapping,
-    Optional,
-    Protocol,
-    Sequence,
-    Tuple,
-    TypeAlias,
-    TypeVar,
-    Union,
-)
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Protocol, Sequence, Tuple, TypeAlias, TypeVar, Union
 
 import datasets
 import equinox as eqx
@@ -1378,7 +1364,7 @@ class FIMUrlSourceConfig:
     predict_router_token: bool = False
     predict_fim_token: bool = False
 
-    data_format: Literal["flattened", "repo_level"] = "flattened"
+    data_format: str = "flattened"
     repo_level_percentage = 0.0
     repo_name_field: str = CANONICAL_REPO_NAME_FIELD
     files_field: str = CANONICAL_FILES_FIELD
