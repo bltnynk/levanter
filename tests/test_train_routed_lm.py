@@ -58,7 +58,7 @@ def test_routed_train(expert_type):
             predict_router_token=False,
             predict_prefix=False,
             pack=True,
-            data_format="flatted",
+            data_format="flattened",
             shuffle=True,
         )
         tokenizer = data_cfg.the_tokenizer

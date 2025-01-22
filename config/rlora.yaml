@@ -3,10 +3,10 @@ full_ft: false
 embedding_router_token_ft: false
 data:
   train_urls:
-    - gs://usc-stack-v2/shard1_150_flat.jsonl.gz
+    - gs://usc-stack-v2/20250122-flattened-shuffled/shard-{00..58}.jsonl.gz
   validation_urls:
-    - gs://usc-stack-v2/shard1_215_220_flat.jsonl.gz
-  cache_dir: "gs://usc2-datacache/shard1"
+    - gs://usc-stack-v2/20250122-flattened-shuffled/shard-{59..60}.jsonl.gz
+  cache_dir: "gs://usc2-datacache/20250122-flattened-shuffled"
   tokenizer: "Qwen/Qwen2.5-Coder-1.5B"
   shuffle: true
   predict_prefix: false
@@ -14,6 +14,7 @@ data:
   predict_fim_token: false
   add_router_token: false
   pack: true
+  data_format: "flattened"
 model:
   seq_len: 8192
   hidden_dim: 1536

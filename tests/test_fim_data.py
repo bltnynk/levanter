@@ -27,7 +27,7 @@ async def test_fim_url_data(flattened, predict_prefix, predict_fim_token):
             predict_router_token=False,
             shuffle=True,
             pack=True,
-            data_format="flatted" if flattened else "repo_level",
+            data_format="flattened" if flattened else "repo_level",
         )
         tokenizer = cfg.the_tokenizer
         Pos = hax.Axis("Pos", max_len)

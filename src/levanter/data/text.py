@@ -1378,7 +1378,7 @@ class FIMUrlSourceConfig:
     predict_router_token: bool = False
     predict_fim_token: bool = False
 
-    data_format: Literal["flatted", "repo_level"] = "flatted"
+    data_format: Literal["flattened", "repo_level"] = "flattened"
     repo_level_percentage = 0.0
     repo_name_field: str = CANONICAL_REPO_NAME_FIELD
     files_field: str = CANONICAL_FILES_FIELD
@@ -1404,9 +1404,9 @@ class FIMUrlSourceConfig:
     def __post_init__(self):
         if not self.add_router_token:
             assert not self.predict_router_token, "Can't predict router token if it's not in the data"
-        assert self.data_format in ["flatted", "repo_level"]
+        assert self.data_format in ["flattened", "repo_level"]
 
-    def get_flatted_source(self, split: str) -> Optional[ShardedDataSource[str]]:
+    def get_flattened_source(self, split: str) -> Optional[ShardedDataSource[str]]:
         urls = self.train_urls if split == "train" else self.validation_urls
         if not urls:
             return None
@@ -1630,8 +1630,8 @@ def mk_fim_dataset(
     await_finished: bool = True,
 ) -> AsyncDataset[RoutableLmExample]:
 
-    if config.data_format == "flatted":
-        source = config.get_flatted_source(split)
+    if config.data_format == "flattened":
+        source = config.get_flattened_source(split)
     elif config.data_format == "repo_level":
         source = config.get_repo_level_source(split)
     else:
