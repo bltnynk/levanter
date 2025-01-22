@@ -274,7 +274,7 @@ class RQwenConfig(LlamaConfig):
     expert_init: ExpertInit = ExpertInit.LORA_ZERO_B
     expert_init_scale: float = 0.02
     router_init_scale: float = 0.02
-    divide_by_topk: bool = False
+    mult_by_topk: bool = False
 
     Experts = property(lambda self: Axis("experts", self.num_experts))
     ExpertRank = property(lambda self: Axis("expert_rank", self.expert_rank))
@@ -814,8 +814,8 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
             elems = hax.nn.softmax(router_logits, Experts)
             elems, top_k_indices = hax.top_k(elems, Experts, TopK.size, TopK)
 
-        if self.config.divide_by_topk:
-            elems /= TopK.size
+        if self.config.mult_by_topk:
+            elems *= TopK.size
 
         expert_mask = create_expert_mask(Batch, Pos, TopK, Experts, top_k_indices, elems.astype(compute_dtype))
         expert_mask = hax.where(router_hs_idxs < 0, 0.0, expert_mask).astype(compute_dtype)

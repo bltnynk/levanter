@@ -3,7 +3,7 @@ from jax.random import PRNGKey
 
 import haliax as hax
 
-from levanter.utils.stat_utils import IndexCountHistogram, IndexCountUnique, MeanScalar
+from levanter.utils.stat_utils import IndexCountHistogram, IndexCountUnique, MeanScalar, RunningMean
 
 
 def test_topk_selected():
@@ -38,11 +38,16 @@ def test_mean_scalar():
     Ax = hax.Axis("X", 4)
 
     arr = hax.random.normal(PRNGKey(0), (AccumStep, MicroBatch, Ax))
+    where = hax.random.bernoulli(PRNGKey(1), (AccumStep, MicroBatch, Ax), 0.5)
 
     acc = MeanScalar.zero()
+    rmacc = RunningMean.zeros_like(jnp.array(0))
 
     for i in range(AccumStep.size):
-        mean_scalar = MeanScalar.init(arr[AccumStep, i], where=None)
+        wi = where[AccumStep, i]
+        mean_scalar = MeanScalar.init(arr[AccumStep, i], where=wi)
         acc += mean_scalar
+        rmacc += RunningMean(arr[AccumStep, i].mean(where=wi), wi.sum())
 
-    assert jnp.allclose(acc.item(), arr.mean().item())
+    assert jnp.allclose(acc.item(), arr.mean(where=where).item())
+    assert jnp.allclose(rmacc.item(), arr.mean(where=where).item())

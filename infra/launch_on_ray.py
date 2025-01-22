@@ -45,6 +45,10 @@ def main():
     args = parser.parse_args()
 
     command = args.command
+    cmd_file = None
+    if len(command) == 1 and command[0].endswith(".txt"):
+        cmd_file = command[0]
+        command = None
     docker_repository = args.docker_repository
     image_id = args.image_name
     project = args.project
@@ -68,9 +72,15 @@ def main():
     if zone is None:
         raise ValueError("Zone must be specified or set in gcloud config.")
 
+    if cmd_file is not None and args.foreground:
+        raise ValueError("Cannot specify --cmd_file and --foreground together.")
+
+    if cmd_file is None and not command:
+        raise ValueError("Must specify a command to run.")
+
     region = "-".join(zone.split("-")[:-1])
 
-    if command[0] == "--":
+    if command and command[0] == "--":
         command = command[1:]
 
     # make an image tag based on the unix timestamp to ensure we always pull the latest image
@@ -113,41 +123,54 @@ def main():
 
     # Submit the job to the Ray cluster. We have to use the JobSubmissionClient to do this and stringify the arguments
     # we want:
-    from levanter.infra.ray_tpu import RunDockerOnPodConfig
+    commands = []
+    if cmd_file is not None:
+        with open(cmd_file, "r") as f:
+            for line in f:
+                if line.strip()[0] == "#":
+                    continue
+                commands.append(line.strip().split())
+    else:
+        commands = [command]
+    del command
 
-    config = RunDockerOnPodConfig(
-        image_id=full_image_id,
-        command=command,
-        tpu_type=tpu_type,
-        env=env,
-        name="levanter",
-        retries=retries,
-        node_count=args.node_count,
-    )
+    for cmd in commands:
+        print("Launching command:", " ".join(cmd))
+        from levanter.infra.ray_tpu import RunDockerOnPodConfig
 
-    address = args.address or os.getenv("RAY_ADDRESS")
+        config = RunDockerOnPodConfig(
+            image_id=full_image_id,
+            command=cmd,
+            tpu_type=tpu_type,
+            env=env,
+            name="levanter",
+            retries=retries,
+            node_count=args.node_count,
+        )
 
-    job_id = ray_tpu.submit_tpu_job_on_ray(
-        config,
-        ray_address=address,
-        run_id=run_id,
-    )
+        address = args.address or os.getenv("RAY_ADDRESS")
 
-    print(
-        f"""
--------------------------------------------------------
-Job '{job_id}' submitted successfully
--------------------------------------------------------
+        job_id = ray_tpu.submit_tpu_job_on_ray(
+            config,
+            ray_address=address,
+            run_id=run_id,
+        )
 
-Next steps
-  Query the logs of the job:
-    ray job logs {job_id}
-  Query the status of the job:
-    ray job status {job_id}
-  Request the job to be stopped:
-    ray job stop {job_id}
-"""
-    )
+        print(
+            f"""
+    -------------------------------------------------------
+    Job '{job_id}' submitted successfully
+    -------------------------------------------------------
+
+    Next steps
+    Query the logs of the job:
+        ray job logs {job_id}
+    Query the status of the job:
+        ray job status {job_id}
+    Request the job to be stopped:
+        ray job stop {job_id}
+    """
+        )
 
     if args.foreground:
         client = JobSubmissionClient(address)
