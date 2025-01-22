@@ -11,7 +11,21 @@ import warnings
 from dataclasses import dataclass
 from functools import cached_property
 from itertools import chain
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Protocol, Sequence, Tuple, TypeAlias, TypeVar, Union
+from typing import (
+    Any,
+    Dict,
+    Iterator,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    TypeAlias,
+    TypeVar,
+    Union,
+)
 
 import datasets
 import equinox as eqx
@@ -1364,6 +1378,7 @@ class FIMUrlSourceConfig:
     predict_router_token: bool = False
     predict_fim_token: bool = False
 
+    data_format: Literal["flatted", "repo_level"] = "flatted"
     repo_level_percentage = 0.0
     repo_name_field: str = CANONICAL_REPO_NAME_FIELD
     files_field: str = CANONICAL_FILES_FIELD
@@ -1389,8 +1404,40 @@ class FIMUrlSourceConfig:
     def __post_init__(self):
         if not self.add_router_token:
             assert not self.predict_router_token, "Can't predict router token if it's not in the data"
+        assert self.data_format in ["flatted", "repo_level"]
 
-    def get_shard_source(self, split: str) -> Optional[ShardedDataSource[str]]:
+    def get_flatted_source(self, split: str) -> Optional[ShardedDataSource[str]]:
+        urls = self.train_urls if split == "train" else self.validation_urls
+        if not urls:
+            return None
+
+        urls = [globbed for url in urls for globbed in expand_glob(url)]
+        source = UrlDataSource(
+            urls, columns=[self.repo_name_field, self.id_field, self.file_content_field, self.file_path_field]
+        )
+
+        def make_entry(x) -> str:
+            hash_input = x[self.id_field]
+            rand = random.Random(hash(hash_input))
+            content = x[self.file_content_field]
+            i0 = rand.randint(0, len(content) - 1)
+            i1 = rand.randint(0, len(content) - 1)
+            while i1 == i0:
+                i1 = rand.randint(0, len(content) - 1)
+            i0, i1 = min(i0, i1), max(i0, i1) + 1
+            prefix = content[:i0]
+            middle = content[i0:i1]
+            suffix = content[i1:]
+            to_join = []
+            to_join.extend([self.prefix_token, prefix, self.suffix_token, suffix])
+            if self.add_router_token:
+                to_join.extend([self.router_token])
+            to_join.extend([self.middle_token, middle, self.eos_token])
+            return "".join(to_join)
+
+        return source.map(make_entry)
+
+    def get_repo_level_source(self, split: str) -> Optional[ShardedDataSource[str]]:
         urls = self.train_urls if split == "train" else self.validation_urls
         if not urls:
             return None
@@ -1582,7 +1629,12 @@ def mk_fim_dataset(
     key: Optional[PRNGKeyArray] = None,
 ) -> AsyncDataset[RoutableLmExample]:
 
-    source = config.get_shard_source(split)
+    if config.data_format == "flatted":
+        source = config.get_flatted_source(split)
+    elif config.data_format == "repo_level":
+        source = config.get_repo_level_source(split)
+    else:
+        raise ValueError(f"Unknown data format {config.data_format}")
 
     output_exemplar = {
         "input_ids": np.zeros((0,), dtype=np.int32),
