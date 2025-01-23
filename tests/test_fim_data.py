@@ -60,3 +60,15 @@ async def test_fim_url_data(flattened, predict_prefix, predict_fim_token):
             assert not lm[e].all().item(), "should never predict after eos"
             # hs idxs testing
             assert (elem0.router_hs_idxs.array[m:e] == m - 1).all().item()
+
+
+def test_replace_illegal_chars():
+    cfg = FIMUrlSourceConfig()
+
+    illegal_str = f"some {cfg.middle_token} illegal {cfg.eos_token} chars"
+    cleaned_str = cfg.replace_illegal_chars(illegal_str)
+    assert cfg.middle_token not in cleaned_str
+    assert cfg.eos_token not in cleaned_str
+    assert "some" in cleaned_str
+    assert "illegal" in cleaned_str
+    assert "chars" in cleaned_str

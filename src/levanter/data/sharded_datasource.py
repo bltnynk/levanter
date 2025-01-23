@@ -85,6 +85,7 @@ class ShardedDataSource(Generic[T_co]):
         *,
         await_finished: bool = True,
         monitors: Optional[Sequence["MetricsMonitor"]] = None,
+        options=None,  # type: ignore
     ) -> AsyncDataset[T]:
         """
         Constructs a shard cache version of this dataset using Ray.
@@ -102,7 +103,7 @@ class ShardedDataSource(Generic[T_co]):
         """
 
         source, processor = _construct_composite_batch_processor(self)
-        from ..store.cache import build_or_load_cache
+        from ..store.cache import CacheOptions, build_or_load_cache
 
         cache = build_or_load_cache(
             path,
@@ -110,6 +111,7 @@ class ShardedDataSource(Generic[T_co]):
             processor,
             await_finished=await_finished,
             monitors=monitors,
+            options=options if options is not None else CacheOptions.default(),
         )
         return cache
 

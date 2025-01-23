@@ -11,6 +11,7 @@ from levanter.distributed import RayConfig
 from levanter.models.rotary import DefaultRotaryEmbeddingsConfig
 from levanter.models.routed_qwen_model import ExpertInit, ExpertType
 from levanter.optim.config import AdamConfig
+from levanter.store.cache import CacheOptions
 from levanter.tracker.wandb import WandbConfig
 from test_utils import skip_if_no_torch
 
@@ -45,17 +46,21 @@ def test_routed_train(expert_type):
     # just testing if train_lm has a pulse
     model_cfg = small_model_cfg(expert_type=expert_type)
     with tempfile.TemporaryDirectory() as tmpdir:
-        test_data_jsonl = tiny_test_corpus.write_fim_data(tmpdir + "/test_data.jsonl", len=2048, flattened=True)
+        train_urls = [
+            tiny_test_corpus.write_fim_data(tmpdir + f"/test_data_{i}.jsonl", len=512, flattened=True)
+            for i in range(5)
+        ]
         test_validation_jsonl = tiny_test_corpus.write_fim_data(
-            tmpdir + "/test_data_valid.jsonl", len=2048, flattened=True
+            tmpdir + "/test_data_valid.jsonl", len=512, flattened=True
         )
         data_cfg = FIMUrlSourceConfig(
             cache_dir=tmpdir + "/cache",
-            train_urls=[test_data_jsonl],
+            train_urls=train_urls,
             validation_urls=[test_validation_jsonl],
             add_router_token=True,
             predict_fim_token=False,
             predict_router_token=False,
+            cache_options=CacheOptions(target_size_per_flush=1, final_copy_cpus=1, final_copy_memory=64 * 1024 * 1024),
             predict_prefix=False,
             pack=True,
             data_format="flattened",

@@ -74,6 +74,9 @@ class CacheOptions:
 
     batch_size: int = 128
 
+    final_copy_cpus: int = 4
+    final_copy_memory: int = 6 * 1024 * 1024 * 1024
+
     @property
     def target_bytes_per_flush(self):
         if isinstance(self.target_size_per_flush, int):
@@ -959,6 +962,8 @@ def _core_writer_task(
             group_cache_paths,
             processor,
             processor_ref,
+            num_cpus=options.final_copy_cpus,
+            memory=options.final_copy_memory,
         )
 
         ledger.is_finished = True
@@ -1029,6 +1034,8 @@ def _copy_temp_caches_to_final_cache(
     group_cache_paths,
     processor,
     processor_ref,
+    num_cpus: int = 4,
+    memory: int = 6 * 1024 * 1024 * 1024,
 ):
     """
     Copy the temporary caches to the output cache, in order. (essentially concatenating them)
@@ -1120,7 +1127,7 @@ def _copy_temp_caches_to_final_cache(
         # we need to copy this group
         found_one_to_copy = True
 
-        copy_refs[group] = _copy_cache_data.remote(
+        copy_refs[group] = _copy_cache_data.options(memory=memory, num_cpus=num_cpus).remote(
             cache_dir,
             group_cache_paths[group],
             processor_ref,

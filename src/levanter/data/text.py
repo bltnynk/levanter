@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import random
+import tempfile
 import warnings
 from dataclasses import dataclass
 from functools import cached_property
@@ -28,9 +29,11 @@ from tokenizers import normalizers
 import haliax as hax
 from haliax import Axis
 
+import levanter
 from levanter.data import AsyncDataset
 from levanter.data.dataset import MappedAsyncDataset
 from levanter.data.mixture import MixtureDataset, StopStrategy
+from levanter.data.utils import FastReplacer
 from levanter.models.attention import AttentionMask
 from levanter.models.lm_model import LmExample, RoutableLmExample
 from levanter.store.cache import CacheOptions, TreeCache
@@ -1357,6 +1360,7 @@ class FIMUrlSourceConfig:
     tokenizer: str = "Qwen/Qwen2.5-Coder-1.5B"
     train_urls: list[str] = dataclasses.field(default_factory=list)
     validation_urls: list[str] = dataclasses.field(default_factory=list)
+    cache_options: CacheOptions = field(default_factory=CacheOptions)
     shuffle: bool | int = True
     pack: bool = False
     add_router_token: bool = True
@@ -1405,7 +1409,7 @@ class FIMUrlSourceConfig:
         def make_entry(x) -> str:
             hash_input = x[self.id_field]
             rand = random.Random(hash(hash_input))
-            content = x[self.file_content_field]
+            content = self.replace_illegal_chars(x[self.file_content_field])
             i0 = rand.randint(0, len(content) - 1)
             i1 = rand.randint(0, len(content) - 1)
             while i1 == i0:
@@ -1439,13 +1443,13 @@ class FIMUrlSourceConfig:
             rand = random.Random(hash(hash_input))
             is_repo_level = len(files) > 1 and (rand.random() < self.repo_level_percentage)
             file = files[rand.choice(range(len(files)))]
-            file_len = len(file[self.file_content_field])
+            content = self.replace_illegal_chars(file[self.file_content_field])
+            file_len = len(content)
             i0 = rand.randint(0, file_len - 1)
             i1 = rand.randint(0, file_len - 1)
             while i1 == i0:
                 i1 = rand.randint(0, file_len - 1)
             i0, i1 = min(i0, i1), max(i0, i1) + 1
-            content = file[self.file_content_field]
             prefix = content[:i0]
             middle = content[i0:i1]
             suffix = content[i1:]
@@ -1453,7 +1457,14 @@ class FIMUrlSourceConfig:
             if is_repo_level:
                 to_join = [self.repo_name_token, x[self.repo_name_field], "\n"]
                 for f in files:
-                    to_join.extend([self.file_sep_token, f[self.file_path_field], "\n", f[self.file_content_field]])
+                    to_join.extend(
+                        [
+                            self.file_sep_token,
+                            f[self.file_path_field],
+                            "\n",
+                            self.replace_illegal_chars(f[self.file_content_field]),
+                        ]
+                    )
 
             to_join.extend([self.prefix_token, prefix, self.suffix_token, suffix])
             if self.add_router_token:
@@ -1474,6 +1485,27 @@ class FIMUrlSourceConfig:
             pad_token = "<|padding|>"
             tokenizer.add_special_tokens({"pad_token": pad_token})
         return tokenizer
+
+    @cached_property
+    def _replacer(self) -> FastReplacer:
+        return FastReplacer(
+            {
+                k: k[:2] + "cleaned_" + k[2:]
+                for k in [
+                    self.prefix_token,
+                    self.middle_token,
+                    self.suffix_token,
+                    self.repo_name_token,
+                    self.file_sep_token,
+                    self.eos_token,
+                    self.router_token,
+                    "<|padding|>",
+                ]
+            }
+        )
+
+    def replace_illegal_chars(self, text: str) -> str:
+        return self._replacer.replace(text)
 
 
 def _preprocess_fim_example(
@@ -1573,8 +1605,14 @@ def _prepare_fim_examples(
         if len(ends) == len(mids) - 1:  # we might not be able to fit a single long sequence in
             ends = np.concat([ends, [Pos.size - 1]])
         if len(mids) != len(ends):
-            print(f"Mismatched num middle and ends, {(mids, ends)}")
-            continue
+            # We've hit some broken sequence, abort
+            with tempfile.TemporaryDirectory() as tmpdir:
+                out_path = os.path.join(tmpdir, "invalid_sequence.txt")
+                with open(os.path.join(tmpdir, "invalid_sequence.txt"), "w") as f:
+                    f.write(tokenizer.decode(input_ids[seq_idx]))
+                levanter.tracker.current_tracker().log_artifact(out_path, name="invalid sequence")
+                raise ValueError(f"Mismatched num middle and ends, {(mids, ends)}")
+
         hs_idx = -1 * np.ones(len(input_ids[seq_idx]), dtype=np.int32)
         for m, e in zip(mids, ends):
             hs_idx[m:e] = m - 1  # we use the hidden state which predicts the fim token
@@ -1651,7 +1689,9 @@ def mk_fim_dataset(
     if config.pack:
         split += "_packed"
     split_cache_dir = os.path.join(config.cache_dir, split)
-    cached_dataset: AsyncDataset[dict] = dataset.build_or_load_cache(split_cache_dir, await_finished=await_finished)
+    cached_dataset: AsyncDataset[dict] = dataset.build_or_load_cache(
+        split_cache_dir, await_finished=await_finished, options=config.cache_options
+    )
 
     ds = cached_dataset.map_batches(
         lambda ex: _prepare_fim_examples(
