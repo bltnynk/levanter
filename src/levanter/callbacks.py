@@ -17,7 +17,6 @@ from jaxtyping import PyTree
 from tqdm_loggable import tqdm_logging
 from tqdm_loggable.auto import tqdm
 
-import haliax as hax
 import haliax.nn
 from haliax import NamedArray, is_named_array
 from haliax.jax_utils import is_jax_array_like
@@ -31,7 +30,7 @@ from levanter.trainer_state import TrainerState
 from levanter.utils import flop_utils, jax_utils
 from levanter.utils.jax_utils import barrier_sync, jnp_to_python
 from levanter.utils.logging import save_xla_dumps_to_wandb
-from levanter.utils.stat_utils import RunningMean
+from levanter.utils.stat_utils import MeanScalar
 from levanter.utils.types import Extras
 from levanter.visualization import compute_and_visualize_log_probs as viz_probs
 
@@ -148,7 +147,7 @@ def get_total_dataset_tokens(ds: AsyncDataset, seq_length: int):
 
 
 def eval_loss_loop(loss_fn, model, dataset, max_batches: Optional[int] = None, name: Optional[str] = None):
-    loss = RunningMean(jnp.zeros(()), jnp.zeros(()))
+    loss = MeanScalar.zero()
     extras: Extras = {}
 
     if name is not None:
@@ -167,8 +166,7 @@ def eval_loss_loop(loss_fn, model, dataset, max_batches: Optional[int] = None, n
         if batch is None:
             break
         losses, where, extras = loss_fn(model, batch)
-        mean_loss = hax.mean(losses, where=where)
-        loss += RunningMean(mean_loss, where.sum())
+        loss += MeanScalar.init(losses, where=where)
         for k, v in extras.items():
             if k not in extras:
                 extras[k] = v
