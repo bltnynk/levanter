@@ -503,7 +503,7 @@ class Trainer:
             max_buffered_batches=128,
             mesh=self.device_mesh,
             axis_resources=self.compute_axis_mapping,
-            prefetch_size=128,
+            prefetch_size=16,
         )
 
     @cached_property

@@ -8,7 +8,7 @@ data:
     - gs://usc-stack-v2/20250122-flattened-shuffled/shard-{59..60}.jsonl.gz
   cache_dir: "gs://usc2-datacache/20250122-flattened-shuffled"
   tokenizer: "Qwen/Qwen2.5-Coder-1.5B"
-  shuffle: true
+  shuffle: false
   predict_prefix: false
   predict_router_token: false
   predict_fim_token: false

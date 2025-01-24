@@ -3,10 +3,14 @@ import tempfile
 import jax.numpy as jnp
 import pytest
 from jax.random import PRNGKey
+from tqdm import tqdm
 
 import haliax as hax
 
+from levanter.data.loader import DataLoader
 from levanter.data.text import FIMUrlSourceConfig, mk_fim_dataset
+from levanter.store.cache import CacheOptions
+from levanter.trainer import TrainerConfig
 from tiny_test_corpus import write_fim_data
 
 
@@ -60,6 +64,40 @@ async def test_fim_url_data(flattened, predict_prefix, predict_fim_token):
             assert not lm[e].all().item(), "should never predict after eos"
             # hs idxs testing
             assert (elem0.router_hs_idxs.array[m:e] == m - 1).all().item()
+
+
+def test_large_prefetch():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        max_len = 32
+        test_data_jsonl = [
+            "file://" + write_fim_data(tmpdir + f"/test_data_{i}.jsonl", flattened=True, len=1024) for i in range(8)
+        ]
+        cfg = FIMUrlSourceConfig(
+            cache_dir=tmpdir + "/cache",
+            train_urls=test_data_jsonl,
+            predict_prefix=True,
+            predict_fim_token=True,
+            add_router_token=False,
+            predict_router_token=False,
+            shuffle=True,
+            pack=True,
+            data_format="flattened",
+            cache_options=CacheOptions(final_copy_cpus=1, final_copy_memory=6 * 1024 * 1024),
+        )
+        tokenizer = cfg.the_tokenizer
+        Pos = hax.Axis("Pos", max_len)
+        dataset = mk_fim_dataset(cfg, "train", tokenizer, Pos, key=PRNGKey(0))
+        tc = TrainerConfig()
+        loader = DataLoader(
+            tc.TrainBatch,
+            dataset,
+            max_buffered_batches=128,
+            mesh=tc.device_mesh,
+            axis_resources=tc.compute_axis_mapping,
+            prefetch_size=1024,
+        )
+        for _ in tqdm(loader):
+            print("Loaded batch")
 
 
 def test_replace_illegal_chars():
