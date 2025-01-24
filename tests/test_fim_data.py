@@ -2,6 +2,7 @@ import tempfile
 
 import jax.numpy as jnp
 import pytest
+import ray
 from jax.random import PRNGKey
 from tqdm import tqdm
 
@@ -67,6 +68,7 @@ async def test_fim_url_data(flattened, predict_prefix, predict_fim_token):
 
 
 def test_large_prefetch():
+    ray.init(runtime_env={"env_vars": {"RAY_DEBUG": "legacy"}})
     with tempfile.TemporaryDirectory() as tmpdir:
         max_len = 32
         test_data_jsonl = [

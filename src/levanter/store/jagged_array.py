@@ -494,6 +494,8 @@ class JaggedArrayStore:
             data_start = 0
             offsets[0] = 0
 
+        if data_stop < data_start:
+            raise ValueError(f"Invalid offsets ({data_start}, {data_start}) at index {start}:{stop}")
         return data_start, data_stop, offsets
 
 
