@@ -46,7 +46,7 @@ def maybe_fused_next_token_loss(
         NamedArray: Computed loss.
     """
     # Resolve axes
-    Pos = pred_embeddings.resolve_axis(Pos)
+    Pos = pred_embeddings.resolve_axis(Pos.name)
     Vocab = pred_lm_head.resolve_axis(Vocab)
     not_last_loss_mask = 1 - hax.nn.one_hot(-1, Pos, dtype=jnp.float32)  # type: ignore
     if loss_mask is not None:

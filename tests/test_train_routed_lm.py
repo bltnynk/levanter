@@ -109,7 +109,7 @@ def test_routed_train(expert_type):
                 optimizer=get_opt_cfg(),
                 router_z_loss_weight=0.001,
                 full_ft=False,
-                embedding_router_token_ft=True,
+                embedding_router_token_ft=False,
             )
             routed_lm.main(config)
         finally:

@@ -38,6 +38,7 @@ from levanter.config import JsonAtom
 from levanter.data import AsyncDataset, DataLoader
 from levanter.distributed import DistributedConfig, RayConfig
 from levanter.grad_accum import microbatched
+from levanter.optim.model_averaging import ModelAveragingConfig
 from levanter.tracker import TrackerConfig, capture_time
 from levanter.trainer_state import TrainerState, saveable_training_mask
 from levanter.utils import cloud_utils, fsspec_utils
@@ -338,6 +339,7 @@ class Trainer:
                 mesh=self.device_mesh,
                 subpath="model",
                 do_load=True,
+                allow_partial=self.config.allow_partial_checkpoint,
             )()
             model_init = jax.tree_util.Partial(lambda m: m, loaded_model)
 
@@ -351,6 +353,7 @@ class Trainer:
                 is_trainable=is_trainable,
                 mp=self.mp,
                 fp8=self.fp8,
+                model_averaging=self.config.model_averaging,
             )
             return state
 
@@ -364,6 +367,7 @@ class Trainer:
             mesh=self.device_mesh,
             is_checkpointed=saveable_train_state,
             do_load=load_checkpoint,
+            allow_partial=self.config.allow_partial_checkpoint,
         )(model_init, training_key)
 
         return state
@@ -473,7 +477,6 @@ class Trainer:
 
             @eqx.filter_jit
             def eval_loss(model, *batch, **batch_kwargs):
-                model = inference_mode(model, True)
                 model = self.mp.cast_to_compute(model)
                 return self.loss_fn(model, *batch, **batch_kwargs, key=None)
 
@@ -582,6 +585,7 @@ class TrainerConfig:
     seed: int = 0  # random seed
     mp: jmp.Policy = jmp.get_policy("f32")  # mixed precision policy
     fp8: Optional[bool | Fp8Config] = None
+    model_averaging: ModelAveragingConfig | None = None
 
     wandb: Optional[tracker.wandb.WandbConfig] = None
     log_dir: Path = Path("logs/")
@@ -634,6 +638,9 @@ class TrainerConfig:
     load_checkpoint_path: Optional[str] = None
     """can be a parent (to find latest) or a specific checkpoint. if None, will set to checkpointer.base_path."""
     initialize_from: Optional[str] = None  # Levanter trainer checkpoint to initialize from
+    allow_partial_checkpoint: bool = False
+    """If True, we allow loading a checkpoint that doesn't have all the parameters in the model.
+        Missing parameters are initialized from the model_init function."""
 
     jax_config: Mapping[str, JsonAtom] = field(
         default_factory=lambda: copy.deepcopy(DEFAULT_JAX_CONFIG)

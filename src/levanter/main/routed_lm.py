@@ -175,7 +175,7 @@ def main(config: TrainLmConfig):
         # This allows Zero-3-style parameter sharding, where we shard the parameters and optimizer state across the mesh
         parameter_axis_mapping = trainer.parameter_axis_mapping
 
-        train_dataset = mk_fim_dataset(config.data, "train", tokenizer, Pos, key=data_key)
+        train_dataset = mk_fim_dataset(config.data, "train", tokenizer, Pos, key=data_key, await_finished=False)
 
         # add epoch logging if epochs specified
         if config.epoch > 0:
@@ -257,7 +257,9 @@ def main(config: TrainLmConfig):
             max_eval_examples_per_ds *= config.trainer.eval_batch_size
 
         if len(config.data.validation_urls) > 0:
-            eval_dataset = mk_fim_dataset(config.data, "validation", tokenizer, Pos, key=data_key)
+            eval_dataset = mk_fim_dataset(
+                config.data, "validation", tokenizer, Pos, key=data_key, await_finished=False
+            )
             trainer.add_eval_hook(eval_dataset)
 
         flops_per_token = config.model.flops_per_token(vocab_size)
