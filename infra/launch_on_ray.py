@@ -4,6 +4,7 @@
 import argparse
 import getpass
 import os
+import shlex
 import time
 from pathlib import Path
 
@@ -123,23 +124,27 @@ def main():
         env["WANDB_PROJECT"] = "levanter"
 
     env["GIT_COMMIT"] = cli.get_git_commit()
-    env["RUN_ID"] = run_id
     env["WANDB_DOCKER"] = full_image_id
+    if "RUN_ID" in env:
+        del env["RUN_ID"]
 
     # Submit the job to the Ray cluster. We have to use the JobSubmissionClient to do this and stringify the arguments
     # we want:
     commands = []
+    run_ids = []
     if cmd_file is not None:
         with open(cmd_file, "r") as f:
             for line in f:
-                if line.strip()[0] == "#":
-                    continue
-                commands.append(line.strip().split())
+                cmd = shlex.split(line, comments=True)
+                if len(cmd) > 0:
+                    commands.append(cmd)
+                    run_ids.append(cli.default_run_id())
     else:
         commands = [command]
-    del command
+        run_ids = [run_id]
+    del command, run_id
 
-    for cmd in commands:
+    for cmd, run_id in zip(commands, run_ids):
         print("Launching command:", " ".join(cmd))
         from levanter.infra.ray_tpu import RunDockerOnPodConfig
 
@@ -147,7 +152,7 @@ def main():
             image_id=full_image_id,
             command=cmd,
             tpu_type=tpu_type,
-            env=env,
+            env=env | {"RUN_ID": run_id},
             name="levanter",
             retries=retries,
             node_count=args.node_count,
