@@ -18,6 +18,10 @@ class CliConfig:
     project: str | None = None
     zone: str | None = None
     tpu: str | None = None
+    tpu_name: str | None = None
+    tpu_type: str | None = None
+    preemptible: bool | None = None
+    autodelete: bool | None = None
     repository: str | None = None
     image: str | None = None
     tag: str | None = None
@@ -27,6 +31,7 @@ class CliConfig:
     extra_context: str | None = None
     docker_target: str | None = None
     docker_repository: str | None = None
+    docker_registry: str | None = None
     subnetwork: str | None = None
 
     env: dict[str, str] = dataclasses.field(default_factory=dict)

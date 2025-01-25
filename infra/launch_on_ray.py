@@ -45,7 +45,7 @@ def main():
 
     command = args.command
     cmd_file = None
-    if len(command) == 1 and command[0].endswith(".txt"):
+    if len(command) == 1 and command[0].endswith(".cmd"):
         cmd_file = command[0]
         command = None
     docker_repository = args.docker_repository
@@ -115,7 +115,9 @@ def main():
     else:
         raise ValueError(f"Unknown docker registry: {registry}")
 
-    env = {k: v for k, v in args.env}
+    env = config.env_for_accel(tpu_type)
+    for key, value in args.env or []:
+        env[key] = value
 
     if "WANDB_PROJECT" not in env:
         env["WANDB_PROJECT"] = "levanter"

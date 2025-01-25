@@ -792,6 +792,7 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         k_head, k_rout = maybe_rng_split(key, 2)
         Experts, Pos, Embed, TopK = self.config.Experts, self.config.Pos, self.config.Embed, self.config.TopK
         compute_dtype = self.embeddings.token_embeddings.weight.dtype
+        extras: Extras = {}
 
         # Softmax, topk
         if Experts.size > 1:
@@ -830,14 +831,11 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         else:
             res = self(input_ids, attn_mask=attn_mask, key=k_head, expert_mask=expert_mask)
 
-        index_hist = IndexCountHistogram.init((expert_mask > 0).sum(axis=(Batch, Pos)))
-        index_count = IndexCountUnique.init(top_k_indices, Experts)
-        router_logit_hist = LogitHistogram.init(router_logits)
-        return (
-            res,
-            router_logits.astype(compute_dtype),
-            {"router/index_hist": index_hist, "router/used_count": index_count, "router/logits": router_logit_hist},
-        )
+        if expert_mask is not None:
+            extras["router/index_hist"] = IndexCountHistogram.init((expert_mask > 0).sum(axis=(Batch, Pos)))
+        extras["router/used_count"] = IndexCountUnique.init(top_k_indices, Experts)
+        extras["router/logits"] = LogitHistogram.init(router_logits)
+        return (res, router_logits.astype(compute_dtype), extras)
 
     def get_lm_head(self) -> hax.NamedArray:
         if self.lm_head is None:

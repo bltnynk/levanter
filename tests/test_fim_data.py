@@ -66,6 +66,7 @@ async def test_fim_url_data(flattened, predict_prefix, predict_fim_token):
             assert (elem0.router_hs_idxs.array[m:e] == m - 1).all().item()
 
 
+@pytest.mark.slow
 def test_large_prefetch():
     with tempfile.TemporaryDirectory() as tmpdir:
         max_len = 32

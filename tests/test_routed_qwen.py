@@ -1,12 +1,15 @@
 import dataclasses
 import tempfile
+from contextlib import ExitStack
 
 import equinox as eqx
 import jax
 import numpy as np
 import pytest
+from jax.sharding import Mesh
 
 import haliax as hax
+from haliax.partitioning import ResourceAxis
 
 from levanter.models.attention import AttentionMask
 from levanter.models.routed_qwen_model import (
@@ -30,21 +33,30 @@ def test_routed_qwen_state_dict_keys():
     print(model.to_state_dict().keys())
 
 
+def get_mesh(Batch: hax.Axis):
+    stack = ExitStack()
+    mesh = Mesh((jax.devices()), (ResourceAxis.DATA,))
+    stack.enter_context(mesh)
+    stack.enter_context(hax.axis_mapping({Batch.name: ResourceAxis.DATA}))
+    return stack
+
+
 def test_routed_qwen_forward():
-    config = RQwenConfig(seq_len=512, num_layers=2, hidden_dim=256, intermediate_dim=512, tie_word_embeddings=True)
-    Vocab = hax.Axis("vocab", 1000)
-    key = jax.random.PRNGKey(0)
-    model = RQwenLMHeadModel.init(Vocab, config, key=key)
-
     Batch = hax.Axis("batch", 32)
-    x = hax.random.randint(key, (Batch, config.Pos), 0, Vocab.size)
-    inds = hax.random.randint(key, (Batch, config.Pos), 0, config.Pos.size - 1)
-    _ = model.routed_forward(Batch, x, inds)
+    with get_mesh(Batch):
+        config = RQwenConfig(seq_len=512, num_layers=2, hidden_dim=256, intermediate_dim=512, tie_word_embeddings=True)
+        Vocab = hax.Axis("vocab", 1000)
+        key = jax.random.PRNGKey(0)
+        model = RQwenLMHeadModel.init(Vocab, config, key=key)
 
-    # test with num_experts=1
-    config = dataclasses.replace(config, num_experts=1, top_k=1)
-    model = RQwenLMHeadModel.init(Vocab, config, key=key)
-    _ = model.routed_forward(Batch, x, inds)
+        x = hax.random.randint(key, (Batch, config.Pos), 0, Vocab.size)
+        inds = hax.random.randint(key, (Batch, config.Pos), 0, config.Pos.size - 1)
+        _ = model.routed_forward(Batch, x, inds)
+
+        # test with num_experts=1
+        config = dataclasses.replace(config, num_experts=1, top_k=1)
+        model = RQwenLMHeadModel.init(Vocab, config, key=key)
+        _ = model.routed_forward(Batch, x, inds)
 
 
 @skip_if_no_torch
@@ -93,40 +105,43 @@ def test_rqwen_consistent_with_base_qwen(expert_type, expert_init):
     torch_out = torch_model(input_torch)
     torch_out = torch_out.logits.detach().cpu().numpy()
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        torch_model.save_pretrained(f"{tmpdir}/torch_model")
+    with get_mesh(Batch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            torch_model.save_pretrained(f"{tmpdir}/torch_model")
 
-        model = converter.load_pretrained(
-            Qwen2ForCausalLM, ref=f"{tmpdir}/torch_model", config=config, resize_vocab_to_match_tokenizer=False
-        )
+            model = converter.load_pretrained(
+                Qwen2ForCausalLM, ref=f"{tmpdir}/torch_model", config=config, resize_vocab_to_match_tokenizer=False
+            )
 
-        @hax.named_jit
-        def compute(model: RQwenLMHeadModel, input):
-            model_output = model.routed_forward(Batch, input, router_hs_idxs=seq_inds, attn_mask=attn_mask)
-            return model_output
+            @hax.named_jit
+            def compute(model: RQwenLMHeadModel, input):
+                model_output = model.routed_forward(Batch, input, router_hs_idxs=seq_inds, attn_mask=attn_mask)
+                return model_output
 
-        token_pred, mask, extras = compute(model, input)
-        jax_out = token_pred.array
+            token_pred, mask, extras = compute(model, input)
+            jax_out = token_pred.array
 
-        assert torch_out.shape == jax_out.shape, f"{torch_out.shape} != {jax_out.shape}"
-        assert np.isclose(torch_out, np.array(jax_out), rtol=1e-4, atol=1e-4).all(), f"{torch_out} != {jax_out}"
+            assert torch_out.shape == jax_out.shape, f"{torch_out.shape} != {jax_out.shape}"
+            assert np.isclose(torch_out, np.array(jax_out), rtol=1e-4, atol=1e-4).all(), f"{torch_out} != {jax_out}"
 
-        cfg_with_expert = dataclasses.replace(config, disable_expert_mask=False)
-        model = dataclasses.replace(model, transformer=dataclasses.replace(model.transformer, config=cfg_with_expert))
+            cfg_with_expert = dataclasses.replace(config, disable_expert_mask=False)
+            model = dataclasses.replace(
+                model, transformer=dataclasses.replace(model.transformer, config=cfg_with_expert)
+            )
 
-        @hax.named_jit
-        def compute(model: RQwenLMHeadModel, input):
-            model_output = model.routed_forward(Batch, input, router_hs_idxs=seq_inds, attn_mask=attn_mask)
-            return model_output
+            @hax.named_jit
+            def compute(model: RQwenLMHeadModel, input):
+                model_output = model.routed_forward(Batch, input, router_hs_idxs=seq_inds, attn_mask=attn_mask)
+                return model_output
 
-        token_pred, mask, extras = compute(model, input)
-        jax_out = token_pred.array
+            token_pred, mask, extras = compute(model, input)
+            jax_out = token_pred.array
 
-        assert torch_out.shape == jax_out.shape, f"{torch_out.shape} != {jax_out.shape}"
-        should_be_close = expert_init != ExpertInit.NONZERO
-        assert (
-            should_be_close == np.isclose(torch_out, np.array(jax_out), rtol=1e-4, atol=1e-4).all()
-        ), f"{torch_out} == {jax_out} with lora mask"
+            assert torch_out.shape == jax_out.shape, f"{torch_out.shape} != {jax_out.shape}"
+            should_be_close = expert_init != ExpertInit.NONZERO
+            assert (
+                should_be_close == np.isclose(torch_out, np.array(jax_out), rtol=1e-4, atol=1e-4).all()
+            ), f"{torch_out} == {jax_out} with lora mask"
 
 
 def init_const_model(
