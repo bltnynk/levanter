@@ -275,10 +275,17 @@ class RQwenConfig(LlamaConfig):
     expert_init_scale: float = 0.02
     router_init_scale: float = 0.02
     mult_by_topk: bool = False
+    prefill_expert: bool = False
 
-    Experts = property(lambda self: Axis("experts", self.num_experts))
     ExpertRank = property(lambda self: Axis("expert_rank", self.expert_rank))
     TopK = property(lambda self: Axis("top_k", self.top_k))
+
+    @property
+    def Experts(self) -> Axis:
+        num_experts = self.num_experts
+        if self.prefill_expert:
+            num_experts += self.top_k  # Add prefill experts
+        return Axis("experts", num_experts)
 
     def __post_init__(self):
         assert (
@@ -304,6 +311,11 @@ class RQwenConfig(LlamaConfig):
                 ExpertInit.MLP_ZERO_GATE,
                 ExpertInit.NONZERO,
             ], self.expert_init
+
+        if self.prefill_expert:
+            assert (not self.ident_expert_mask) and (
+                not self.disable_expert_mask
+            ), "Can only use prefill experts when using the expert mask"
 
     def hf_checkpoint_converter(self) -> HFCheckpointConverter["RQwenConfig"]:  # type: ignore
         return HFCheckpointConverter(
@@ -807,6 +819,10 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         else:
             router_logits = hax.zeros((Batch, Pos, Experts), dtype=jnp.float32)
 
+        if self.config.prefill_expert:
+            # The first top_k logical experts are just the prefill expert
+            router_logits = router_logits.at[Experts, : TopK.size].set(-1e9)
+
         if self.config.top_k > 1:
             # Softmax after topk if k > 1
             elems, top_k_indices = hax.top_k(router_logits, Experts, TopK.size, TopK)
@@ -819,7 +835,12 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
             elems *= TopK.size
 
         expert_mask = create_expert_mask(Batch, Pos, TopK, Experts, top_k_indices, elems.astype(compute_dtype))
-        expert_mask = hax.where(router_hs_idxs < 0, 0.0, expert_mask).astype(compute_dtype)
+        if self.config.prefill_expert:
+            # For prefill tokens, enable only the prefill expert
+            only_exp0 = hax.zeros_like(expert_mask).at[Experts, : TopK.size].set(1.0)
+            expert_mask = hax.where(router_hs_idxs < 0, only_exp0, expert_mask).astype(compute_dtype)
+        else:
+            expert_mask = hax.where(router_hs_idxs < 0, 0.0, expert_mask).astype(compute_dtype)
 
         if self.config.disable_expert_mask:
             expert_mask = None

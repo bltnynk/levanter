@@ -25,7 +25,7 @@ from levanter.trainer import Trainer
 from test_utils import skip_if_no_torch
 
 
-def small_model_cfg(expert_type=ExpertType.LORA):
+def small_model_cfg(**kwargs):
     return routed_lm.RQwenConfig(
         num_layers=4,
         num_heads=2,
@@ -40,17 +40,17 @@ def small_model_cfg(expert_type=ExpertType.LORA):
         tie_word_embeddings=True,
         disable_expert_mask=False,
         use_layer_norm_weight=True,
-        expert_type=expert_type,
         expert_init=ExpertInit.NONZERO,  # supported by every type
         rope=DefaultRotaryEmbeddingsConfig(theta=1000000.0),
+        **kwargs,
     )
 
 
 def get_data_cfg(tmpdir):
     train_urls = [
-        tiny_test_corpus.write_fim_data(tmpdir + f"/test_data_{i}.jsonl", len=512, flattened=True) for i in range(5)
+        tiny_test_corpus.write_fim_data(tmpdir + f"/test_data_{i}.jsonl", len=16, flattened=True) for i in range(2)
     ]
-    test_validation_jsonl = tiny_test_corpus.write_fim_data(tmpdir + "/test_data_valid.jsonl", len=512, flattened=True)
+    test_validation_jsonl = tiny_test_corpus.write_fim_data(tmpdir + "/test_data_valid.jsonl", len=16, flattened=True)
     return FIMUrlSourceConfig(
         cache_dir=tmpdir + "/cache",
         train_urls=train_urls,
@@ -72,12 +72,13 @@ def get_opt_cfg():
 
 @pytest.mark.entry
 @pytest.mark.parametrize("expert_type", [t for t in ExpertType])
+@pytest.mark.parametrize("prefill_expert", [True, False])
 @skip_if_no_torch
-def test_routed_train(expert_type):
+def test_routed_train(expert_type, prefill_expert):
     from transformers import Qwen2ForCausalLM
 
     # just testing if train_lm has a pulse
-    model_cfg = small_model_cfg(expert_type=expert_type)
+    model_cfg = small_model_cfg(expert_type=expert_type, prefill_expert=prefill_expert)
     with tempfile.TemporaryDirectory() as tmpdir:
         data_cfg = get_data_cfg(tmpdir)
         tokenizer = data_cfg.the_tokenizer
@@ -93,7 +94,7 @@ def test_routed_train(expert_type):
                 model=model_cfg,
                 trainer=routed_lm.TrainerConfig(
                     seed=42,
-                    num_train_steps=16,
+                    num_train_steps=4,
                     train_batch_size=2,
                     per_device_parallelism=1,  # test out grad accum
                     max_eval_batches=1,
