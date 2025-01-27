@@ -158,7 +158,7 @@ def main(config: TrainLmConfig):
         compute_next_token_loss,
         logsumexp_weight=config.z_loss_weight,
         router_zloss_weight=config.router_z_loss_weight,
-        stop_grad=not (config.full_ft or config.embedding_router_token_ft),
+        stop_grad=not (config.full_ft or config.embedding_router_token_ft or config.model.prefill_expert),
     )
 
     # Using the trainer as a context manager does 3 things:

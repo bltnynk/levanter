@@ -277,6 +277,8 @@ class RQwenConfig(LlamaConfig):
     mult_by_topk: bool = False
     prefill_expert: bool = False
 
+    router_activation: str = "softmax"
+
     ExpertRank = property(lambda self: Axis("expert_rank", self.expert_rank))
     TopK = property(lambda self: Axis("top_k", self.top_k))
 
@@ -316,6 +318,8 @@ class RQwenConfig(LlamaConfig):
             assert (not self.ident_expert_mask) and (
                 not self.disable_expert_mask
             ), "Can only use prefill experts when using the expert mask"
+
+        assert self.router_activation in ["softmax", "sigmoid"], f"Invalid router activation: {self.router_activation}"
 
     def hf_checkpoint_converter(self) -> HFCheckpointConverter["RQwenConfig"]:  # type: ignore
         return HFCheckpointConverter(
@@ -544,14 +548,14 @@ class RQwenMlpExperts(eqx.Module):
         return RQwenMlpExperts(gate_proj, up_proj, down_proj, act)
 
     @named_call
-    def __call__(self, x: NamedArray, expert_mask: Optional[NamedArray], *, key=None) -> NamedArray:
+    def __call__(self, x: NamedArray, expert_mask: NamedArray, *, key=None) -> NamedArray:
         k_gate, k_up, k_down = maybe_rng_split(key, 3)
+        assert expert_mask is not None
         hidden_states = x
         hidden_states = self.act(self.up_proj(hidden_states, key=k_up))
         if self.gate_proj is not None:
             hidden_states *= self.gate_proj(hidden_states, key=k_gate)
-        if expert_mask is not None:
-            hidden_states *= expert_mask
+        hidden_states *= expert_mask
         outputs = self.down_proj(hidden_states, key=k_down)
         return outputs
 
@@ -606,7 +610,7 @@ class RQwenMlp(ModuleWithStateDictSerialization):
         hidden_states = self.act(hidden_states)
         hidden_states = hidden_states * self.up_proj(x, expert_mask, key=k_up)
         outputs = self.down_proj(hidden_states, expert_mask, key=k_down)
-        if self.experts is not None:
+        if self.experts is not None and expert_mask is not None:
             outputs += self.experts(x, expert_mask, key=key)
         return outputs
 
@@ -790,25 +794,35 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
 
         return x
 
-    def routed_forward(
+    def router_activation(self, x: NamedArray, axis: hax.Axis) -> NamedArray:
+        if self.config.router_activation == "softmax":
+            return hax.nn.softmax(x, axis)
+        elif self.config.router_activation == "sigmoid":
+            return hax.nn.sigmoid(x)
+        else:
+            raise ValueError(f"Invalid router activation: {self.config.router_activation}")
+
+    def router_logits(
         self,
         Batch: hax.Axis,
         input_ids: NamedArray,
         router_hs_idxs: NamedArray,
-        attn_mask: Optional[NamedArray] = None,
+        attn_mask: Optional[NamedArray],
         *,
-        key=None,
+        k_head=None,
         router_stop_grad: bool = True,
-        activations: bool = False,
-    ) -> tuple[NamedArray, NamedArray, Extras]:
-        k_head, k_rout = maybe_rng_split(key, 2)
+        k_rout=None,
+    ) -> NamedArray:
         Experts, Pos, Embed, TopK = self.config.Experts, self.config.Pos, self.config.Embed, self.config.TopK
         compute_dtype = self.embeddings.token_embeddings.weight.dtype
-        extras: Extras = {}
-
         # Softmax, topk
         if Experts.size > 1:
-            x = self.activations(input_ids, attn_mask=attn_mask, key=k_head)
+            prefill_exp_mask = None
+            if self.config.prefill_expert:
+                assert not router_stop_grad, "Prefill expert requires router_stop_grad=False"
+                prefill_exp_mask = hax.zeros((Batch, Pos, Experts), dtype=compute_dtype)
+                prefill_exp_mask = prefill_exp_mask.at[Experts, : TopK.size].set(1.0)
+            x = self.activations(input_ids, attn_mask=attn_mask, expert_mask=prefill_exp_mask, key=k_head)
             # Get the hidden states for the idxs we select
             router_inputs = fast_gather(Batch, Pos, Embed, x, router_hs_idxs)
             # Get the logits from the router
@@ -822,13 +836,41 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         if self.config.prefill_expert:
             # The first top_k logical experts are just the prefill expert
             router_logits = router_logits.at[Experts, : TopK.size].set(-1e9)
+        return router_logits
+
+    def routed_forward(
+        self,
+        Batch: hax.Axis,
+        input_ids: NamedArray,
+        router_hs_idxs: NamedArray,
+        attn_mask: Optional[NamedArray] = None,
+        *,
+        key=None,
+        router_stop_grad: bool = True,
+        activations: bool = False,
+    ) -> tuple[NamedArray, NamedArray, Extras]:
+        k_head, k_rout = maybe_rng_split(key, 2)
+        Experts, Pos, TopK = self.config.Experts, self.config.Pos, self.config.TopK
+        compute_dtype = self.embeddings.token_embeddings.weight.dtype
+        extras: Extras = {}
+
+        # Softmax, topk
+        router_logits = self.router_logits(
+            Batch,
+            input_ids,
+            router_hs_idxs,
+            attn_mask,
+            k_head=k_head,
+            router_stop_grad=router_stop_grad,
+            k_rout=k_rout,
+        )
 
         if self.config.top_k > 1:
             # Softmax after topk if k > 1
             elems, top_k_indices = hax.top_k(router_logits, Experts, TopK.size, TopK)
-            elems = hax.nn.softmax(elems, TopK)
+            elems = self.router_activation(elems, TopK)
         else:
-            elems = hax.nn.softmax(router_logits, Experts)
+            elems = self.router_activation(router_logits, Experts)
             elems, top_k_indices = hax.top_k(elems, Experts, TopK.size, TopK)
 
         if self.config.mult_by_topk:

@@ -21,7 +21,7 @@ from tiny_test_corpus import write_fim_data
 async def test_fim_url_data(flattened, predict_prefix, predict_fim_token):
     with tempfile.TemporaryDirectory() as tmpdir:
         max_len = 128
-        test_data_jsonl = "file://" + write_fim_data(tmpdir + "/test_data.jsonl", flattened=flattened, len=1024)
+        test_data_jsonl = "file://" + write_fim_data(tmpdir + "/test_data.jsonl", flattened=flattened, len=4)
         cfg = FIMUrlSourceConfig(
             cache_dir=tmpdir + "/cache",
             train_urls=[test_data_jsonl],
@@ -35,7 +35,7 @@ async def test_fim_url_data(flattened, predict_prefix, predict_fim_token):
         )
         tokenizer = cfg.the_tokenizer
         Pos = hax.Axis("Pos", max_len)
-        dataset = mk_fim_dataset(cfg, "train", tokenizer, Pos, key=PRNGKey(0))
+        dataset = mk_fim_dataset(cfg, "train", tokenizer, Pos, key=PRNGKey(0), await_finished=False)
         dset_len = await dataset.async_len()
         last_elem = await dataset.get_batch([dset_len - 1])
         elem0 = last_elem[0]

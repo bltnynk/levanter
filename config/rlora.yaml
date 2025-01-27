@@ -37,6 +37,8 @@ model:
   disable_expert_mask: false
   ident_expert_mask: false
 
+  prefill_expert: false
+
   num_experts: 512
   expert_rank: 4
   top_k: 64
