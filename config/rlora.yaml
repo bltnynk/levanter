@@ -52,7 +52,7 @@ trainer:
   per_device_parallelism: 4
   num_train_steps: 200
   steps_per_eval: 10
-  max_eval_batches: 32
+  max_eval_samples: 512
   per_device_eval_parallelism: 4
   tensor_parallel_axes: ["mlp", "heads"]
   fsdp_axis: "embed"

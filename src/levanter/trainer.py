@@ -473,7 +473,7 @@ class Trainer:
 
         eval_loader = self.data_loader(eval_dataset, self.EvalBatch)
 
-        if eval_loader and (self.config.max_eval_batches is None or self.config.max_eval_batches > 0):
+        if eval_loader and (self.config.max_eval_samples is None or self.config.max_eval_samples > 0):
 
             @eqx.filter_jit
             def eval_loss(model, *batch, **batch_kwargs):
@@ -484,7 +484,7 @@ class Trainer:
                 callbacks.compute_validation_loss(
                     eval_loss,
                     eval_loader,
-                    max_batches=self.config.max_eval_batches,
+                    max_batches=self.config.max_eval_samples // self.EvalBatch.size,
                     name=name,
                 ),
                 every=self.config.steps_per_eval,
@@ -631,6 +631,9 @@ class TrainerConfig:
     num_train_steps: int = 400_000  # number of training steps
     steps_per_eval: int = 1_000  # how often to evaluate
     max_eval_batches: Optional[int] = None  # max number of batches to evaluate on. None means all batches
+    """Deprecated: use max_eval_samples instead"""
+    max_eval_samples: Optional[int] = None
+    """max number of samples to evaluate on. None means all samples"""
 
     checkpointer: CheckpointerConfig = field(default_factory=CheckpointerConfig)
     load_checkpoint: Optional[bool] = None
@@ -847,6 +850,22 @@ class TrainerConfig:
         if self.replica_dcn_axis_size == -1:
             self.replica_dcn_axis_size = self.num_slices
             logger.info(f"Setting replica_dcn_axis_size to {self.replica_dcn_axis_size}")
+
+        if self.max_eval_batches is not None:
+            warnings.warn(
+                "max_eval_batches is deprecated. use max_eval_samples instead",
+                DeprecationWarning,
+            )
+            assert self.max_eval_samples is None, (
+                f"max_eval_batches={self.max_eval_batches} and max_eval_samples={self.max_eval_samples} are mutually"
+                " exclusive"
+            )
+            self.max_eval_samples = self.max_eval_batches * self.eval_batch_size
+        if self.max_eval_samples % self.eval_batch_size != 0:
+            raise ValueError(
+                f"max_eval_samples=({self.max_eval_samples}) must be evenly divisible by"
+                f" eval_batch_size={self.eval_batch_size}"
+            )
 
 
 class AllConfig(Protocol):

@@ -154,11 +154,12 @@ def main(config: TrainLmConfig):
     Batch = config.trainer.TrainBatch
     Pos = config.model.Pos
 
+    stop_grad = not (config.full_ft or config.embedding_router_token_ft or config.model.prefill_expert)
     loss_function = functools.partial(
         compute_next_token_loss,
         logsumexp_weight=config.z_loss_weight,
         router_zloss_weight=config.router_z_loss_weight,
-        stop_grad=not (config.full_ft or config.embedding_router_token_ft or config.model.prefill_expert),
+        stop_grad=stop_grad,
     )
 
     # Using the trainer as a context manager does 3 things:
@@ -252,10 +253,6 @@ def main(config: TrainLmConfig):
         print(f"Trainable params: {trainable_params}, Total params: {param_count}")
         levanter.tracker.log_summary({"parameter_count": param_count, "trainable_params": trainable_params})
 
-        max_eval_examples_per_ds = config.trainer.max_eval_batches
-        if max_eval_examples_per_ds is not None:
-            max_eval_examples_per_ds *= config.trainer.eval_batch_size
-
         if len(config.data.validation_urls) > 0:
             eval_dataset = mk_fim_dataset(
                 config.data, "validation", tokenizer, Pos, key=data_key, await_finished=False
@@ -264,7 +261,10 @@ def main(config: TrainLmConfig):
 
         flops_per_token = config.model.flops_per_token(vocab_size)
         # Doing 3x the flops: 1 to get the router set, 1 w/the experts, 1 for the backprop (+ the experts but that's small)
-        flops_per_example = 3 * flops_per_token * Pos.size if flops_per_token is not None else None
+        # add one more for the double backprop if we're not stopping the grad
+        flops_per_example = (
+            (3 if stop_grad else 4) * flops_per_token * Pos.size if flops_per_token is not None else None
+        )
         trainer.add_hook(
             callbacks.log_performance_stats(Pos.size, trainer.config.train_batch_size, flops_per_example), every=1
         )

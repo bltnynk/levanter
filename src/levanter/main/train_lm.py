@@ -196,10 +196,6 @@ def main(config: TrainLmConfig):
 
         levanter.tracker.log_summary({"parameter_count": parameter_count(state.model)})
 
-        max_eval_examples_per_ds = config.trainer.max_eval_batches
-        if max_eval_examples_per_ds is not None:
-            max_eval_examples_per_ds *= config.trainer.eval_batch_size
-
         if len(tagged_eval_datasets) == 0:
             logger.warning("No evaluation datasets provided.")
         else:
@@ -218,7 +214,7 @@ def main(config: TrainLmConfig):
                 tokenizer,
                 trainer.device_mesh,
                 compute_axis_mapping,
-                max_eval_examples_per_ds,
+                config.trainer.max_eval_samples,
                 mp=config.trainer.mp,
             )
             trainer.add_hook(cb, every=config.trainer.steps_per_eval)
@@ -235,7 +231,7 @@ def main(config: TrainLmConfig):
                 tokenizer,
                 trainer.device_mesh,
                 compute_axis_mapping,
-                max_eval_examples_per_ds,
+                config.trainer.max_eval_samples,
                 prefix="internal_eval",
                 mp=config.trainer.mp,
             )
