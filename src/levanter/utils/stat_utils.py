@@ -32,7 +32,7 @@ class MeanScalar(eqx.Module):
     @staticmethod
     def init(array: hax.NamedArray, where: Optional[hax.NamedArray] = None) -> "MeanScalar":
         total = where.sum() if where is not None else hax.named(array.size, ())
-        mean = hax.mean(array, where=where).scalar()
+        mean = hax.mean(array, where=where).scalar().astype(jnp.float32)
         return MeanScalar(total.scalar().astype(jnp.float32), mean)
 
     def item(self) -> float:
@@ -49,7 +49,7 @@ class MeanScalar(eqx.Module):
 
     @staticmethod
     def zero() -> "MeanScalar":
-        return MeanScalar(jnp.zeros(()), jnp.zeros(()))
+        return MeanScalar(jnp.zeros((), dtype=jnp.float32), jnp.zeros((), dtype=jnp.float32))
 
 
 class IndexCountUnique(eqx.Module):
@@ -82,7 +82,7 @@ def combine_histograms(hist1: Histogram, hist2: Histogram) -> Histogram:
 
 
 def _logit_buckets():
-    return jnp.concatenate([-jnp.logspace(6, -7, 64), jnp.array([0]), jnp.logspace(-7, 6, 64)])
+    return jnp.concatenate([-jnp.logspace(3, -7, 64), jnp.array([0]), jnp.logspace(-7, 3, 64)])
 
 
 class LogitHistogram(eqx.Module, Zeroable):

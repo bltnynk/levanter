@@ -110,12 +110,10 @@ def compute_next_token_loss(
     if router_zloss_weight > 0.0:
         z_loss = hax.nn.logsumexp(rlogits, model.config.Experts)
         z_loss = hax.square(z_loss)  # [batch,]
-        tokens_per_seq = mask.sum(axis=model.Pos)  # [batch,]
-        # This reweights the z_loss to be better balanced based on the number of tokens in the sequence
-        per_token = router_zloss_weight * z_loss / tokens_per_seq
-        per_token = per_token.broadcast_to(losses.axes)
-        extras["router/z_loss"] = MeanScalar.init(per_token, where=mask)
-        losses += per_token
+        if model.config.Layers in z_loss.axes:
+            z_loss = hax.mean(z_loss, model.config.Layers)
+        extras["router/z_loss"] = MeanScalar.init(z_loss, where=mask)
+        losses += z_loss
 
     return losses, mask, extras
 

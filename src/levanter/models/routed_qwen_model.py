@@ -276,6 +276,7 @@ class RQwenConfig(LlamaConfig):
     router_init_scale: float = 0.02
     mult_by_topk: bool = False
     prefill_expert: bool = False
+    route_each_layer: bool = False
 
     router_activation: str = "softmax"
 
@@ -288,6 +289,13 @@ class RQwenConfig(LlamaConfig):
         if self.prefill_expert:
             num_experts += self.top_k  # Add prefill experts
         return Axis("experts", num_experts)
+
+    @property
+    def RouterOut(self) -> tuple[hax.Axis, ...]:
+        return (self.Layers, self.Experts) if self.route_each_layer else (self.Experts,)
+
+    def mask_axes(self, Batch: hax.Axis) -> tuple[hax.Axis, ...]:
+        return (Batch, self.Pos) + self.RouterOut
 
     def __post_init__(self):
         assert (
@@ -729,7 +737,7 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         else:
             lm_head = hnn.Linear.init(In=config.Embed, Out=Vocab, key=k_emb, use_bias=False, out_first=True)
 
-        router = Router.init(In=config.Embed, Out=config.Experts, key=k_rout, use_bias=False, out_first=True)
+        router = Router.init(In=config.Embed, Out=config.RouterOut, key=k_rout, use_bias=False, out_first=True)
 
         return RQwenLMHeadModel(transformer, embeddings, lm_head, router)
 
@@ -820,7 +828,7 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
             prefill_exp_mask = None
             if self.config.prefill_expert:
                 assert not router_stop_grad, "Prefill expert requires router_stop_grad=False"
-                prefill_exp_mask = hax.zeros((Batch, Pos, Experts), dtype=compute_dtype)
+                prefill_exp_mask = hax.zeros(self.config.mask_axes(Batch), dtype=compute_dtype)
                 prefill_exp_mask = prefill_exp_mask.at[Experts, : TopK.size].set(1.0)
             x = self.activations(input_ids, attn_mask=attn_mask, expert_mask=prefill_exp_mask, key=k_head)
             # Get the hidden states for the idxs we select
@@ -831,7 +839,7 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
             router_logits = self.router(router_inputs, key=k_rout)
             router_logits = router_logits.astype(jnp.float32)
         else:
-            router_logits = hax.zeros((Batch, Pos, Experts), dtype=jnp.float32)
+            router_logits = hax.zeros(self.config.mask_axes(Batch), dtype=jnp.float32)
 
         if self.config.prefill_expert:
             # The first top_k logical experts are just the prefill expert
@@ -876,7 +884,7 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         if self.config.mult_by_topk:
             elems *= TopK.size
 
-        expert_mask = create_expert_mask(Batch, Pos, TopK, Experts, top_k_indices, elems.astype(compute_dtype))
+        expert_mask = create_expert_mask(TopK, Experts, top_k_indices, elems.astype(compute_dtype))
         if self.config.prefill_expert:
             # For prefill tokens, enable only the prefill expert
             only_exp0 = hax.zeros_like(expert_mask).at[Experts, : TopK.size].set(1.0)
@@ -887,16 +895,28 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         if self.config.disable_expert_mask:
             expert_mask = None
         elif self.config.ident_expert_mask:
-            expert_mask = hax.ones((Batch, Pos, Experts), dtype=compute_dtype)
+            expert_mask = hax.ones(self.config.mask_axes(Batch), dtype=compute_dtype)
 
         if activations:
             res = self.activations(input_ids, attn_mask=attn_mask, key=k_head, expert_mask=expert_mask)
         else:
             res = self(input_ids, attn_mask=attn_mask, key=k_head, expert_mask=expert_mask)
 
-        if expert_mask is not None:
+        if self.config.route_each_layer:
+            if expert_mask is not None:
+                expert_mask_used = expert_mask > 0
+                for i in range(self.config.Layers.size):
+                    extras[f"router/index_hist_{i:0>2}"] = IndexCountHistogram.init(
+                        expert_mask_used[self.config.Layers, i].sum(axis=(Batch, Pos))
+                    )
+                    extras[f"router/used_count_{i:0>2}"] = IndexCountUnique.init(
+                        top_k_indices[self.config.Layers, i], Experts
+                    )
+
+        else:
             extras["router/index_hist"] = IndexCountHistogram.init((expert_mask > 0).sum(axis=(Batch, Pos)))
-        extras["router/used_count"] = IndexCountUnique.init(top_k_indices, Experts)
+            extras["router/used_count"] = IndexCountUnique.init(top_k_indices, Experts)
+
         extras["router/logits"] = LogitHistogram.init(router_logits)
         return (res, router_logits.astype(compute_dtype), extras)
 
@@ -932,44 +952,6 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         return fsd(self, state_dict, prefix)
 
 
-def create_expert_mask(
-    Batch: hax.Axis,
-    Pos: hax.Axis,
-    TopK: hax.Axis,
-    Experts: hax.Axis,
-    indices: hax.NamedArray,
-    values: hax.NamedArray,
-):
-    def create_expert_mask_jax(indices, values):
-        """
-        Creates expert mask using one-hot encoding and matrix multiplication.
-
-        Args:
-            indices: Array of shape [batch, seq, top_k]
-            values: Array of shape [batch, seq, top_k]
-            num_experts: Total number of experts
-        """
-        # Create one-hot encoding: [batch, seq, top_k, num_experts]
-        one_hot = jax.nn.one_hot(indices, Experts.size)
-
-        # Multiply with values to place them in correct positions
-        # values: [batch, seq, top_k, 1]
-        # one_hot: [batch, seq, top_k, num_experts]
-        values_expanded = values[..., None]
-
-        # Result: [batch, seq, top_k, num_experts]
-        weighted = one_hot * values_expanded
-
-        # Sum over top_k dimension to get final mask
-        # Result: [batch, seq, num_experts]
-        return jax.numpy.sum(weighted, axis=2)
-
-    inds = indices.rearrange((Batch, Pos, TopK)).array
-    values = values.rearrange((Batch, Pos, TopK)).array
-    jres = create_expert_mask_jax(inds, values)
-    return hax.named(jres, (Batch, Pos, Experts))
-
-
 def fast_gather(
     Batch: hax.Axis,
     Pos: hax.Axis,
@@ -996,3 +978,22 @@ def fast_gather(
     inds = indices.rearrange((Batch, Pos)).array
     jres = fast_gather_jax(x, inds)
     return hax.named(jres, (Batch, Pos, Embed))
+
+
+def create_expert_mask(
+    TopK: hax.Axis,
+    Experts: hax.Axis,
+    indices: hax.NamedArray,
+    values: hax.NamedArray,
+):
+    assert TopK in indices.axes, f"TopK must be in indices: {indices.axes}"
+    # [..., TopK, Experts]
+    one_hot = hax.nn.one_hot(indices, Experts, dtype=bool)
+    # [..., TopK, 1]
+    values_expanded = values.rearrange(indices.axes).array[..., None]
+    # [..., TopK, Experts] where experts is one_hot
+    one_hot = one_hot.rearrange(indices.axes + (Experts,)).array
+    # [..., TopK, Experts]
+    weighted = one_hot * values_expanded  # hax doesn't like broadcasting sometimes
+    # [..., Experts] by summing out TopK
+    return hax.NamedArray(weighted, indices.axes + (Experts,)).sum(TopK)

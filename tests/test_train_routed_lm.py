@@ -78,13 +78,17 @@ def get_opt_cfg():
 @pytest.mark.parametrize("expert_type", [t for t in ExpertType])
 @pytest.mark.parametrize("prefill_expert", [True, False])
 @pytest.mark.parametrize("router_activation", ["sigmoid", "softmax"])
+@pytest.mark.parametrize("route_each_layer", [True, False])
 @skip_if_no_torch
-def test_routed_train(data_cfg: FIMUrlSourceConfig, expert_type, prefill_expert, router_activation):
+def test_routed_train(data_cfg: FIMUrlSourceConfig, expert_type, prefill_expert, router_activation, route_each_layer):
     from transformers import Qwen2ForCausalLM
 
     # just testing if train_lm has a pulse
     model_cfg = small_model_cfg(
-        expert_type=expert_type, prefill_expert=prefill_expert, router_activation=router_activation
+        expert_type=expert_type,
+        prefill_expert=prefill_expert,
+        router_activation=router_activation,
+        route_each_layer=route_each_layer,
     )
     with tempfile.TemporaryDirectory() as tmpdir:
         tokenizer = data_cfg.the_tokenizer
@@ -103,7 +107,7 @@ def test_routed_train(data_cfg: FIMUrlSourceConfig, expert_type, prefill_expert,
                     num_train_steps=4,
                     train_batch_size=2,
                     per_device_parallelism=1,  # test out grad accum
-                    max_eval_batches=1,
+                    max_eval_samples=16,
                     steps_per_eval=2,
                     tracker=WandbConfig(mode="disabled"),
                     require_accelerator=False,

@@ -1,6 +1,7 @@
 import dataclasses
 import tempfile
 from contextlib import ExitStack
+from typing import List
 
 import equinox as eqx
 import jax
@@ -18,6 +19,7 @@ from levanter.models.routed_qwen_model import (
     RLoraLinear,
     RQwenConfig,
     RQwenLMHeadModel,
+    create_expert_mask,
     reinit_expert_weights,
     routed_experts_trainable_params_filter,
 )
@@ -309,3 +311,39 @@ def test_rqwen_expert_type_init():
         model: RQwenLMHeadModel = config.build(hax.Axis("vocab", 100), key=jax.random.PRNGKey(0))
         assert not isinstance(model.transformer.layers.stacked.mlp.down_proj, RLoraLinear)
         assert model.transformer.layers.stacked.mlp.experts is not None
+
+
+@pytest.mark.parametrize("with_layers", [True, False])
+def test_create_expert_mask(with_layers):
+    Batch = hax.Axis("batch", 2)
+    TopK = hax.Axis("topk", 3)
+    Expert = hax.Axis("experts", 4)
+    Pos = hax.Axis("pos", 5)
+    Layer = hax.Axis("layers", 6)
+    MaskShape = (Batch, Pos, Expert)
+    if with_layers:
+        MaskShape = (Batch, Pos, Layer, Expert)
+    activations = hax.random.uniform(jax.random.PRNGKey(0), MaskShape)
+    elems, inds = hax.top_k(activations, Expert, k=TopK.size, new_axis=TopK)
+    mask = create_expert_mask(TopK, Expert, inds, elems)
+
+    def get(x, *args):
+        return x.__getitem__(*args)
+
+    def check_idx(*idxs):
+        bp_inds: List[int] = get(inds, *idxs).tolist()
+        for e in range(Expert.size):
+            if e in bp_inds:
+                idx = bp_inds.index(e)
+                val = get(elems, *idxs, TopK, idx)
+                assert get(mask, *idxs, Expert, e) == val
+            else:
+                assert get(mask, *idxs, Expert, e) == 0.0
+
+    for b in range(Batch.size):
+        for p in range(Pos.size):
+            if with_layers:
+                for li in range(Layer.size):
+                    check_idx(Batch, b, Pos, p, Layer, li)
+            else:
+                check_idx(Batch, b, Pos, p)
