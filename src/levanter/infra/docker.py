@@ -241,6 +241,7 @@ def split_image_and_tag(docker_base_image):
 
 def make_docker_run_command(image_id, command, *, foreground, env, name="levanter"):
     docker_command = [
+        "sudo",
         "docker",
         "run",
         "-t" if foreground else "-d",

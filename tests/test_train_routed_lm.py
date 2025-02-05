@@ -80,7 +80,15 @@ def get_opt_cfg():
 @pytest.mark.parametrize("router_activation", ["sigmoid", "softmax"])
 @pytest.mark.parametrize("route_each_layer", [True, False])
 @skip_if_no_torch
-def test_routed_train(data_cfg: FIMUrlSourceConfig, expert_type, prefill_expert, router_activation, route_each_layer):
+def test_routed_train(
+    data_cfg: FIMUrlSourceConfig,
+    expert_type,
+    prefill_expert,
+    router_activation,
+    route_each_layer,
+    full_ft=False,
+    base_params_optim=None,
+):
     from transformers import Qwen2ForCausalLM
 
     # just testing if train_lm has a pulse
@@ -102,6 +110,8 @@ def test_routed_train(data_cfg: FIMUrlSourceConfig, expert_type, prefill_expert,
                 initialize_from_hf=torch_model_dir,
                 data=data_cfg,
                 model=model_cfg,
+                full_ft=full_ft,
+                full_ft_base_weights_optimizer=base_params_optim,
                 trainer=routed_lm.TrainerConfig(
                     seed=42,
                     num_train_steps=4,
@@ -119,7 +129,6 @@ def test_routed_train(data_cfg: FIMUrlSourceConfig, expert_type, prefill_expert,
                 ),
                 optimizer=get_opt_cfg(),
                 router_z_loss_weight=0.001,
-                full_ft=False,
                 embedding_router_token_ft=False,
             )
             routed_lm.main(config)
@@ -128,6 +137,19 @@ def test_routed_train(data_cfg: FIMUrlSourceConfig, expert_type, prefill_expert,
                 os.unlink("wandb")
             except Exception:
                 pass
+
+
+@pytest.mark.parametrize("expert_type", [t for t in ExpertType])
+def test_full_ft_routed_train(data_cfg: FIMUrlSourceConfig, expert_type):
+    test_routed_train(
+        data_cfg,
+        expert_type=expert_type,
+        prefill_expert=True,
+        router_activation="softmax",
+        route_each_layer=False,
+        full_ft=True,
+        base_params_optim=get_opt_cfg(),
+    )
 
 
 def test_eval_loop(data_cfg):

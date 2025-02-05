@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jrandom
 from chex import PRNGKey
+from jaxtyping import PyTree
 
 import haliax as hax
 import haliax.nn as hnn
@@ -80,11 +81,28 @@ class LowRankLinear(ModuleWithStateDictSerialization):
         return lora_b * self.scale
 
 
-def routed_experts_trainable_params_filter(model: eqx.Module) -> Dict[str, jnp.ndarray]:
-    def is_routed_experts_param(x):
-        return isinstance(x, (RQwenMlpExperts, Router, LowRankLinear))
+def is_routed_experts_param(x):
+    return isinstance(x, (RQwenMlpExperts, Router, LowRankLinear))
 
+
+def routed_experts_trainable_params_filter(model: eqx.Module) -> Dict[str, jnp.ndarray]:
     return jax.tree_util.tree_map(is_routed_experts_param, model, is_leaf=is_routed_experts_param)
+
+
+def routed_experts_mask(model_shape: PyTree) -> PyTree:
+    return jax.tree.map(
+        is_routed_experts_param,
+        model_shape,
+        is_leaf=lambda x: is_routed_experts_param(x) or isinstance(x, hax.NamedArray),
+    )
+
+
+def base_weights_mask(model_shape: PyTree) -> PyTree:
+    return jax.tree.map(
+        lambda x: not is_routed_experts_param(x),
+        model_shape,
+        is_leaf=lambda x: is_routed_experts_param(x) or isinstance(x, hax.NamedArray),
+    )
 
 
 def re_init_linear(x: hnn.Linear, init_scale=1.0, *, key):

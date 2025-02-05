@@ -24,7 +24,9 @@ from levanter.models.loss import maybe_fused_next_token_loss
 from levanter.models.routed_qwen_model import (
     RQwenConfig,
     RQwenLMHeadModel,
+    base_weights_mask,
     reinit_expert_weights,
+    routed_experts_mask,
     routed_experts_trainable_params_filter,
 )
 from levanter.optim import AdamConfig, OptimizerConfig
@@ -54,11 +56,18 @@ class TrainLmConfig:
     full_ft: bool = False
     embedding_router_token_ft: bool = False
 
+    full_ft_base_weights_optimizer: Optional[OptimizerConfig] = None
+
     def __post_init__(self):
         if self.embedding_router_token_ft and self.full_ft:
             raise ValueError("Can't have both full_ft and embedding_router_token_ft")
         if self.embedding_router_token_ft and not self.data.add_router_token:
             raise ValueError("Can't have embedding_router_token_ft without add_router_token")
+        if self.full_ft_base_weights_optimizer:
+            if not self.full_ft:
+                raise ValueError("Can't have full_ft_base_weights_optimizer without full_ft")
+            if self.embedding_router_token_ft:
+                raise ValueError("Can't have full_ft_base_weights_optimizer with embedding_router_token_ft")
 
 
 def compute_next_token_loss(
@@ -141,12 +150,40 @@ def main(config: TrainLmConfig):
     if vocab_size != Vocab.size:
         logger.info(f"Rounding vocab size from {vocab_size} to {Vocab.size} for partitioning")
 
+    seed = config.trainer.seed
+    model_key, data_key, training_key = jrandom.split(jrandom.PRNGKey(seed), 3)
+
+    def model_init():
+        return config.model.build(Vocab, key=model_key)
+
+    model_shape = eqx.filter_eval_shape(model_init)
+    is_trainable: PyTree[FilterSpec]
+    if config.full_ft:
+        is_trainable = True
+    else:
+        is_trainable = routed_experts_trainable_params_filter(model_shape)
+        if config.embedding_router_token_ft:
+            assert isinstance(
+                is_trainable.embeddings, eqx.Module
+            ), f"Expected embeddings to be a module, got {type(is_trainable.embeddings)}"
+            is_trainable = eqx.tree_at(lambda x: x.embeddings, is_trainable, replace=True)
+
     optimizer = config.optimizer.build(config.trainer.num_train_steps)
     if config.embedding_router_token_ft:
         token_mask = hax.nn.one_hot(
             tokenizer.convert_tokens_to_ids(config.data.router_token), Vocab, dtype=jnp.float32
         )
         optimizer = optax.chain(optimizer, filter_embedding_grads(config.model.Embed, Vocab, token_mask))
+    if config.full_ft_base_weights_optimizer:
+        base_weights_optimizer = config.full_ft_base_weights_optimizer.build(config.trainer.num_train_steps)
+        assert is_trainable is True, "Can't have full_ft_base_weights_optimizer without full_ft"
+        base_mask = base_weights_mask(model_shape)
+        expert_mask = routed_experts_mask(model_shape)
+
+        optimizer = optax.chain(
+            optax.masked(base_weights_optimizer, base_mask),
+            optax.masked(optimizer, expert_mask),
+        )
 
     # some axes we need
     Batch = config.trainer.TrainBatch
@@ -167,8 +204,6 @@ def main(config: TrainLmConfig):
     with Trainer(config.trainer, optimizer, loss_function) as trainer:
         # randomness in jax is tightly controlled by "keys" which are the states of the random number generators
         # this makes deterministic training pretty easy
-        seed = config.trainer.seed
-        model_key, data_key, training_key = jrandom.split(jrandom.PRNGKey(seed), 3)
 
         # We have two axis_mappings: one for storing the model and optimizer states, and one for compute
         # This allows Zero-3-style parameter sharding, where we shard the parameters and optimizer state across the mesh
@@ -199,20 +234,6 @@ def main(config: TrainLmConfig):
         # For most things, we just insist you specify the config right, but tokenizers often have strange numbers of
         # tokens: gpt-2 has 50257, for example. So we round up.
 
-        def model_init():
-            return config.model.build(Vocab, key=model_key)
-
-        model_shape = eqx.filter_eval_shape(model_init)
-        is_trainable: PyTree[FilterSpec]
-        if config.full_ft:
-            is_trainable = True
-        else:
-            is_trainable = routed_experts_trainable_params_filter(model_shape)
-            if config.embedding_router_token_ft:
-                assert isinstance(
-                    is_trainable.embeddings, eqx.Module
-                ), f"Expected embeddings to be a module, got {type(is_trainable.embeddings)}"
-                is_trainable = eqx.tree_at(lambda x: x.embeddings, is_trainable, replace=True)
         state = trainer.initial_state(training_key, model_init=model_init, is_trainable=is_trainable)
 
         seek_dataloader = True

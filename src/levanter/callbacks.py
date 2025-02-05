@@ -212,7 +212,7 @@ def log_step_info(total_steps: Optional[int]):
     def log_step_info_inner(step: StepInfo):
         metrics = {"train/loss": step.loss, "global_step": step.step}
         if total_steps:
-            metrics["run_progress"] = step.step / total_steps
+            metrics["run_progress"] = (step.step + 1) / total_steps
         log_optimizer_hyperparams(step.opt_state, step=step.step, prefix="optim")
         levanter.tracker.log(metrics, step=step.step)
 

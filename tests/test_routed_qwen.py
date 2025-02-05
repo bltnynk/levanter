@@ -19,8 +19,10 @@ from levanter.models.routed_qwen_model import (
     RLoraLinear,
     RQwenConfig,
     RQwenLMHeadModel,
+    base_weights_mask,
     create_expert_mask,
     reinit_expert_weights,
+    routed_experts_mask,
     routed_experts_trainable_params_filter,
 )
 from test_utils import skip_if_no_torch
@@ -347,3 +349,45 @@ def test_create_expert_mask(with_layers):
                     check_idx(Batch, b, Pos, p, Layer, li)
             else:
                 check_idx(Batch, b, Pos, p)
+
+
+def test_weight_masks():
+    config = RQwenConfig(
+        seq_len=512,
+        num_layers=2,
+        hidden_dim=256,
+        intermediate_dim=512,
+        tie_word_embeddings=True,
+        expert_type=ExpertType.MLP_GLU,
+        expert_init=ExpertInit.NONZERO,
+    )
+
+    def model_init():
+        return config.build(hax.Axis("vocab", 100), key=jax.random.PRNGKey(0))
+
+    model_shape = eqx.filter_eval_shape(model_init)
+
+    experts_mask: RQwenLMHeadModel = routed_experts_mask(model_shape)
+
+    def manual_expert_values(mask: RQwenLMHeadModel):
+        stacked = mask.transformer.layers.stacked
+        tvals = [mask.router, stacked.mlp.experts]
+        fvals = [
+            stacked.mlp.gate_proj.linear.weight,
+            stacked.mlp.up_proj.linear.weight,
+            stacked.mlp.down_proj.linear.weight,
+            stacked.self_attn.k_proj.linear.weight,
+            stacked.self_attn.q_proj.linear.weight,
+            stacked.self_attn.v_proj.linear.weight,
+            stacked.self_attn.o_proj.linear.weight,
+        ]
+        return tvals, fvals
+
+    exp_vals, base_vals = manual_expert_values(experts_mask)
+    assert all([t is True for t in exp_vals])
+    assert all([f is False for f in base_vals])
+
+    base_mask: RQwenLMHeadModel = base_weights_mask(model_shape)
+    exp_vals, base_vals = manual_expert_values(base_mask)
+    assert all([t is False for t in exp_vals])
+    assert all([f is True for f in base_vals])
