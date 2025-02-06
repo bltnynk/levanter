@@ -28,7 +28,7 @@ from levanter.models.rotary import RotaryEmbeddingsConfig
 from levanter.utils.flop_utils import lm_flops_per_token
 from levanter.utils.jax_utils import key_iterator
 from levanter.utils.logging import silence_transformer_nag
-from levanter.utils.stat_utils import IndexCountHistogram, IndexCountUnique, LogitHistogram
+from levanter.utils.stat_utils import IndexCountHistogram, IndexCountUnique, LogitHistogram, RunningMean
 
 
 silence_transformer_nag()
@@ -82,11 +82,14 @@ class LowRankLinear(ModuleWithStateDictSerialization):
 
 
 def is_routed_experts_param(x):
-    return isinstance(x, (RQwenMlpExperts, Router, LowRankLinear))
+    return isinstance(x, (RQwenMlpExperts, LowRankLinear))
 
 
 def routed_experts_trainable_params_filter(model: eqx.Module) -> Dict[str, jnp.ndarray]:
-    return jax.tree_util.tree_map(is_routed_experts_param, model, is_leaf=is_routed_experts_param)
+    is_trainable = jax.tree_util.tree_map(is_routed_experts_param, model, is_leaf=is_routed_experts_param)
+    is_trainable_router = jax.tree_util.tree_map(lambda x: isinstance(x, hnn.Linear), is_trainable.router, is_leaf=lambda x: isinstance(x, hnn.Linear))
+    is_trainable = dataclasses.replace(is_trainable, router=is_trainable_router)
+    return is_trainable
 
 
 def routed_experts_mask(model_shape: PyTree) -> PyTree:
@@ -907,7 +910,7 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         router_stop_grad: bool = True,
         activations: bool = False,
         expert_bias: Optional[ExpertBiasTracker] = None,
-    ) -> tuple[NamedArray, NamedArray, Extras]:
+    ) -> tuple[NamedArray, NamedArray, NamedArray, NamedArray, Extras]:
         k_head, k_rout = maybe_rng_split(key, 2)
         Batch = example.tokens.resolve_axis("batch")
         Experts, Pos, TopK = self.config.Experts, self.config.Pos, self.config.TopK
@@ -949,6 +952,13 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         else:
             expert_mask = hax.where(router_hs_idxs < 0, 0.0, expert_mask).astype(compute_dtype)
 
+        # Compute the number of tokens routed to each experts.
+        used_experts = expert_mask > 0
+        # Since we are routing by sequence, this step is necessary.
+        used_experts /= example.seq_length
+        # Due to microbatchibg, we sum across (Pos, ) instead of (Batch, Pos)
+        expert_load = hax.sum(used_experts, (Pos,), where=example.completion_mask, dtype=compute_dtype)
+
         if self.config.disable_expert_mask:
             expert_mask = None
         elif self.config.ident_expert_mask:
@@ -980,14 +990,11 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
                 extras.loggable["router/used_count"] = IndexCountUnique.init(top_k_indices, Experts)
 
         if expert_bias is not None:
-            per_expert_load = ((expert_mask > 0) / example.seq_length).sum(
-                axis=[Batch, Pos], where=example.completion_mask
-            )
             # Put the new bias in, per_expert_load will get aggregated across microbatches
-            extras.aux["expert_bias"] = ExpertBiasTracker(expert_bias.bias(self.config), per_expert_load)
+            extras.aux["expert_bias"] = ExpertBiasTracker(expert_bias.bias(self.config), expert_load)
 
         extras.loggable["router/logits"] = LogitHistogram.init(router_logits)
-        return (res, router_logits.astype(compute_dtype), extras)
+        return (res, router_logits.astype(compute_dtype), expert_mask.astype(compute_dtype), expert_load.astype(compute_dtype), extras)
 
     def get_lm_head(self) -> hax.NamedArray:
         if self.lm_head is None:
