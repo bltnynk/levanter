@@ -126,7 +126,7 @@ def compute_next_token_loss(
         if router_zloss_normalize_by_seqlen:
             z_loss /= example.seq_length
         extras["router/z_loss"] = MeanScalar.init(z_loss, where=mask)
-        losses += z_loss
+        losses += router_zloss_weight * z_loss
 
     return losses, mask, extras
 
