@@ -1541,6 +1541,7 @@ def _mk_fim_example_jit(
     Pos: hax.Axis,
     input_ids: hax.NamedArray,
     hs_idxs: hax.NamedArray,
+    seq_len: hax.NamedArray,
     middle_token_id: int,
     eos_token_id: int,
     pad_token_id: int,
@@ -1569,6 +1570,7 @@ def _mk_fim_example_jit(
     return RoutableLmExample.causal_with_hs_idxs(
         input_ids,
         router_hs_idxs=hs_idxs,
+        seq_length=seq_len,
         loss_mask=loss_mask,
         completion_mask=completion_mask,
         eos_id=eos_token_id,
@@ -1599,6 +1601,7 @@ def _prepare_fim_examples(
     assert all(len(ids) == Pos.size for ids in input_ids)
 
     hs_idx_selector = []
+    seq_lens = []
     for seq_idx in range(input_ids.shape[0]):
         mids = np.argwhere(input_ids[seq_idx] == middle_token_id).flatten()
         ends = np.argwhere(input_ids[seq_idx] == eos_token_id).flatten()
@@ -1614,17 +1617,20 @@ def _prepare_fim_examples(
                 raise ValueError(f"Mismatched num middle and ends, {(mids, ends)}")
 
         hs_idx = -1 * np.ones(len(input_ids[seq_idx]), dtype=np.int32)
+        seq_len_i = -1 * np.ones(len(input_ids[seq_idx]), dtype=np.int32)
         for m, e in zip(mids, ends):
             hs_idx[m:e] = m - 1  # we use the hidden state which predicts the fim token
+            seq_len_i[m:e] = e - m
         hs_idx_selector.append(hs_idx)
-    hs_idx_selector = np.vstack(hs_idx_selector)
+        seq_lens.append(seq_len_i)
 
     out = []
-    for ids, hs in zip(input_ids, hs_idx_selector):
+    for ids, hs, seq_len_i in zip(input_ids, hs_idx_selector, seq_lens):
         causal: RoutableLmExample = _mk_fim_example_jit(
             Pos,
             hax.named(ids, Pos),
             hax.named(hs, Pos),
+            hax.named(seq_len_i, Pos),
             middle_token_id=middle_token_id,
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,

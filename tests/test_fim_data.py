@@ -64,6 +64,7 @@ async def test_fim_url_data(flattened, predict_prefix, predict_fim_token):
             assert not lm[e].all().item(), "should never predict after eos"
             # hs idxs testing
             assert (elem0.router_hs_idxs.array[m:e] == m - 1).all().item()
+            assert (elem0.seq_length.array[m:e] == e - m).all().item()
 
 
 @pytest.mark.slow

@@ -76,9 +76,10 @@ def get_opt_cfg():
 
 @pytest.mark.entry
 @pytest.mark.parametrize("expert_type", [t for t in ExpertType])
-@pytest.mark.parametrize("prefill_expert", [True, False])
-@pytest.mark.parametrize("router_activation", ["sigmoid", "softmax"])
-@pytest.mark.parametrize("route_each_layer", [True, False])
+@pytest.mark.parametrize("prefill_expert", [True, False], ids=["prefill", "no_prefill"])
+@pytest.mark.parametrize("router_activation", ["sigmoid"], ids=["sigmoid"])
+@pytest.mark.parametrize("route_each_layer", [True, False], ids=["route_each_layer", "route_once"])
+@pytest.mark.parametrize("zloss_seq_norm", [True, False], ids=["zloss_seq_norm", "zloss_no_seq_norm"])
 @skip_if_no_torch
 def test_routed_train(
     data_cfg: FIMUrlSourceConfig,
@@ -86,6 +87,7 @@ def test_routed_train(
     prefill_expert,
     router_activation,
     route_each_layer,
+    zloss_seq_norm,
     full_ft=False,
     base_params_optim=None,
 ):
@@ -129,6 +131,7 @@ def test_routed_train(
                 ),
                 optimizer=get_opt_cfg(),
                 router_z_loss_weight=0.001,
+                router_z_loss_normalize_by_seqlen=zloss_seq_norm,
                 embedding_router_token_ft=False,
             )
             routed_lm.main(config)

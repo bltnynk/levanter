@@ -53,6 +53,7 @@ class TrainLmConfig:
     epoch: int = 0
     z_loss_weight: float = 0.0
     router_z_loss_weight: float = 0.0
+    router_z_loss_normalize_by_seqlen: bool = True
     full_ft: bool = False
     embedding_router_token_ft: bool = False
 
@@ -78,6 +79,7 @@ def compute_next_token_loss(
     logsumexp_weight: Optional[float] = None,
     loss_dtype: Optional[Type[jnp.dtype]] = jnp.float32,
     router_zloss_weight: float = 0.0,
+    router_zloss_normalize_by_seqlen: bool = True,
     stop_grad: bool = True,
 ) -> tuple[hax.NamedArray, hax.NamedArray, Extras]:
     """
@@ -121,6 +123,8 @@ def compute_next_token_loss(
         z_loss = hax.square(z_loss)  # [batch,]
         if model.config.Layers in z_loss.axes:
             z_loss = hax.mean(z_loss, model.config.Layers)
+        if router_zloss_normalize_by_seqlen:
+            z_loss /= example.seq_length
         extras["router/z_loss"] = MeanScalar.init(z_loss, where=mask)
         losses += z_loss
 
@@ -194,6 +198,7 @@ def main(config: TrainLmConfig):
         compute_next_token_loss,
         logsumexp_weight=config.z_loss_weight,
         router_zloss_weight=config.router_z_loss_weight,
+        router_zloss_normalize_by_seqlen=config.router_z_loss_normalize_by_seqlen,
         stop_grad=stop_grad,
     )
 
