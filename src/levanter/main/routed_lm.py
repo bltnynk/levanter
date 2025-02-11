@@ -119,6 +119,7 @@ def compute_next_token_loss(
     extras["all_lm_loss"] = MeanScalar.init(losses, where=mask)
 
     if router_zloss_weight > 0.0:
+        assert example.completion_mask is not None, "Need completion mask for router zloss"
         z_loss = hax.nn.logsumexp(rlogits, model.config.Experts)
         z_loss = hax.square(z_loss)  # [batch,]
         if model.config.Layers in z_loss.axes:
@@ -126,7 +127,7 @@ def compute_next_token_loss(
         if router_zloss_normalize_by_seqlen:
             z_loss /= example.seq_length
         extras["router/z_loss"] = MeanScalar.init(z_loss, where=mask)
-        losses += router_zloss_weight * z_loss
+        losses += router_zloss_weight * z_loss * example.completion_mask
 
     return losses, mask, extras
 

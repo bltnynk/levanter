@@ -110,6 +110,7 @@ class LmExample(eqx.Module):
 
 class RoutableLmExample(LmExample):
     router_hs_idxs: Optional[hax.NamedArray] = None
+    """-1 if the token is not routable, otherwise the index of the router hidden state"""
     completion_mask: Optional[hax.NamedArray] = None
     seq_length: Optional[hax.NamedArray] = None
 
