@@ -10,8 +10,7 @@ from haliax import Axis, NamedArray
 from haliax.nn import cross_entropy_loss
 
 from levanter.models.attention import AttentionMask
-from levanter.models.lm_model import LmConfig
-from levanter.utils.types import Extras
+from levanter.models.lm_model import Extras, LmConfig
 
 
 class AudioTextExample(eqx.Module):
@@ -115,7 +114,7 @@ class ASRMixin(abc.ABC):
             reduction=None,
         )
 
-        return loss, example.loss_mask, {}
+        return loss, example.loss_mask, Extras()
 
     @property
     def vocab_size(self) -> int:

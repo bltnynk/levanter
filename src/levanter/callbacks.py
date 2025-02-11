@@ -31,7 +31,7 @@ from levanter.utils import flop_utils, jax_utils
 from levanter.utils.jax_utils import barrier_sync, jnp_to_python
 from levanter.utils.logging import save_xla_dumps_to_wandb
 from levanter.utils.stat_utils import MeanScalar
-from levanter.utils.types import Extras
+from levanter.utils.types import ComputeLossFunction, ExtraData
 from levanter.visualization import compute_and_visualize_log_probs as viz_probs
 
 
@@ -147,9 +147,11 @@ def get_total_dataset_tokens(ds: AsyncDataset, seq_length: int):
     return future
 
 
-def eval_loss_loop(loss_fn, model, dataset, max_batches: Optional[int] = None, name: Optional[str] = None):
+def eval_loss_loop(
+    loss_fn: ComputeLossFunction, model, dataset, max_batches: Optional[int] = None, name: Optional[str] = None
+):
     loss = MeanScalar.zero()
-    extras: Extras = {}
+    extras: ExtraData = {}
 
     if name is not None:
         desc = f"eval {name}"
@@ -168,7 +170,7 @@ def eval_loss_loop(loss_fn, model, dataset, max_batches: Optional[int] = None, n
             break
         losses_i, where_i, extras_i = loss_fn(model, batch)
         loss += MeanScalar.init(losses_i, where=where_i)
-        for k, v in extras_i.items():
+        for k, v in extras_i.loggable.items():
             if k not in extras:
                 extras[k] = v
             else:

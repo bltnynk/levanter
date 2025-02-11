@@ -13,6 +13,7 @@ import haliax as hax
 from haliax.partitioning import ResourceAxis
 
 from levanter.models.attention import AttentionMask
+from levanter.models.lm_model import RoutableLmExample
 from levanter.models.routed_qwen_model import (
     ExpertInit,
     ExpertType,
@@ -55,12 +56,13 @@ def test_routed_qwen_forward():
 
         x = hax.random.randint(key, (Batch, config.Pos), 0, Vocab.size)
         inds = hax.random.randint(key, (Batch, config.Pos), 0, config.Pos.size - 1)
-        _ = model.routed_forward(Batch, x, inds)
+        example = RoutableLmExample(x, None, router_hs_idxs=inds)
+        _ = model.routed_forward(example)
 
         # test with num_experts=1
         config = dataclasses.replace(config, num_experts=1, top_k=1)
         model = RQwenLMHeadModel.init(Vocab, config, key=key)
-        _ = model.routed_forward(Batch, x, inds)
+        _ = model.routed_forward(example)
 
 
 @skip_if_no_torch
@@ -99,6 +101,7 @@ def test_rqwen_consistent_with_base_qwen(expert_type, expert_init):
     input = hax.random.randint(jax.random.PRNGKey(0), (Batch, config.Pos), 0, Vocab.size)
     seq_inds = hax.random.randint(jax.random.PRNGKey(0), (Batch, config.Pos), 0, config.Pos.size - 1)
     attn_mask = AttentionMask.causal()
+    example = RoutableLmExample(input, None, attn_mask=attn_mask, router_hs_idxs=seq_inds)
     input_torch = torch.from_numpy(np.array(input.array)).to(torch.int32)
 
     torch.random.manual_seed(0)
@@ -118,11 +121,11 @@ def test_rqwen_consistent_with_base_qwen(expert_type, expert_init):
             )
 
             @hax.named_jit
-            def compute(model: RQwenLMHeadModel, input):
-                model_output = model.routed_forward(Batch, input, router_hs_idxs=seq_inds, attn_mask=attn_mask)
+            def compute(model: RQwenLMHeadModel, example: RoutableLmExample):
+                model_output = model.routed_forward(example)
                 return model_output
 
-            token_pred, mask, extras = compute(model, input)
+            token_pred, mask, extras = compute(model, example)
             jax_out = token_pred.array
 
             assert torch_out.shape == jax_out.shape, f"{torch_out.shape} != {jax_out.shape}"
@@ -134,11 +137,11 @@ def test_rqwen_consistent_with_base_qwen(expert_type, expert_init):
             )
 
             @hax.named_jit
-            def compute(model: RQwenLMHeadModel, input):
-                model_output = model.routed_forward(Batch, input, router_hs_idxs=seq_inds, attn_mask=attn_mask)
+            def compute(model: RQwenLMHeadModel, example: RoutableLmExample):
+                model_output = model.routed_forward(example)
                 return model_output
 
-            token_pred, mask, extras = compute(model, input)
+            token_pred, mask, extras = compute(model, example)
             jax_out = token_pred.array
 
             assert torch_out.shape == jax_out.shape, f"{torch_out.shape} != {jax_out.shape}"
@@ -330,7 +333,7 @@ def test_create_expert_mask(with_layers):
     mask = create_expert_mask(TopK, Expert, inds, elems)
 
     def get(x, *args):
-        return x.__getitem__(*args)
+        return x.__getitem__(args)
 
     def check_idx(*idxs):
         bp_inds: List[int] = get(inds, *idxs).tolist()

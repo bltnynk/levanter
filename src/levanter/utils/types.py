@@ -1,3 +1,4 @@
+from dataclasses import field
 from typing import Any, Callable, Dict, Protocol, Tuple, TypeAlias, TypeVar, Union
 
 import equinox as eqx
@@ -13,7 +14,7 @@ M_con = TypeVar("M_con", contravariant=True)  # Model
 X = TypeVar("X", contravariant=True)  # Input
 
 
-Extras: TypeAlias = Dict[str, jax.Array | eqx.Module]
+ExtraData: TypeAlias = Dict[str, jax.Array | eqx.Module]
 
 try:
     from haliax.nn.scan import BlockFoldable
@@ -45,6 +46,27 @@ is kept, otherwise it is filtered out.
 """
 
 FilterTree = FilterSpec | PyTree[FilterSpec]
+
+
+def add_merge(res: ExtraData, input: ExtraData):
+    for k, v in input.items():
+        if k not in res:
+            res[k] = v
+        else:
+            res[k] = res[k] + v
+
+
+class Extras(eqx.Module):
+    loggable: ExtraData = field(default_factory=dict)
+    aux: ExtraData = field(default_factory=dict)
+
+    def merge(self, other: "Extras") -> "Extras":
+        res = Extras()
+        add_merge(res.loggable, self.loggable)
+        add_merge(res.loggable, other.loggable)
+        add_merge(res.aux, self.aux)
+        add_merge(res.aux, other.aux)
+        return res
 
 
 class ComputeLossFunction(Protocol[M_con, X]):

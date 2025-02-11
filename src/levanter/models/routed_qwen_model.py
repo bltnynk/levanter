@@ -1,4 +1,5 @@
 import dataclasses
+import warnings
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Dict, Optional, Type, Union
@@ -22,13 +23,12 @@ from levanter.compat.hf_checkpoints import HFCheckpointConverter
 from levanter.models.attention import AttentionMask, dot_product_attention
 from levanter.models.gpt2 import ACT2FN
 from levanter.models.llama import LlamaConfig, LlamaEmbedding, LlamaRMSNorm
-from levanter.models.lm_model import LmConfig, LmHeadModel
+from levanter.models.lm_model import Extras, LmConfig, LmHeadModel, RoutableLmExample
 from levanter.models.rotary import RotaryEmbeddingsConfig
 from levanter.utils.flop_utils import lm_flops_per_token
 from levanter.utils.jax_utils import key_iterator
 from levanter.utils.logging import silence_transformer_nag
 from levanter.utils.stat_utils import IndexCountHistogram, IndexCountUnique, LogitHistogram
-from levanter.utils.types import Extras
 
 
 silence_transformer_nag()
@@ -298,6 +298,9 @@ class RQwenConfig(LlamaConfig):
 
     router_activation: str = "softmax"
 
+    router_act_before_topk: bool = False
+    lossless_exp_bias_update_rate: Optional[float] = None
+
     ExpertRank = property(lambda self: Axis("expert_rank", self.expert_rank))
     TopK = property(lambda self: Axis("top_k", self.top_k))
 
@@ -345,7 +348,13 @@ class RQwenConfig(LlamaConfig):
                 not self.disable_expert_mask
             ), "Can only use prefill experts when using the expert mask"
 
-        assert self.router_activation in ["softmax", "sigmoid"], f"Invalid router activation: {self.router_activation}"
+        assert self.router_activation in [
+            "softmax",
+            "sigmoid",
+            "sigmoid_norm",
+        ], f"Invalid router activation: {self.router_activation}"
+        if self.lossless_exp_bias_update_rate is not None:
+            assert self.router_act_before_topk, "Lossless expert bias update requires router_act_before_topk"
 
     def hf_checkpoint_converter(self) -> HFCheckpointConverter["RQwenConfig"]:  # type: ignore
         return HFCheckpointConverter(
@@ -739,6 +748,29 @@ class Router(hnn.Linear):
         return Router(linear.weight, linear.bias, linear.In, linear.Out, linear.dot_general)
 
 
+class ExpertBiasTracker(eqx.Module):
+    curr_bias: NamedArray
+    load: NamedArray
+
+    def __add__(self, other: "ExpertBiasTracker") -> "ExpertBiasTracker":
+        return ExpertBiasTracker(self.curr_bias, self.load + other.load)
+
+    @staticmethod
+    def zero(config: RQwenConfig):
+        return ExpertBiasTracker(hax.zeros(config.Experts), hax.zeros(config.Experts))
+
+    def bias(self, config: RQwenConfig) -> NamedArray:
+        assert config.lossless_exp_bias_update_rate is not None, "Lossless expert bias update requires a rate"
+        mask = hax.ones(config.Experts, dtype=bool)
+        if config.prefill_expert:
+            mask = hax.ones(config.Experts, dtype=bool).at[config.Experts, : config.top_k].set(False)
+        avg_load = self.load.mean(config.Experts, where=mask)
+        update = hax.where(
+            (self.load > avg_load) & mask, -config.lossless_exp_bias_update_rate, config.lossless_exp_bias_update_rate
+        )
+        return self.curr_bias + update
+
+
 class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerialization):
     transformer: RQwenTransformer
     embeddings: LlamaEmbedding  # Can reuse Llama embeddings
@@ -825,6 +857,9 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
             return hax.nn.softmax(x, axis)
         elif self.config.router_activation == "sigmoid":
             return hax.nn.sigmoid(x)
+        elif self.config.router_activation == "sigmoid_norm":
+            sig = hax.nn.sigmoid(x)
+            return sig / sig.sum(axis=axis).broadcast_to(sig.axes)
         else:
             raise ValueError(f"Invalid router activation: {self.config.router_activation}")
 
@@ -866,19 +901,20 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
 
     def routed_forward(
         self,
-        Batch: hax.Axis,
-        input_ids: NamedArray,
-        router_hs_idxs: NamedArray,
-        attn_mask: Optional[NamedArray] = None,
+        example: RoutableLmExample,
         *,
         key=None,
         router_stop_grad: bool = True,
         activations: bool = False,
+        expert_bias: Optional[ExpertBiasTracker] = None,
     ) -> tuple[NamedArray, NamedArray, Extras]:
         k_head, k_rout = maybe_rng_split(key, 2)
+        Batch = example.tokens.resolve_axis("batch")
         Experts, Pos, TopK = self.config.Experts, self.config.Pos, self.config.TopK
         compute_dtype = self.embeddings.token_embeddings.weight.dtype
-        extras: Extras = {}
+        extras: Extras = Extras()
+        input_ids, attn_mask, router_hs_idxs = example.tokens, example.attn_mask, example.router_hs_idxs
+        assert router_hs_idxs is not None
 
         # Softmax, topk
         router_logits = self.router_logits(
@@ -891,13 +927,16 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
             k_rout=k_rout,
         )
 
-        if self.config.top_k > 1:
-            # Softmax after topk if k > 1
+        if self.config.router_act_before_topk or self.config.top_k == 1:
+            if self.config.top_k == 1 and not self.config.router_act_before_topk:
+                warnings.warn("router_act_before_topk=False but top_k=1, doing router_act_before_topk anyways")
+            elems = self.router_activation(router_logits, Experts)
+            topk_inp = elems + expert_bias.bias(self.config) if expert_bias is not None else router_logits
+            elems, top_k_indices = hax.top_k(topk_inp, Experts, TopK.size, TopK)
+        else:
+            assert expert_bias is None, "Expert bias only supported with router_act_before_topk"
             elems, top_k_indices = hax.top_k(router_logits, Experts, TopK.size, TopK)
             elems = self.router_activation(elems, TopK)
-        else:
-            elems = self.router_activation(router_logits, Experts)
-            elems, top_k_indices = hax.top_k(elems, Experts, TopK.size, TopK)
 
         if self.config.mult_by_topk:
             elems *= TopK.size
@@ -920,22 +959,34 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         else:
             res = self(input_ids, attn_mask=attn_mask, key=k_head, expert_mask=expert_mask)
 
-        if self.config.route_each_layer:
-            if expert_mask is not None:
+        if expert_mask is not None:
+            if self.config.route_each_layer:
                 expert_mask_used = expert_mask > 0
                 for i in range(self.config.Layers.size):
-                    extras[f"router/index_hist_{i:0>2}"] = IndexCountHistogram.init(
+                    extras.loggable[f"router/index_hist_{i:0>2}"] = IndexCountHistogram.init(
                         expert_mask_used[self.config.Layers, i].sum(axis=(Batch, Pos))
                     )
-                    extras[f"router/used_count_{i:0>2}"] = IndexCountUnique.init(
+                    extras.loggable[f"router/used_count_{i:0>2}"] = IndexCountUnique.init(
                         top_k_indices[self.config.Layers, i], Experts
                     )
 
-        else:
-            extras["router/index_hist"] = IndexCountHistogram.init((expert_mask > 0).sum(axis=(Batch, Pos)))
-            extras["router/used_count"] = IndexCountUnique.init(top_k_indices, Experts)
+            else:
+                # TODO: can we do this by sequence rather than by token? I.e. adjust for the seq length?
+                # Maybe what we want is a 'first token mask' that is 1 for the first token in the completion of sequence
+                # and zero otherwise. That would get rid of a lot of hacking stuff around.
+                extras.loggable["router/index_hist"] = IndexCountHistogram.init(
+                    (expert_mask > 0).sum(axis=(Batch, Pos))
+                )
+                extras.loggable["router/used_count"] = IndexCountUnique.init(top_k_indices, Experts)
 
-        extras["router/logits"] = LogitHistogram.init(router_logits)
+        if expert_bias is not None:
+            per_expert_load = ((expert_mask > 0) / example.seq_length).sum(
+                axis=[Batch, Pos], where=example.completion_mask
+            )
+            # Put the new bias in, per_expert_load will get aggregated across microbatches
+            extras.aux["expert_bias"] = ExpertBiasTracker(expert_bias.bias(self.config), per_expert_load)
+
+        extras.loggable["router/logits"] = LogitHistogram.init(router_logits)
         return (res, router_logits.astype(compute_dtype), extras)
 
     def get_lm_head(self) -> hax.NamedArray:

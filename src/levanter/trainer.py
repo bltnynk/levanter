@@ -1,5 +1,6 @@
 import atexit
 import copy
+import dataclasses
 import functools
 import logging as pylogging
 import os
@@ -38,13 +39,14 @@ from levanter.config import JsonAtom
 from levanter.data import AsyncDataset, DataLoader
 from levanter.distributed import DistributedConfig, RayConfig
 from levanter.grad_accum import microbatched
+from levanter.models.lm_model import Extras
 from levanter.optim.model_averaging import ModelAveragingConfig
 from levanter.tracker import TrackerConfig, capture_time
-from levanter.trainer_state import TrainerState, saveable_training_mask
+from levanter.trainer_state import AuxData, TrainerState, saveable_training_mask
 from levanter.utils import cloud_utils, fsspec_utils
 from levanter.utils.jax_utils import create_fsdp_mesh, zeros_like_tree
 from levanter.utils.tree_utils import inference_mode
-from levanter.utils.types import ComputeLossFunction, Extras, FilterSpec
+from levanter.utils.types import ComputeLossFunction, FilterSpec
 
 
 logger = pylogging.getLogger(__name__)
@@ -294,6 +296,7 @@ class Trainer:
         model_init: Optional[Callable[[], M]] = None,
         *,
         is_trainable: PyTree[FilterSpec] = True,
+        aux_data: AuxData | None = None,
     ) -> TrainerState[M]:
         """
         Either loads a checkpoint or initializes a fresh trainer state. This is the recommended way to initialize
@@ -354,6 +357,7 @@ class Trainer:
                 mp=self.mp,
                 fp8=self.fp8,
                 model_averaging=self.config.model_averaging,
+                aux_data=aux_data,
             )
             return state
 
@@ -388,6 +392,9 @@ class Trainer:
         # this results in two compiles, but the cost of the second compile is worth it
         hooks_this_time = any(state.step % h.every == 0 for h in self.hooks.stateful_hooks)
 
+        if state.aux_data is not None:
+            batch_kwargs |= state.aux_data
+
         with capture_time() as step_time:
             if hooks_this_time:
                 loss, new_state, extras, cb_states = self._jit_train_step_fn(state, batch, batch_kwargs)
@@ -403,7 +410,7 @@ class Trainer:
                 if hooks_this_time:
                     self.hooks.run_jit_hooks_outside_step(info, cb_states)
 
-            log_items = {k: v.item() for k, v in extras.items()} | {"throughput/hook_time": hook_time()}
+            log_items = {k: v.item() for k, v in extras.loggable.items()} | {"throughput/hook_time": hook_time()}
             log_items = {f"train/{k}": v for k, v in log_items.items()}
             levanter.tracker.log(log_items, step=info.step)
 
@@ -551,6 +558,9 @@ class Trainer:
 
         new_state = state.take_step(grads, obj_fun=obj_fun)
         new_state = hax.shard(new_state, self.parameter_axis_mapping)
+        if extras.aux:
+            new_state = dataclasses.replace(new_state, aux_data=extras.aux)
+
         if _no_hooks:
             return loss, new_state, extras
         else:

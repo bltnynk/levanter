@@ -12,6 +12,7 @@ from haliax import Axis, NamedArray, NamedOrNumeric
 
 from levanter.models.attention import AttentionMask
 from levanter.models.loss import maybe_fused_next_token_loss
+from levanter.utils.types import Extras
 
 
 LmConfigT = TypeVar("LmConfigT", bound="LmConfig")
@@ -273,7 +274,7 @@ def compute_next_token_loss(
     key=None,
     logsumexp_weight: Optional[float] = None,
     loss_dtype: Optional[Type[jnp.dtype]] = jnp.float32,
-) -> tuple[NamedArray, NamedArray, dict]:
+) -> tuple[NamedArray, NamedArray, Extras]:
     """
     Computes the cross-entropy loss for a language modeling example. If reduction is not None, the loss is reduced
     across the reduction axis (with reduction_axis=None meaning all axes). If reduction is None, the loss is not
@@ -283,9 +284,9 @@ def compute_next_token_loss(
     if isinstance(activations, tuple):
         activations, extras = activations
     else:
-        extras = {}
+        extras = Extras()
 
-    loss, where = maybe_fused_next_token_loss(
+    losses, where = maybe_fused_next_token_loss(
         model.Pos,
         model.Embed,
         model.Vocab,
@@ -298,4 +299,4 @@ def compute_next_token_loss(
         block_size=model.config.cross_entropy_block_size,
     )
 
-    return loss, where, extras
+    return losses, where, extras

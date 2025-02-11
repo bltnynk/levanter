@@ -1,6 +1,6 @@
 import dataclasses
 import typing
-from typing import TYPE_CHECKING, Callable, Generic, Optional, Tuple, TypeVar
+from typing import TYPE_CHECKING, Callable, Dict, Generic, Optional, Tuple, TypeVar
 
 import equinox as eqx
 import jax
@@ -14,6 +14,7 @@ from haliax.types import IntScalar, Scalar
 
 from levanter.optim.model_averaging import ModelAveraging, ModelAveragingConfig
 from levanter.utils.jax_utils import is_inexact_arrayish
+from levanter.utils.stat_utils import Arrayish
 from levanter.utils.tree_utils import inference_mode
 from levanter.utils.types import FilterTree
 
@@ -34,6 +35,9 @@ def _ensure_int_is_array(x):
         return jnp.array(x)
     else:
         return x
+
+
+AuxData = Dict[str, Arrayish]
 
 
 class TrainerState(eqx.Module, Generic[M]):
@@ -58,6 +62,9 @@ class TrainerState(eqx.Module, Generic[M]):
     mp: jmp.Policy = eqx.field(static=True)
 
     model_averaging: ModelAveraging[M] | None = None
+
+    aux_data: AuxData | None = None
+    """Aux data that should be saved with the trainer. Initial use case is for deepseekmoe's loss-free expert balancing"""
 
     @property
     def int_step(self) -> int:

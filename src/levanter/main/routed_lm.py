@@ -19,9 +19,10 @@ import levanter
 from levanter import callbacks
 from levanter.checkpoint import EpochCheckpointer, load_checkpoint
 from levanter.data.text import FIMUrlSourceConfig, mk_fim_dataset
-from levanter.models.lm_model import LmExample, RoutableLmExample
+from levanter.models.lm_model import Extras, LmExample, RoutableLmExample
 from levanter.models.loss import maybe_fused_next_token_loss
 from levanter.models.routed_qwen_model import (
+    ExpertBiasTracker,
     RQwenConfig,
     RQwenLMHeadModel,
     base_weights_mask,
@@ -34,7 +35,7 @@ from levanter.optim.util import filter_embedding_grads
 from levanter.trainer import Trainer, TrainerConfig
 from levanter.utils.jax_utils import parameter_count
 from levanter.utils.stat_utils import MeanScalar
-from levanter.utils.types import Extras, FilterSpec
+from levanter.utils.types import FilterSpec
 
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,7 @@ def compute_next_token_loss(
     router_zloss_weight: float = 0.0,
     router_zloss_normalize_by_seqlen: bool = True,
     stop_grad: bool = True,
+    expert_bias: Optional[hax.NamedArray] = None,
 ) -> tuple[hax.NamedArray, hax.NamedArray, Extras]:
     """
     Computes the cross-entropy loss for a language modeling example. If reduction is not None, the loss is reduced
@@ -89,15 +91,12 @@ def compute_next_token_loss(
     """
     assert isinstance(example, RoutableLmExample)
     # This is problematic, we don't get correctly batched ones so...
-    batch_axis = example.tokens.resolve_axis("batch")
     activations, rlogits, extras = model.routed_forward(
-        batch_axis,
-        example.tokens,
-        example.router_hs_idxs,
-        example.attn_mask,
+        example,
         key=key,
         activations=True,
         router_stop_grad=stop_grad,
+        expert_bias=expert_bias,
     )
 
     losses, mask = maybe_fused_next_token_loss(
@@ -114,9 +113,9 @@ def compute_next_token_loss(
     )
 
     if example.completion_mask is not None:
-        extras["completion_loss"] = MeanScalar.init(losses, where=example.completion_mask)
+        extras.loggable["completion_loss"] = MeanScalar.init(losses, where=example.completion_mask)
 
-    extras["all_lm_loss"] = MeanScalar.init(losses, where=mask)
+    extras.loggable["all_lm_loss"] = MeanScalar.init(losses, where=mask)
 
     if router_zloss_weight > 0.0:
         assert example.completion_mask is not None, "Need completion mask for router zloss"
@@ -126,7 +125,7 @@ def compute_next_token_loss(
             z_loss = hax.mean(z_loss, model.config.Layers)
         if router_zloss_normalize_by_seqlen:
             z_loss /= example.seq_length
-        extras["router/z_loss"] = MeanScalar.init(z_loss, where=mask)
+        extras.loggable["router/z_loss"] = MeanScalar.init(z_loss, where=mask)
         losses += router_zloss_weight * z_loss * example.completion_mask
 
     return losses, mask, extras
@@ -240,7 +239,12 @@ def main(config: TrainLmConfig):
         # For most things, we just insist you specify the config right, but tokenizers often have strange numbers of
         # tokens: gpt-2 has 50257, for example. So we round up.
 
-        state = trainer.initial_state(training_key, model_init=model_init, is_trainable=is_trainable)
+        aux_data = None
+        if config.model.lossless_exp_bias_update_rate:
+            aux_data = dict(expert_bias=ExpertBiasTracker.zero(config.model))
+        state = trainer.initial_state(
+            training_key, model_init=model_init, is_trainable=is_trainable, aux_data=aux_data
+        )
 
         seek_dataloader = True
         if int(state.step) == 0 and config.initialize_from_checkpoint_path is not None:

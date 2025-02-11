@@ -62,7 +62,7 @@ def data_cfg():
             add_router_token=False,
             predict_fim_token=False,
             predict_router_token=False,
-            cache_options=CacheOptions(target_size_per_flush=1, final_copy_cpus=1, final_copy_memory=64 * 1024 * 1024),
+            cache_options=CacheOptions(target_size_per_flush=1, final_copy_cpus=1, final_copy_memory=64 * 1024),
             predict_prefix=False,
             pack=True,
             data_format="flattened",
@@ -90,6 +90,8 @@ def test_routed_train(
     zloss_seq_norm,
     full_ft=False,
     base_params_optim=None,
+    model_kwargs={},
+    trainer_kwargs={},
 ):
     from transformers import Qwen2ForCausalLM
 
@@ -99,6 +101,7 @@ def test_routed_train(
         prefill_expert=prefill_expert,
         router_activation=router_activation,
         route_each_layer=route_each_layer,
+        **model_kwargs,
     )
     with tempfile.TemporaryDirectory() as tmpdir:
         tokenizer = data_cfg.the_tokenizer
@@ -133,6 +136,7 @@ def test_routed_train(
                 router_z_loss_weight=0.001,
                 router_z_loss_normalize_by_seqlen=zloss_seq_norm,
                 embedding_router_token_ft=False,
+                **trainer_kwargs,
             )
             routed_lm.main(config)
         finally:
@@ -152,6 +156,18 @@ def test_full_ft_routed_train(data_cfg: FIMUrlSourceConfig, expert_type):
         route_each_layer=False,
         full_ft=True,
         base_params_optim=get_opt_cfg(),
+    )
+
+
+def test_expert_bias(data_cfg: FIMUrlSourceConfig):
+    test_routed_train(
+        data_cfg,
+        expert_type=ExpertType.MLP_GLU,
+        prefill_expert=True,
+        router_activation="softmax",
+        route_each_layer=False,
+        zloss_seq_norm=True,
+        model_kwargs={"lossless_exp_bias_update_rate": 0.05, "router_act_before_topk": True},
     )
 
 
