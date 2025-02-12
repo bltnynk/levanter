@@ -79,7 +79,7 @@ def microbatched(
         @functools.wraps(loss_fn)
         def no_accum_loss_fn(*args, **kwargs):
             losses, where, extras = loss_fn(*args, **kwargs)
-            extras["seen_tokens"] = SumScalar(where.sum().scalar())
+            extras.loggable["seen_tokens"] = SumScalar(where.sum().scalar())
             return hax.mean(losses, where=where).scalar(), extras
 
         return eqx.filter_value_and_grad(no_accum_loss_fn, has_aux=True)

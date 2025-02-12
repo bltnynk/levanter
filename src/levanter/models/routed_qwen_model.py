@@ -750,28 +750,28 @@ class Router(hnn.Linear):
         linear = hnn.Linear.init(*args, **kwargs)
         return Router(linear.weight, linear.bias, linear.In, linear.Out, linear.dot_general)
 
-
-class ExpertBiasTracker(eqx.Module):
-    curr_bias: NamedArray
+@dataclass
+class ExpertBiasTracker():
+    bias: NamedArray
     load: NamedArray
 
-    def __add__(self, other: "ExpertBiasTracker") -> "ExpertBiasTracker":
-        return ExpertBiasTracker(self.curr_bias, self.load + other.load)
-
     @staticmethod
-    def zero(config: RQwenConfig):
-        return ExpertBiasTracker(hax.zeros(config.Experts), hax.zeros(config.Experts))
+    def init(config: RQwenConfig):
+        return ExpertBiasTracker(hax.zeros(config.RouterOut), hax.zeros(config.RouterOut))
 
-    def bias(self, config: RQwenConfig) -> NamedArray:
+    def __add__(self, other: "ExpertBiasTracker") -> "ExpertBiasTracker":
+        return ExpertBiasTracker(self.bias, self.load + other.load)
+
+    def update(self, expert_load: NamedArray, config: RQwenConfig) -> "ExpertBiasTracker":
         assert config.lossless_exp_bias_update_rate is not None, "Lossless expert bias update requires a rate"
-        mask = hax.ones(config.Experts, dtype=bool)
+        mask = hax.ones(config.RouterOut, dtype=bool)
         if config.prefill_expert:
-            mask = hax.ones(config.Experts, dtype=bool).at[config.Experts, : config.top_k].set(False)
-        avg_load = self.load.mean(config.Experts, where=mask)
-        update = hax.where(
-            (self.load > avg_load) & mask, -config.lossless_exp_bias_update_rate, config.lossless_exp_bias_update_rate
+            mask = mask.at[config.Experts, : config.top_k].set(False)
+        avg_load = expert_load.mean(config.Experts, where=mask)
+        new_bias = self.bias + hax.where(
+            (expert_load > avg_load) & mask, -config.lossless_exp_bias_update_rate, config.lossless_exp_bias_update_rate
         )
-        return self.curr_bias + update
+        return ExpertBiasTracker(new_bias, expert_load)
 
 
 class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerialization):
@@ -993,7 +993,7 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
 
         if expert_bias is not None:
             # Put the new bias in, per_expert_load will get aggregated across microbatches
-            extras.aux["expert_bias"] = ExpertBiasTracker(expert_bias.bias(self.config), expert_load)
+            extras.aux["expert_bias"] = expert_bias.update(expert_load, self.config)
 
         extras.loggable["router/logits"] = LogitHistogram.init(router_logits)
         return (res, router_logits.astype(compute_dtype), expert_mask.astype(compute_dtype), expert_load.astype(compute_dtype), extras)

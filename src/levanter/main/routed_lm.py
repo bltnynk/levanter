@@ -284,7 +284,7 @@ def main(config: TrainLmConfig):
 
         aux_data = None
         if config.model.lossless_exp_bias_update_rate:
-            aux_data = dict(expert_bias=ExpertBiasTracker.zero(config.model))
+            aux_data = dict(expert_bias=ExpertBiasTracker.init(config.model))
         state = trainer.initial_state(
             training_key, model_init=model_init, is_trainable=is_trainable, aux_data=aux_data
         )
