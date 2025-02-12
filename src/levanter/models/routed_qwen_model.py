@@ -933,9 +933,11 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         if self.config.router_act_before_topk or self.config.top_k == 1:
             if self.config.top_k == 1 and not self.config.router_act_before_topk:
                 warnings.warn("router_act_before_topk=False but top_k=1, doing router_act_before_topk anyways")
+
             elems = self.router_activation(router_logits, Experts)
-            topk_inp = elems + expert_bias.bias(self.config) if expert_bias is not None else router_logits
-            elems, top_k_indices = hax.top_k(topk_inp, Experts, TopK.size, TopK)
+            router_scores = elems + self.router.expert_bias if expert_bias is not None else elems
+            _, top_k_indices = hax.top_k(router_scores, Experts, TopK.size, TopK)
+            elems = hax.take(elems, Experts, top_k_indices)
         else:
             assert expert_bias is None, "Expert bias only supported with router_act_before_topk"
             elems, top_k_indices = hax.top_k(router_logits, Experts, TopK.size, TopK)
