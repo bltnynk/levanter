@@ -74,6 +74,7 @@ class CacheOptions:
 
     batch_size: int = 128
 
+    shard_tokenize_memory: int = 3 * 1024 * 1024 * 1024
     final_copy_cpus: int = 4
     final_copy_memory: int = 6 * 1024 * 1024 * 1024
 
@@ -940,7 +941,7 @@ def _core_writer_task(
                     num_cpus=processor.num_cpus,
                     num_gpus=processor.num_gpus,
                     resources=processor.resources,
-                    memory=3 * 1024 * 1024 * 1024,  # made this up
+                    memory=options.shard_tokenize_memory,  # made this up
                     name=f"tokenize::{temporary_cache_path}::{group_name}",
                     retry_exceptions=True,
                     max_retries=10,

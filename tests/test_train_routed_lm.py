@@ -5,6 +5,7 @@ import tempfile
 import jmp
 import numpy as np
 import pytest
+import ray
 from jax.random import PRNGKey
 
 import haliax as hax
@@ -23,6 +24,13 @@ from levanter.tracker.tracker import NoopConfig
 from levanter.tracker.wandb import WandbConfig
 from levanter.trainer import Trainer
 from test_utils import skip_if_no_torch
+
+
+@pytest.fixture(autouse=True, scope="session")
+def ray_init_fixture():
+    ray.init()
+    yield
+    ray.shutdown()
 
 
 def small_model_cfg(**kwargs):
@@ -46,23 +54,29 @@ def small_model_cfg(**kwargs):
     )
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def data_cfg():
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory() as data_dir:
         train_urls = [
-            tiny_test_corpus.write_fim_data(tmpdir + f"/test_data_{i}.jsonl", len=16, flattened=True) for i in range(2)
+            tiny_test_corpus.write_fim_data(data_dir + f"/test_data_{i}.jsonl", len=16, flattened=True)
+            for i in range(2)
         ]
         test_validation_jsonl = tiny_test_corpus.write_fim_data(
-            tmpdir + "/test_data_valid.jsonl", len=16, flattened=True
+            data_dir + "/test_data_valid.jsonl", len=16, flattened=True
         )
         yield FIMUrlSourceConfig(
-            cache_dir=tmpdir + "/cache",
+            cache_dir=data_dir + "/cache",
             train_urls=train_urls,
             validation_urls=[test_validation_jsonl],
             add_router_token=False,
             predict_fim_token=False,
             predict_router_token=False,
-            cache_options=CacheOptions(target_size_per_flush=1, final_copy_cpus=1, final_copy_memory=64 * 1024),
+            cache_options=CacheOptions(
+                target_size_per_flush=1,
+                final_copy_cpus=1,
+                final_copy_memory=64 * 1024,
+                shard_tokenize_memory=64 * 1024,
+            ),
             predict_prefix=False,
             pack=True,
             data_format="flattened",
@@ -82,7 +96,7 @@ def get_opt_cfg():
 @pytest.mark.parametrize("zloss_seq_norm", [True, False], ids=["zloss_seq_norm", "zloss_no_seq_norm"])
 @skip_if_no_torch
 def test_routed_train(
-    data_cfg: FIMUrlSourceConfig,
+    data_cfg,
     expert_type,
     prefill_expert,
     router_activation,
@@ -147,19 +161,20 @@ def test_routed_train(
 
 
 @pytest.mark.parametrize("expert_type", [t for t in ExpertType])
-def test_full_ft_routed_train(data_cfg: FIMUrlSourceConfig, expert_type):
+def test_full_ft_routed_train(data_cfg, expert_type):
     test_routed_train(
         data_cfg,
         expert_type=expert_type,
         prefill_expert=True,
         router_activation="softmax",
         route_each_layer=False,
+        zloss_seq_norm=True,
         full_ft=True,
         base_params_optim=get_opt_cfg(),
     )
 
 
-def test_expert_bias(data_cfg: FIMUrlSourceConfig):
+def test_expert_bias(data_cfg):
     test_routed_train(
         data_cfg,
         expert_type=ExpertType.MLP_GLU,

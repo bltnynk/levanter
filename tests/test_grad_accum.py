@@ -9,6 +9,7 @@ import haliax as hax
 import haliax.nn as hnn
 
 from levanter.grad_accum import microbatched
+from levanter.utils.types import Extras
 
 
 class Mlp(eqx.Module):
@@ -47,11 +48,11 @@ def test_accumulate_gradients_sharded(parallelism, accum_steps):
     def loss_fn(mlp, x):
         out = mlp(x)
         where = hax.ones_like(out)
-        return out, where, {}
+        return out, where, Extras()
 
     def scalar_loss_fn(mlp, x):
         out, where, _ = loss_fn(mlp, x)
-        return hax.mean(out, where=where).scalar(), {}
+        return hax.mean(out, where=where).scalar(), Extras()
 
     x = hax.random.normal(jax.random.PRNGKey(0), (Batch, In))
 
