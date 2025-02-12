@@ -302,7 +302,7 @@ class RQwenConfig(LlamaConfig):
     router_activation: str = "softmax"
 
     router_act_before_topk: bool = False
-    lossless_exp_bias_update_rate: Optional[float] = None
+    expert_bias_update_rate: Optional[float] = None
 
     ExpertRank = property(lambda self: Axis("expert_rank", self.expert_rank))
     TopK = property(lambda self: Axis("top_k", self.top_k))
@@ -356,7 +356,7 @@ class RQwenConfig(LlamaConfig):
             "sigmoid",
             "sigmoid_norm",
         ], f"Invalid router activation: {self.router_activation}"
-        if self.lossless_exp_bias_update_rate is not None:
+        if self.expert_bias_update_rate is not None:
             assert self.router_act_before_topk, "Lossless expert bias update requires router_act_before_topk"
 
     def hf_checkpoint_converter(self) -> HFCheckpointConverter["RQwenConfig"]:  # type: ignore
@@ -763,13 +763,13 @@ class ExpertBiasTracker():
         return ExpertBiasTracker(self.bias, self.load + other.load)
 
     def update(self, expert_load: NamedArray, config: RQwenConfig) -> "ExpertBiasTracker":
-        assert config.lossless_exp_bias_update_rate is not None, "Lossless expert bias update requires a rate"
+        assert config.expert_bias_update_rate is not None, "Lossless expert bias update requires a rate"
         mask = hax.ones(config.RouterOut, dtype=bool)
         if config.prefill_expert:
             mask = mask.at[config.Experts, : config.top_k].set(False)
         avg_load = expert_load.mean(config.Experts, where=mask)
         new_bias = self.bias + hax.where(
-            (expert_load > avg_load) & mask, -config.lossless_exp_bias_update_rate, config.lossless_exp_bias_update_rate
+            (expert_load > avg_load) & mask, -config.expert_bias_update_rate, config.expert_bias_update_rate
         )
         return ExpertBiasTracker(new_bias, expert_load)
 
