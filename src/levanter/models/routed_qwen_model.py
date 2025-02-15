@@ -926,7 +926,7 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
             if self.config.top_k == 1 and not self.config.router_act_before_topk:
                 warnings.warn("router_act_before_topk=False but top_k=1, doing router_act_before_topk anyways")
             router_acts = self.router_activation(router_logits, Experts)
-            topk_inp = router_acts + expert_bias.curr_bias(self.config) if expert_bias is not None else router_logits
+            topk_inp = router_acts + expert_bias.curr_bias(self.config) if expert_bias is not None else router_acts
             _, top_k_indices = hax.top_k(topk_inp, Experts, TopK.size, TopK)
             expert_mask = create_expert_mask_from_acts(TopK, Experts, top_k_indices, router_acts.astype(compute_dtype))
         else:
