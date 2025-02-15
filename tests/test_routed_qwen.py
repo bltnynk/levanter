@@ -22,6 +22,7 @@ from levanter.models.routed_qwen_model import (
     RQwenLMHeadModel,
     base_weights_mask,
     create_expert_mask,
+    create_expert_mask_from_acts,
     reinit_expert_weights,
     routed_experts_mask,
     routed_experts_trainable_params_filter,
@@ -330,28 +331,34 @@ def test_create_expert_mask(with_layers):
         MaskShape = (Batch, Pos, Layer, Expert)
     activations = hax.random.uniform(jax.random.PRNGKey(0), MaskShape)
     elems, inds = hax.top_k(activations, Expert, k=TopK.size, new_axis=TopK)
-    mask = create_expert_mask(TopK, Expert, inds, elems)
 
-    def get(x, *args):
-        return x.__getitem__(args)
+    def check_mask(mask):
+        def get(x, *args):
+            return x.__getitem__(args)
 
-    def check_idx(*idxs):
-        bp_inds: List[int] = get(inds, *idxs).tolist()
-        for e in range(Expert.size):
-            if e in bp_inds:
-                idx = bp_inds.index(e)
-                val = get(elems, *idxs, TopK, idx)
-                assert get(mask, *idxs, Expert, e) == val
-            else:
-                assert get(mask, *idxs, Expert, e) == 0.0
+        def check_idx(*idxs):
+            bp_inds: List[int] = get(inds, *idxs).tolist()
+            for e in range(Expert.size):
+                if e in bp_inds:
+                    idx = bp_inds.index(e)
+                    val = get(elems, *idxs, TopK, idx)
+                    assert get(mask, *idxs, Expert, e) == val
+                else:
+                    assert get(mask, *idxs, Expert, e) == 0.0
 
-    for b in range(Batch.size):
-        for p in range(Pos.size):
-            if with_layers:
-                for li in range(Layer.size):
-                    check_idx(Batch, b, Pos, p, Layer, li)
-            else:
-                check_idx(Batch, b, Pos, p)
+        for b in range(Batch.size):
+            for p in range(Pos.size):
+                if with_layers:
+                    for li in range(Layer.size):
+                        check_idx(Batch, b, Pos, p, Layer, li)
+                else:
+                    check_idx(Batch, b, Pos, p)
+
+    mask1 = create_expert_mask(TopK, Expert, inds, elems)
+    check_mask(mask1)
+
+    mask2 = create_expert_mask_from_acts(TopK, Expert, inds, activations)
+    check_mask(mask2)
 
 
 def test_weight_masks():

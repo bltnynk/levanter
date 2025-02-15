@@ -240,7 +240,7 @@ def main(config: TrainLmConfig):
         # tokens: gpt-2 has 50257, for example. So we round up.
 
         aux_data = None
-        if config.model.lossless_exp_bias_update_rate:
+        if config.model.expert_bias_update_rate:
             aux_data = dict(expert_bias=ExpertBiasTracker.zero(config.model))
         state = trainer.initial_state(
             training_key, model_init=model_init, is_trainable=is_trainable, aux_data=aux_data
