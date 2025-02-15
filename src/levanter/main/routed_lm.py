@@ -124,7 +124,7 @@ def compute_next_token_loss(
         if model.config.Layers in z_loss.axes:
             z_loss = hax.mean(z_loss, model.config.Layers)
         if router_zloss_normalize_by_seqlen:
-            z_loss /= example.seq_length
+            z_loss *= example.completion_first_token_mask
         extras.loggable["router/z_loss"] = MeanScalar.init(z_loss, where=mask)
         losses += router_zloss_weight * z_loss * example.completion_mask
 

@@ -56,8 +56,9 @@ class IndexCountUnique(eqx.Module):
     seen: jnp.ndarray
 
     @staticmethod
-    def init(inds: hax.NamedArray, axis: hax.Axis) -> "IndexCountUnique":
-        seen = hax.zeros(axis, dtype=jnp.bool).at[axis, inds.array.flatten()].set(True)
+    def init(mask: hax.NamedArray, axis: hax.Axis) -> "IndexCountUnique":
+        other_axes = [ax for ax in mask.axes if ax.name != axis.name]
+        seen = mask.sum(axis=other_axes) > 0
         return IndexCountUnique(seen)
 
     def item(self) -> int:

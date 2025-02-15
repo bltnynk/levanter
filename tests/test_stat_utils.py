@@ -3,6 +3,7 @@ from jax.random import PRNGKey
 
 import haliax as hax
 
+from levanter.models.routed_qwen_model import create_expert_mask_from_acts
 from levanter.utils.stat_utils import IndexCountHistogram, IndexCountUnique, MeanScalar, RunningMean
 
 
@@ -20,12 +21,15 @@ def test_topk_selected():
     acc3 = acc1 + acc2
     assert acc3.hist.bucket_counts.tolist() == [3, 2, 2, 1]
 
-    _, inds1 = hax.top_k(logits1, Ax, 2)
-    _, inds2 = hax.top_k(logits2, Ax, 2)
+    TopK = hax.Axis("TopK", 2)
+    _, inds1 = hax.top_k(logits1, Ax, TopK.size, TopK)
+    mask1 = create_expert_mask_from_acts(TopK, Ax, inds1, logits1)
+    _, inds2 = hax.top_k(logits2, Ax, TopK.size, TopK)
+    mask2 = create_expert_mask_from_acts(TopK, Ax, inds2, logits2)
 
-    acc1 = IndexCountUnique.init(inds1, Ax)
+    acc1 = IndexCountUnique.init(mask1, Ax)
     assert acc1.item() == 3
-    acc2 = IndexCountUnique.init(inds2, Ax)
+    acc2 = IndexCountUnique.init(mask2, Ax)
     assert acc2.item() == 4
     acc3 = acc1 + acc2
     assert acc3.item() == 4

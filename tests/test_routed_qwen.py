@@ -15,6 +15,7 @@ from haliax.partitioning import ResourceAxis
 from levanter.models.attention import AttentionMask
 from levanter.models.lm_model import RoutableLmExample
 from levanter.models.routed_qwen_model import (
+    ExpertBiasTracker,
     ExpertInit,
     ExpertType,
     RLoraLinear,
@@ -27,6 +28,8 @@ from levanter.models.routed_qwen_model import (
     routed_experts_mask,
     routed_experts_trainable_params_filter,
 )
+from levanter.utils.stat_utils import IndexCountHistogram, IndexCountUnique
+from levanter.utils.types import Extras
 from test_utils import skip_if_no_torch
 
 
@@ -359,6 +362,67 @@ def test_create_expert_mask(with_layers):
 
     mask2 = create_expert_mask_from_acts(TopK, Expert, inds, activations)
     check_mask(mask2)
+
+
+@pytest.mark.parametrize("with_expert_bias", [True, False])
+def test_expert_mask_creation(with_expert_bias):
+    config = RQwenConfig(
+        seq_len=64,
+        num_layers=2,
+        hidden_dim=16,
+        intermediate_dim=32,
+        num_heads=2,
+        num_kv_heads=2,
+        tie_word_embeddings=True,
+        expert_type=ExpertType.MLP_GLU,
+        expert_init=ExpertInit.NONZERO,  # Experts change output
+        expert_rank=1,
+        num_experts=8,
+        top_k=2,
+        router_act_before_topk=True,
+        # Test with extremely high update rate
+        expert_bias_update_rate=1e6 if with_expert_bias else None,
+    )
+
+    Vocab = hax.Axis("vocab", 100)
+    model: RQwenLMHeadModel = config.build(Vocab, key=jax.random.PRNGKey(0))
+    Batch, Pos = hax.Axis("batch", 1), config.Pos
+    tokens = hax.random.randint(jax.random.PRNGKey(0), (Batch, Pos), 0, Vocab.size)
+    seq_start = 16
+    hs_idxs = -hax.ones_like(tokens)
+    hs_idxs = hs_idxs.at[Batch, 0, Pos, seq_start:].set(seq_start - 1)
+    first_token_mask = hax.zeros_like(tokens).at[Batch, 0, Pos, seq_start].set(1)
+    completion_mask = hax.zeros_like(tokens).at[Batch, 0, Pos, seq_start:].set(1)
+    example = RoutableLmExample(
+        tokens,
+        hax.ones_like(tokens),
+        router_hs_idxs=hs_idxs,
+        completion_mask=completion_mask,
+        completion_first_token_mask=first_token_mask,
+    )
+
+    extras = Extras()
+    expert_bias = None
+    if with_expert_bias:
+        prev_bias = hax.zeros(config.Experts)
+        # Load all but the last top_k. Update bias is high so should select only the last two
+        prev_load = hax.zeros(config.Experts).at[config.Experts, : -config.top_k].set(1.0)
+        expert_bias = ExpertBiasTracker(prev_bias, prev_load)
+        extras.loggable["expert_bias"] = expert_bias
+    router_logits = model.router_logits(Batch, tokens, hs_idxs, example.attn_mask)
+    router_acts = model.router_activation(router_logits, config.Experts).astype(np.float16)
+    mask = model.get_expert_mask(router_logits, hs_idxs, extras, np.float16, expert_bias, example)
+    index_hist: IndexCountHistogram = extras.loggable["router/index_hist"]
+    used_count: IndexCountUnique = extras.loggable["router/used_count"]
+    assert index_hist.hist.bucket_counts.sum().item() == config.top_k  # Only routes one sequence
+    assert used_count.item() == config.top_k  # Only routes one sequence
+    assert ((mask == 0.0) | (mask == router_acts)).all()
+    if with_expert_bias:
+        assert (mask[config.Experts, : -config.top_k] == 0.0).all(), "Only the last top_k should be selected"
+        new_expert_bias: ExpertBiasTracker = extras.aux["expert_bias"]
+        assert (new_expert_bias.prev_bias == expert_bias.curr_bias(config)).all()
+        load = hax.zeros(config.Experts).at[config.Experts, -config.top_k :].set(1.0)
+        assert (new_expert_bias.prev_load == load).all()
 
 
 def test_weight_masks():

@@ -945,28 +945,29 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         else:
             expert_mask = hax.where(router_hs_idxs < 0, 0.0, expert_mask).astype(compute_dtype)
 
+        assert example.completion_first_token_mask is not None, "Need completion_first_token_mask for expert mask"
+        first_token_expert_mask = hax.where(
+            example.completion_first_token_mask.broadcast_to(expert_mask.axes),
+            expert_mask,
+            0.0,
+        )
+        expert_mask_used = first_token_expert_mask > 0
+
         if self.config.route_each_layer:
-            expert_mask_used = expert_mask > 0
             for i in range(self.config.Layers.size):
                 extras.loggable[f"router/index_hist_{i:0>2}"] = IndexCountHistogram.init(
                     expert_mask_used[self.config.Layers, i].sum(axis=(Batch, Pos))
                 )
-                extras.loggable[f"router/used_count_{i:0>2}"] = IndexCountUnique.init(
-                    top_k_indices[self.config.Layers, i], Experts
-                )
-            else:
-                # TODO: can we do this by sequence rather than by token? I.e. adjust for the seq length?
-                # Maybe what we want is a 'first token mask' that is 1 for the first token in the completion of sequence
-                # and zero otherwise. That would get rid of a lot of hacking stuff around.
-                extras.loggable["router/index_hist"] = IndexCountHistogram.init(
-                    (expert_mask > 0).sum(axis=(Batch, Pos))
-                )
-                extras.loggable["router/used_count"] = IndexCountUnique.init(top_k_indices, Experts)
+                extras.loggable[f"router/used_count_{i:0>2}"] = IndexCountUnique.init(expert_mask_used, Experts)
+        else:
+            # TODO: can we do this by sequence rather than by token? I.e. adjust for the seq length?
+            # Maybe what we want is a 'first token mask' that is 1 for the first token in the completion of sequence
+            # and zero otherwise. That would get rid of a lot of hacking stuff around.
+            extras.loggable["router/index_hist"] = IndexCountHistogram.init(expert_mask_used.sum(axis=(Batch, Pos)))
+            extras.loggable["router/used_count"] = IndexCountUnique.init(expert_mask_used, Experts)
 
         if expert_bias is not None:
-            per_expert_load = ((expert_mask > 0) / example.seq_length).sum(
-                axis=[Batch, Pos], where=example.completion_mask
-            )
+            per_expert_load = expert_mask_used.sum(axis=(Batch, Pos))
             # Put the new bias in, per_expert_load will get aggregated across microbatches
             extras.aux["expert_bias"] = ExpertBiasTracker(expert_bias.curr_bias(self.config), per_expert_load)
 
