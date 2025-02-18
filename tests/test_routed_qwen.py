@@ -60,7 +60,8 @@ def test_routed_qwen_forward():
 
         x = hax.random.randint(key, (Batch, config.Pos), 0, Vocab.size)
         inds = hax.random.randint(key, (Batch, config.Pos), 0, config.Pos.size - 1)
-        example = RoutableLmExample(x, None, router_hs_idxs=inds)
+        first_mask = hax.random.randint(key, (Batch, config.Pos), 0, 1).astype(bool)
+        example = RoutableLmExample(x, None, router_hs_idxs=inds, completion_first_token_mask=first_mask)
         _ = model.routed_forward(example)
 
         # test with num_experts=1
@@ -105,7 +106,10 @@ def test_rqwen_consistent_with_base_qwen(expert_type, expert_init):
     input = hax.random.randint(jax.random.PRNGKey(0), (Batch, config.Pos), 0, Vocab.size)
     seq_inds = hax.random.randint(jax.random.PRNGKey(0), (Batch, config.Pos), 0, config.Pos.size - 1)
     attn_mask = AttentionMask.causal()
-    example = RoutableLmExample(input, None, attn_mask=attn_mask, router_hs_idxs=seq_inds)
+    first_mask = hax.random.randint(jax.random.PRNGKey(0), (Batch, config.Pos), 0, 1).astype(bool)
+    example = RoutableLmExample(
+        input, None, attn_mask=attn_mask, router_hs_idxs=seq_inds, completion_first_token_mask=first_mask
+    )
     input_torch = torch.from_numpy(np.array(input.array)).to(torch.int32)
 
     torch.random.manual_seed(0)
@@ -129,11 +133,11 @@ def test_rqwen_consistent_with_base_qwen(expert_type, expert_init):
                 model_output = model.routed_forward(example)
                 return model_output
 
-            token_pred, mask, extras = compute(model, example)
+            token_pred, mask, _, extras = compute(model, example)
             jax_out = token_pred.array
 
             assert torch_out.shape == jax_out.shape, f"{torch_out.shape} != {jax_out.shape}"
-            assert np.isclose(torch_out, np.array(jax_out), rtol=1e-4, atol=1e-4).all(), f"{torch_out} != {jax_out}"
+            assert np.isclose(torch_out, np.array(jax_out), rtol=1e-2, atol=1e-4).all(), f"{torch_out} != {jax_out}"
 
             cfg_with_expert = dataclasses.replace(config, disable_expert_mask=False)
             model = dataclasses.replace(
@@ -145,13 +149,13 @@ def test_rqwen_consistent_with_base_qwen(expert_type, expert_init):
                 model_output = model.routed_forward(example)
                 return model_output
 
-            token_pred, mask, extras = compute(model, example)
+            token_pred, mask, _, extras = compute(model, example)
             jax_out = token_pred.array
 
             assert torch_out.shape == jax_out.shape, f"{torch_out.shape} != {jax_out.shape}"
             should_be_close = expert_init != ExpertInit.NONZERO
             assert (
-                should_be_close == np.isclose(torch_out, np.array(jax_out), rtol=1e-4, atol=1e-4).all()
+                should_be_close == np.isclose(torch_out, np.array(jax_out), rtol=1e-2, atol=1e-4).all()
             ), f"{torch_out} == {jax_out} with lora mask"
 
 

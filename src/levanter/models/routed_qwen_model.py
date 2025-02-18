@@ -761,7 +761,7 @@ class ExpertBiasTracker(eqx.Module):
 
     @staticmethod
     def zero(config: RQwenConfig):
-        return ExpertBiasTracker(hax.zeros(config.Experts), hax.zeros(config.Experts))
+        return ExpertBiasTracker(hax.zeros(config.RouterOut), hax.zeros(config.RouterOut))
 
     def curr_bias(self, config: RQwenConfig) -> NamedArray:
         """This computes the bias for the current batch based on the previous bias/load. XLA should optimize this."""
@@ -981,7 +981,7 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         router_stop_grad: bool = True,
         activations: bool = False,
         expert_bias: Optional[ExpertBiasTracker] = None,
-    ) -> tuple[NamedArray, NamedArray, Extras]:
+    ) -> tuple[NamedArray, NamedArray, NamedArray | None, Extras]:
         k_head, k_rout = maybe_rng_split(key, 2)
         Batch = example.tokens.resolve_axis("batch")
         compute_dtype = self.embeddings.token_embeddings.weight.dtype
@@ -1008,7 +1008,7 @@ class RQwenLMHeadModel(LmHeadModel[RQwenConfig], ModuleWithStateDictSerializatio
         else:
             res = self(input_ids, attn_mask=attn_mask, key=k_head, expert_mask=expert_mask)
 
-        return (res, router_logits.astype(compute_dtype), extras)
+        return (res, router_logits.astype(compute_dtype), expert_mask, extras)
 
     def get_lm_head(self) -> hax.NamedArray:
         if self.lm_head is None:

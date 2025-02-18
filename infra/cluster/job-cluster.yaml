@@ -33,7 +33,7 @@ available_node_types:
     # GCP-Specific Configuration; by default, Ray will configure unspecified fields (e.g., subnets, ssh-keys)
     #   => Ref: https://cloud.google.com/compute/docs/reference/rest/v1/instances/insert
     node_config:
-      machineType: n1-highmem-4
+      machineType: n2-highmem-4
 
       # Create a Persistent Disk w/ 100 GBs
       disks:

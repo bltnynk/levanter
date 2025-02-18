@@ -182,7 +182,7 @@ def test_expert_bias(data_cfg):
         router_activation="softmax",
         route_each_layer=False,
         zloss_seq_norm=True,
-        model_kwargs={"lossless_exp_bias_update_rate": 0.05, "router_act_before_topk": True},
+        model_kwargs={"expert_bias_update_rate": 0.05, "router_act_before_topk": True},
     )
 
 

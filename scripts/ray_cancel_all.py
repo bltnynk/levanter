@@ -38,7 +38,8 @@ async def cancel_and_delete_ray_jobs():
         return
 
     running_jobs = [job_id for job_id, status in jobs if status in ["RUNNING", "PENDING"]]
-    stopped_jobs = [job_id for job_id, status in jobs if status not in ["RUNNING", "PENDING"]]
+    # stopped_jobs = [job_id for job_id, status in jobs if status not in ["RUNNING", "PENDING"]]
+    stopped_jobs = []
 
     # Cancel running jobs
     semaphore = asyncio.Semaphore(8)
