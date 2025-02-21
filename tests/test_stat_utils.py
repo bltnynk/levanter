@@ -3,7 +3,7 @@ from jax.random import PRNGKey
 
 import haliax as hax
 
-from levanter.models.routed_qwen_model import create_expert_mask_from_acts
+from levanter.routed_models.routed import create_expert_mask_from_acts
 from levanter.utils.stat_utils import IndexCountHistogram, IndexCountUnique, MeanScalar, RunningMean
 
 
