@@ -19,14 +19,14 @@ from levanter.models.gpt2 import ACT2FN
 from levanter.models.llama import LlamaConfig, LlamaEmbedding, LlamaRMSNorm
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.models.rotary import RotaryEmbeddingsConfig
-from levanter.models.routed_qwen_model import Router
 from levanter.routed_models.routed import (
     ExpertType,
     MaybeRoutedLinear,
     RLoraLinear,
-    RoutableLmConfigMixin,
-    RoutableLmModel,
+    RoutableLmConfig,
+    RoutableLmHeadModel,
     RoutedMlpExperts,
+    Router,
     make_linear,
 )
 from levanter.utils.flop_utils import lm_flops_per_token
@@ -40,7 +40,7 @@ from transformers import Qwen2Config as HfQwenConfig  # noqa: E402
 
 @LmConfig.register_subclass("rlora_qwen")
 @dataclass(frozen=True)
-class RQwenConfig(LlamaConfig, RoutableLmConfigMixin):
+class RQwenConfig(LlamaConfig, RoutableLmConfig):
     """Extends LlamaConfig with Qwen specific features"""
 
     use_sliding_window: bool = False
@@ -377,7 +377,8 @@ class RQwenTransformer(eqx.Module):
         return x
 
 
-class RQwenLMHeadModel(RoutableLmModel, LmHeadModel[RQwenConfig], ModuleWithStateDictSerialization):
+class RQwenLMHeadModel(RoutableLmHeadModel, ModuleWithStateDictSerialization):
+    router: Router
     transformer: RQwenTransformer
     embeddings: LlamaEmbedding  # Can reuse Llama embeddings
     lm_head: Optional[hnn.Linear]
@@ -395,6 +396,13 @@ class RQwenLMHeadModel(RoutableLmModel, LmHeadModel[RQwenConfig], ModuleWithStat
         router = Router.init(In=config.Embed, Out=config.RouterOut, key=k_rout, use_bias=False, out_first=True)
 
         return RQwenLMHeadModel(router, transformer, embeddings, lm_head)
+
+    def get_router(self) -> Router:
+        return self.router
+
+    @property
+    def compute_dtype(self):
+        return self.embeddings.token_embeddings.weight.dtype
 
     @property
     def config(self):

@@ -2,7 +2,7 @@ import abc
 import dataclasses
 import warnings
 from enum import Enum
-from typing import Callable, Dict, Optional, Union
+from typing import Callable, Dict, Generic, Optional, TypeVar, Union
 
 import equinox as eqx
 import jax
@@ -19,10 +19,14 @@ from haliax.state_dict import ModuleWithStateDictSerialization
 
 from levanter.models.attention import AttentionMask
 from levanter.models.gpt2 import ACT2FN
-from levanter.models.lm_model import RoutableLmExample
+from levanter.models.lm_model import LmConfig, LmHeadModel, RoutableLmExample
 from levanter.utils.jax_utils import key_iterator
 from levanter.utils.stat_utils import IndexCountHistogram, IndexCountUnique, LogitHistogram
 from levanter.utils.types import Extras
+
+
+LmT = TypeVar("LmT", bound="LmHeadModel")
+LmConfigT = TypeVar("LmConfigT", bound="RoutableLmConfig")
 
 
 class ExpertInit(Enum):
@@ -44,7 +48,8 @@ class ExpertType(Enum):
     MLP_GLU = "mlp_glu"
 
 
-class RoutableLmConfigMixin(abc.ABC):
+@dataclasses.dataclass(frozen=True)
+class RoutableLmConfig(LmConfig[LmT], abc.ABC):
     num_experts: int = 64
     expert_rank: int = 16
     top_k: int = 4
@@ -67,19 +72,9 @@ class RoutableLmConfigMixin(abc.ABC):
     ExpertRank = property(lambda self: Axis("expert_rank", self.expert_rank))
     TopK = property(lambda self: Axis("top_k", self.top_k))
 
-    @abc.abstractmethod
     @property
+    @abc.abstractmethod
     def Layers(self) -> Axis:
-        pass
-
-    @property
-    @abc.abstractmethod
-    def Pos(self) -> Axis:
-        pass
-
-    @property
-    @abc.abstractmethod
-    def Embed(self) -> Axis:
         pass
 
     @property
@@ -140,12 +135,14 @@ class RoutableLmConfigMixin(abc.ABC):
             assert self.router_act_before_topk, "Lossless expert bias update requires router_act_before_topk"
 
 
-class RoutableLmModel(abc.ABC, eqx.Module):
-    router: "Router"
+class RoutableLmHeadModel(Generic[LmConfigT], LmHeadModel[LmConfigT], abc.ABC):
+    @abc.abstractmethod
+    def get_router(self) -> "Router":
+        pass
 
     @property
     @abc.abstractmethod
-    def config(self) -> RoutableLmConfigMixin:
+    def config(self) -> RoutableLmConfig:
         pass
 
     @property
@@ -158,6 +155,17 @@ class RoutableLmModel(abc.ABC, eqx.Module):
         self,
         input_ids: NamedArray,
         attn_mask: Optional[AttentionMask | NamedArray] = None,
+        expert_mask: Optional[NamedArray] = None,
+        *,
+        key=None,
+    ) -> NamedArray:
+        pass
+
+    @abc.abstractmethod
+    def __call__(
+        self,
+        input_ids: NamedArray,
+        attn_mask: Optional[Union[NamedArray, AttentionMask]] = None,
         expert_mask: Optional[NamedArray] = None,
         *,
         key=None,
@@ -200,7 +208,7 @@ class RoutableLmModel(abc.ABC, eqx.Module):
             # Get the logits from the router
             if router_stop_grad:
                 router_inputs = jax.lax.stop_gradient(router_inputs)
-            router_logits = self.router(router_inputs, key=k_rout)
+            router_logits = self.get_router()(router_inputs, key=k_rout)
             router_logits = router_logits.astype(jnp.float32)
         else:
             router_logits = hax.zeros(self.config.mask_axes(Batch), dtype=jnp.float32)
@@ -284,8 +292,8 @@ class RoutableLmModel(abc.ABC, eqx.Module):
         example: RoutableLmExample,
         *,
         key=None,
-        router_stop_grad: bool = True,
         activations: bool = False,
+        router_stop_grad: bool = True,
         expert_bias: Optional["ExpertBiasTracker"] = None,
     ) -> tuple[NamedArray, NamedArray, NamedArray | None, Extras]:
         k_head, k_rout = maybe_rng_split(key, 2)
@@ -337,10 +345,10 @@ class ExpertBiasTracker(eqx.Module):
         return ExpertBiasTracker(self.prev_bias, self.prev_load + other.prev_load)
 
     @staticmethod
-    def zero(config: RoutableLmConfigMixin):
+    def zero(config: RoutableLmConfig):
         return ExpertBiasTracker(hax.zeros(config.RouterOut), hax.zeros(config.RouterOut))
 
-    def curr_bias(self, config: RoutableLmConfigMixin) -> NamedArray:
+    def curr_bias(self, config: RoutableLmConfig) -> NamedArray:
         """This computes the bias for the current batch based on the previous bias/load. XLA should optimize this."""
         assert config.expert_bias_update_rate is not None, "Lossless expert bias update requires a rate"
         mask = hax.ones(config.RouterOut, dtype=bool)
@@ -361,7 +369,7 @@ class RoutedMlpExperts(eqx.Module):
 
     @staticmethod
     def init(
-        config: RoutableLmConfigMixin,
+        config: RoutableLmConfig,
         *,
         key,
     ) -> "RoutedMlpExperts":
@@ -546,7 +554,7 @@ def re_init_linear(x: hnn.Linear, init_scale=1.0, *, key):
     return dataclasses.replace(x, weight=weight)
 
 
-def reinit_expert_weights(config: RoutableLmConfigMixin, model: eqx.Module, *, key: jax.random.PRNGKey) -> eqx.Module:
+def reinit_expert_weights(config: RoutableLmConfig, model: eqx.Module, *, key: jax.random.PRNGKey) -> eqx.Module:
     """Re-initialize all LoRA weights in the model while preserving other weights."""
 
     keys = key_iterator(key)
@@ -587,7 +595,7 @@ def reinit_expert_weights(config: RoutableLmConfigMixin, model: eqx.Module, *, k
 
 
 def make_linear(
-    config: RoutableLmConfigMixin,
+    config: RoutableLmConfig,
     In: AxisSpec,
     Out: AxisSpec,
     Inter: AxisSpec,

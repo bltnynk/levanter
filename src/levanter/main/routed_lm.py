@@ -21,17 +21,17 @@ from levanter.checkpoint import EpochCheckpointer, load_checkpoint
 from levanter.data.text import FIMUrlSourceConfig, mk_fim_dataset
 from levanter.models.lm_model import Extras, LmExample, RoutableLmExample
 from levanter.models.loss import maybe_fused_next_token_loss
-from levanter.models.routed_qwen_model import (
+from levanter.optim import AdamConfig, OptimizerConfig
+from levanter.optim.util import filter_embedding_grads
+from levanter.routed_models.qwen import RQwenConfig, RQwenLMHeadModel
+from levanter.routed_models.routed import (
     ExpertBiasTracker,
-    RQwenConfig,
-    RQwenLMHeadModel,
+    RoutableLmConfig,
     base_weights_mask,
     reinit_expert_weights,
     routed_experts_mask,
     routed_experts_trainable_params_filter,
 )
-from levanter.optim import AdamConfig, OptimizerConfig
-from levanter.optim.util import filter_embedding_grads
 from levanter.trainer import Trainer, TrainerConfig
 from levanter.utils.jax_utils import parameter_count
 from levanter.utils.stat_utils import MeanScalar
@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 class TrainLmConfig:
     data: FIMUrlSourceConfig = field(default_factory=FIMUrlSourceConfig)
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
-    model: RQwenConfig = field(default_factory=RQwenConfig)
+    model: RoutableLmConfig = field(default_factory=RQwenConfig)
     optimizer: OptimizerConfig = field(default_factory=AdamConfig)
     initialize_from_hf: Optional[str] = None
     initialize_from_checkpoint_path: Optional[str] = None
@@ -131,7 +131,6 @@ def compute_next_token_loss(
     activations, rlogits, expert_mask, extras = model.routed_forward(
         example,
         key=key,
-        activations=True,
         router_stop_grad=stop_grad,
         expert_bias=expert_bias,
     )

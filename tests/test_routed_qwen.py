@@ -14,13 +14,12 @@ from haliax.partitioning import ResourceAxis
 
 from levanter.models.attention import AttentionMask
 from levanter.models.lm_model import RoutableLmExample
-from levanter.models.routed_qwen_model import (
+from levanter.routed_models.qwen import RQwenConfig, RQwenLMHeadModel
+from levanter.routed_models.routed import (
     ExpertBiasTracker,
     ExpertInit,
     ExpertType,
     RLoraLinear,
-    RQwenConfig,
-    RQwenLMHeadModel,
     base_weights_mask,
     create_expert_mask,
     create_expert_mask_from_acts,
