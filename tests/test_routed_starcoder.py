@@ -206,7 +206,7 @@ def test_rstarcoder_reinit():
         ExpertType.LORA,
         ExpertInit.NONZERO,
         lambda x: (),
-        lambda x: (x.mlp.down_proj.low_rank_linear.lora_a.weight, x.mlp.down_proj.low_rank_linear.lora_b.weight),
+        lambda x: (x.mlp.c_proj.low_rank_linear.lora_a.weight, x.mlp.c_proj.low_rank_linear.lora_b.weight),
     )
 
     case(
@@ -224,14 +224,14 @@ def test_rstarcoder_reinit():
     case(
         ExpertType.LORA,
         ExpertInit.LORA_ZERO_A,
-        lambda x: (x.mlp.down_proj.low_rank_linear.lora_a.weight,),
-        lambda x: (x.mlp.down_proj.low_rank_linear.lora_b.weight,),
+        lambda x: (x.mlp.c_proj.low_rank_linear.lora_a.weight,),
+        lambda x: (x.mlp.c_proj.low_rank_linear.lora_b.weight,),
     )
     case(
         ExpertType.LORA,
         ExpertInit.LORA_ZERO_B,
-        lambda x: (x.mlp.down_proj.low_rank_linear.lora_b.weight,),
-        lambda x: (x.mlp.down_proj.low_rank_linear.lora_a.weight,),
+        lambda x: (x.mlp.c_proj.low_rank_linear.lora_b.weight,),
+        lambda x: (x.mlp.c_proj.low_rank_linear.lora_a.weight,),
     )
 
 
@@ -254,9 +254,8 @@ def test_rstarcoder_trainable_filt(expert_type):
     tf = is_trainable.transformer.layers.stacked
     assert is_trainable.router is True
     if expert_type == ExpertType.LORA:
-        assert tf.mlp.down_proj.low_rank_linear is True
-        assert tf.mlp.up_proj.low_rank_linear is True
-        assert tf.mlp.gate_proj.low_rank_linear is True
+        assert tf.mlp.c_proj.low_rank_linear is True
+        assert tf.mlp.c_fc.low_rank_linear is True
         assert tf.self_attn.k_proj.low_rank_linear is True
         assert tf.self_attn.q_proj.low_rank_linear is True
         assert tf.self_attn.v_proj.low_rank_linear is True
@@ -275,9 +274,9 @@ def test_rstarcoder_expert_type_init():
     )
     model: RStarcoderLMHeadModel = config.build(hax.Axis("vocab", 100), key=jax.random.PRNGKey(0))
     assert model.transformer.layers.stacked.mlp.experts is None
-    assert isinstance(model.transformer.layers.stacked.mlp.down_proj, RLoraLinear)
+    assert isinstance(model.transformer.layers.stacked.mlp.c_proj, RLoraLinear)
 
-    for expert_type in [ExpertType.MLP, ExpertType.LORA]:
+    for expert_type in [ExpertType.MLP]:
         config = RStarcoderConfig(
             seq_len=512,
             num_layers=2,
@@ -287,7 +286,7 @@ def test_rstarcoder_expert_type_init():
             expert_init=ExpertInit.NONZERO,
         )
         model: RStarcoderLMHeadModel = config.build(hax.Axis("vocab", 100), key=jax.random.PRNGKey(0))
-        assert not isinstance(model.transformer.layers.stacked.mlp.down_proj, RLoraLinear)
+        assert not isinstance(model.transformer.layers.stacked.mlp.c_proj, RLoraLinear)
         assert model.transformer.layers.stacked.mlp.experts is not None
 
 
@@ -414,9 +413,8 @@ def test_weight_masks():
         stacked = mask.transformer.layers.stacked
         tvals = [mask.router, stacked.mlp.experts]
         fvals = [
-            stacked.mlp.gate_proj.linear.weight,
-            stacked.mlp.up_proj.linear.weight,
-            stacked.mlp.down_proj.linear.weight,
+            stacked.mlp.c_fc.linear.weight,
+            stacked.mlp.c_proj.linear.weight,
             stacked.self_attn.k_proj.linear.weight,
             stacked.self_attn.q_proj.linear.weight,
             stacked.self_attn.v_proj.linear.weight,

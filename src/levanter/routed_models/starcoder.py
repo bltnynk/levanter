@@ -16,7 +16,7 @@ from haliax.state_dict import ModuleWithStateDictSerialization
 from levanter.compat.hf_checkpoints import HFCheckpointConverter
 from levanter.models.attention import AttentionMask, dot_product_attention
 from levanter.models.gpt2 import ACT2FN
-from levanter.models.llama import LlamaConfig, LlamaEmbedding, LlamaRMSNorm
+from levanter.models.llama import LlamaConfig, LlamaEmbedding
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.models.rotary import RotaryEmbeddingsConfig
 from levanter.routed_models.routed import (
@@ -296,8 +296,8 @@ class RStarcoderDecoderLayer(eqx.Module):
     config: RStarcoderConfig = eqx.static_field()
     self_attn: RStarcoderAttention
     mlp: RStarcoderMlp
-    input_layernorm: LlamaRMSNorm
-    post_attention_layernorm: LlamaRMSNorm
+    input_layernorm: hnn.LayerNorm
+    post_attention_layernorm: hnn.LayerNorm
 
     @staticmethod
     def init(config: RStarcoderConfig, *, key) -> "RStarcoderDecoderLayer":
@@ -314,8 +314,8 @@ class RStarcoderDecoderLayer(eqx.Module):
             key=k_mlp,
             use_bias=config.use_bias,
         )
-        ln_1 = config.mk_LayerNorm(config.Embed)
-        ln_2 = config.mk_LayerNorm(config.Embed)
+        ln_1 = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_epsilon, use_weight=True, use_bias=True)
+        ln_2 = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_epsilon, use_weight=True, use_bias=True)
 
         return RStarcoderDecoderLayer(config, attn, mlp, ln_1, ln_2)
 
@@ -341,7 +341,7 @@ class RStarcoderDecoderLayer(eqx.Module):
 class RStarcoderTransformer(eqx.Module):
     config: RStarcoderConfig = eqx.static_field()
     layers: Stacked[RStarcoderDecoderLayer]
-    norm: LlamaRMSNorm
+    norm: hnn.LayerNorm
 
     @staticmethod
     def init(config: RStarcoderConfig, *, key) -> "RStarcoderTransformer":
@@ -353,7 +353,7 @@ class RStarcoderTransformer(eqx.Module):
             key=shaped_rng_split(key, config.num_layers),
         )
 
-        ln_f = config.mk_LayerNorm(config.Embed)
+        ln_f = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_epsilon, use_weight=True, use_bias=True)
         return RStarcoderTransformer(config, layers, ln_f)
 
     @named_call
