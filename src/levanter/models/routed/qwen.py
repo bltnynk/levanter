@@ -16,10 +16,10 @@ from haliax.state_dict import ModuleWithStateDictSerialization
 from levanter.compat.hf_checkpoints import HFCheckpointConverter
 from levanter.models.attention import AttentionMask, dot_product_attention
 from levanter.models.gpt2 import ACT2FN
-from levanter.models.llama import LlamaConfig, LlamaEmbedding
-from levanter.models.lm_model import LmConfig, LmHeadModel
+from levanter.models.llama import LlamaConfig, LlamaEmbedding, LlamaRMSNorm
+from levanter.models.lm_model import LmHeadModel
 from levanter.models.rotary import RotaryEmbeddingsConfig
-from levanter.routed_models.routed import (
+from levanter.models.routed.comon import (
     ExpertType,
     MaybeRoutedLinear,
     RLoraLinear,
@@ -35,72 +35,77 @@ from levanter.utils.logging import silence_transformer_nag
 
 silence_transformer_nag()
 from transformers import PretrainedConfig as HfConfig  # noqa: E402
-from transformers import Starcoder2Config as HfStarcoderConfig  # noqa: E402
+from transformers import Qwen2Config as HfQwenConfig  # noqa: E402
 
 
-@LmConfig.register_subclass("rstarcoder")
+@RoutableLmConfig.register_subclass("rqwen")
 @dataclass(frozen=True)
-class RStarcoderConfig(LlamaConfig, RoutableLmConfig):
-    """Extends LlamaConfig with Starcoder specific features"""
+class RQwenConfig(LlamaConfig, RoutableLmConfig):
+    """Extends LlamaConfig with Qwen specific features"""
 
-    tie_word_embeddings: bool = False
-    use_bias: bool = True
+    use_sliding_window: bool = False
+    sliding_window: Optional[int] = None
+    max_window_layers: int = 0  # Only apply sliding window beyond this layer
 
-    def hf_checkpoint_converter(self) -> HFCheckpointConverter["RStarcoderConfig"]:  # type: ignore
+    def hf_checkpoint_converter(self) -> HFCheckpointConverter["RQwenConfig"]:  # type: ignore
         return HFCheckpointConverter(
             self.__class__,
             reference_checkpoint=self.reference_checkpoint,
             trust_remote_code=True,
             tokenizer=self.tokenizer if self.tokenizer else self.reference_checkpoint,
-            HfConfigClass=HfStarcoderConfig,
+            HfConfigClass=HfQwenConfig,
         )
 
     @classmethod
     def from_hf_config(cls, hf_config: HfConfig):
         rope_theta = hf_config.rope_theta
         rope_config = RotaryEmbeddingsConfig.from_hf_config(rope_theta, hf_config.rope_scaling)
-        return RStarcoderConfig(
+        return RQwenConfig(
             seq_len=hf_config.max_position_embeddings,
             hidden_dim=hf_config.hidden_size,
             intermediate_dim=hf_config.intermediate_size,
             num_layers=hf_config.num_hidden_layers,
             num_heads=hf_config.num_attention_heads,
             num_kv_heads=hf_config.num_key_value_heads,
+            use_sliding_window=getattr(hf_config, "use_sliding_window", False),
+            sliding_window=getattr(hf_config, "sliding_window", None),
+            max_window_layers=getattr(hf_config, "max_window_layers", 0),
             activation_function=hf_config.hidden_act,
             initializer_range=hf_config.initializer_range,
-            layer_norm_epsilon=hf_config.norm_epsilon,
-            tie_word_embeddings=False,
+            layer_norm_epsilon=hf_config.rms_norm_eps,
+            tie_word_embeddings=hf_config.tie_word_embeddings,
             rope=rope_config,
-            use_bias=hf_config.use_bias,
         )
 
-    def to_hf_config(self, vocab_size: int, config_overrides: Optional[Dict] = None) -> HfStarcoderConfig:
+    def to_hf_config(self, vocab_size: int, config_overrides: Optional[Dict] = None) -> HfQwenConfig:
         if config_overrides is None:
             config_overrides = {}
 
         rope_theta, rope_scaling = self.rope.to_hf_config()
 
-        return HfStarcoderConfig(
+        return HfQwenConfig(
             max_position_embeddings=self.seq_len,
             hidden_size=self.hidden_dim,
             intermediate_size=self.intermediate_dim,
             num_hidden_layers=self.num_layers,
             num_attention_heads=self.num_heads,
             num_key_value_heads=self.num_kv_heads,
+            use_sliding_window=self.use_sliding_window,
+            sliding_window=self.sliding_window,
+            max_window_layers=self.max_window_layers,
             hidden_act=self.activation_function,
             initializer_range=self.initializer_range,
-            norm_epsilon=self.layer_norm_epsilon,
+            rms_norm_eps=self.layer_norm_epsilon,
             tie_word_embeddings=self.tie_word_embeddings,
             vocab_size=vocab_size,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
-            use_bias=self.use_bias,
             **config_overrides,
         )
 
     @property
-    def model_type(self) -> Type["RStarcoderLMHeadModel"]:
-        return RStarcoderLMHeadModel
+    def model_type(self) -> Type["RQwenLMHeadModel"]:
+        return RQwenLMHeadModel
 
     def flops_per_token(self, vocab_size: int):
         return lm_flops_per_token(
@@ -111,30 +116,22 @@ class RStarcoderConfig(LlamaConfig, RoutableLmConfig):
             num_heads=self.num_heads,
             seq_len=self.seq_len,
             vocab_size=vocab_size,
-            glu=False,
+            glu=True,
         )
 
-    def __post_init__(self):
-        assert self.expert_type != ExpertType.MLP_GLU, "MLP_GLU is not supported in Starcoder"
-        assert (
-            not self.tie_word_embeddings
-        ), "Tied word embeddings are not supported in Starcodertests/test_routed_qwen.py"
-        return super().__post_init__()
 
-
-# Modified attention class for Starcoder
-class RStarcoderAttention(eqx.Module):
-    config: RStarcoderConfig = eqx.static_field()
+# Modified attention class for Qwen
+class RQwenAttention(eqx.Module):
+    config: RQwenConfig = eqx.static_field()
     q_proj: MaybeRoutedLinear
     k_proj: MaybeRoutedLinear
     v_proj: MaybeRoutedLinear
     o_proj: MaybeRoutedLinear
 
     @staticmethod
-    def init(config: RStarcoderConfig, *, key) -> "RStarcoderAttention":
+    def init(config: RQwenConfig, *, key) -> "RQwenAttention":
         Embed = config.Embed
         QHeadsPerGroup = hax.Axis("q_heads_per_group", config.num_heads // config.num_kv_heads)
-        use_bias = config.use_bias
 
         k_q, k_k, k_v, k_o = jrandom.split(key, 4)
         q_proj = make_linear(
@@ -144,7 +141,7 @@ class RStarcoderAttention(eqx.Module):
             Inter=(config.Experts, config.ExpertRank),
             scale=config.scale,
             key=k_q,
-            use_bias=use_bias,  # Starcoder always uses bias in attention
+            use_bias=True,  # Qwen always uses bias in attention
             out_first=True,
         )
         k_proj = make_linear(
@@ -154,7 +151,7 @@ class RStarcoderAttention(eqx.Module):
             Inter=(config.Experts, config.ExpertRank),
             scale=config.scale,
             key=k_k,
-            use_bias=use_bias,
+            use_bias=True,
             out_first=True,
         )
         v_proj = make_linear(
@@ -164,7 +161,7 @@ class RStarcoderAttention(eqx.Module):
             Inter=(config.Experts, config.ExpertRank),
             scale=config.scale,
             key=k_v,
-            use_bias=use_bias,
+            use_bias=True,
             out_first=True,
         )
         o_proj = make_linear(
@@ -174,10 +171,10 @@ class RStarcoderAttention(eqx.Module):
             Inter=(config.Experts, config.ExpertRank),
             scale=config.scale,
             key=k_o,
-            use_bias=use_bias,  # Starcoder doesn't use bias in o_proj
+            use_bias=False,  # Qwen doesn't use bias in o_proj
             out_first=True,
         )
-        return RStarcoderAttention(config, q_proj, k_proj, v_proj, o_proj)
+        return RQwenAttention(config, q_proj, k_proj, v_proj, o_proj)
 
     @named_call
     def __call__(
@@ -205,6 +202,14 @@ class RStarcoderAttention(eqx.Module):
         k = k.rename({"position": "key_position"})
         v = v.rename({"position": "key_position"})
 
+        # Apply sliding window attention if configured and past max_window_layers
+        if (
+            self.config.use_sliding_window
+            and self.config.sliding_window is not None
+            and layer_idx >= self.config.max_window_layers
+        ):
+            raise ValueError("Sliding Window Attention is not currently supported.")
+
         # Perform attention
         attn_output = dot_product_attention(
             "position",
@@ -227,20 +232,21 @@ class RStarcoderAttention(eqx.Module):
         return attn_output
 
 
-class RStarcoderMlp(ModuleWithStateDictSerialization):
+class RQwenMlp(ModuleWithStateDictSerialization):
     """Multi-layer Perceptron
     In comparison with GPT2, LlamaMlp adds an up-proj that multiplies with activated gate_proj,
     before down-proj.
     """
 
-    c_fc: MaybeRoutedLinear
-    c_proj: MaybeRoutedLinear
+    gate_proj: MaybeRoutedLinear  # projection from Embed to Mlp
+    up_proj: MaybeRoutedLinear  # projection from Embed to Mlp
+    down_proj: MaybeRoutedLinear  # projection from Mlp to Embed
     experts: Optional[RoutedMlpExperts]
     act: Callable = eqx.static_field()
 
     @staticmethod
     def init(
-        config: RStarcoderConfig,
+        config: RQwenConfig,
         Embed: Axis,
         Mlp: Axis,
         Inter: AxisSpec,
@@ -250,12 +256,15 @@ class RStarcoderMlp(ModuleWithStateDictSerialization):
         scale: float = 1.0,
         use_bias: bool = False,
     ) -> "RLoraLinear":
-        k_fc, k_proj, k_mlp_exp = jrandom.split(key, 3)
-        c_fc = make_linear(
+        k_fc, k_up_proj, k_down_proj, k_mlp_exp = jrandom.split(key, 4)
+        gate_proj = make_linear(
             config, Out=Mlp, In=Embed, Inter=Inter, scale=scale, key=k_fc, use_bias=use_bias, out_first=True
         )
-        c_proj = make_linear(
-            config, Out=Embed, In=Mlp, Inter=Inter, scale=scale, key=k_proj, use_bias=use_bias, out_first=True
+        up_proj = make_linear(
+            config, Out=Mlp, In=Embed, Inter=Inter, scale=scale, key=k_up_proj, use_bias=use_bias, out_first=True
+        )
+        down_proj = make_linear(
+            config, Out=Embed, In=Mlp, Inter=Inter, scale=scale, key=k_down_proj, use_bias=use_bias, out_first=True
         )
         if isinstance(activation_fn, str):
             activation_fn = ACT2FN[activation_fn]
@@ -264,14 +273,15 @@ class RStarcoderMlp(ModuleWithStateDictSerialization):
         if config.expert_type in [ExpertType.MLP, ExpertType.MLP_GLU]:
             experts = RoutedMlpExperts.init(config, key=k_mlp_exp)
 
-        return RStarcoderMlp(c_fc, c_proj, experts, act)
+        return RQwenMlp(gate_proj, up_proj, down_proj, experts, act)
 
     @named_call
     def __call__(self, x: NamedArray, expert_mask: Optional[NamedArray], *, key=None) -> NamedArray:
-        k_gate, k_down = maybe_rng_split(key, 2)
-        hidden_states = self.c_fc(x, expert_mask, key=k_gate)
+        k_gate, k_up, k_down = maybe_rng_split(key, 3)
+        hidden_states = self.gate_proj(x, expert_mask, key=k_gate)
         hidden_states = self.act(hidden_states)
-        outputs = self.c_proj(hidden_states, expert_mask, key=k_down)
+        hidden_states = hidden_states * self.up_proj(x, expert_mask, key=k_up)
+        outputs = self.down_proj(hidden_states, expert_mask, key=k_down)
         if self.experts is not None and expert_mask is not None:
             outputs += self.experts(x, expert_mask, key=key)
         return outputs
@@ -281,7 +291,7 @@ class RStarcoderMlp(ModuleWithStateDictSerialization):
 
     def from_state_dict(self, state_dict, prefix=None):
         fsd = ModuleWithStateDictSerialization.from_state_dict
-        if self.experts is not None and prefix is not None and prefix + ".experts.c_fc" not in state_dict:
+        if self.experts is not None and prefix is not None and prefix + ".experts.up_proj" not in state_dict:
             print("Skipping expert_mlp load")
             experts = self.experts
             self = dataclasses.replace(self, experts=None)
@@ -291,20 +301,20 @@ class RStarcoderMlp(ModuleWithStateDictSerialization):
         return fsd(self, state_dict, prefix)
 
 
-# Modified decoder layer for Starcoder
-class RStarcoderDecoderLayer(eqx.Module):
-    config: RStarcoderConfig = eqx.static_field()
-    self_attn: RStarcoderAttention
-    mlp: RStarcoderMlp
-    input_layernorm: hnn.LayerNorm
-    post_attention_layernorm: hnn.LayerNorm
+# Modified decoder layer for Qwen
+class RQwenDecoderLayer(eqx.Module):
+    config: RQwenConfig = eqx.static_field()
+    self_attn: RQwenAttention
+    mlp: RQwenMlp
+    input_layernorm: LlamaRMSNorm
+    post_attention_layernorm: LlamaRMSNorm
 
     @staticmethod
-    def init(config: RStarcoderConfig, *, key) -> "RStarcoderDecoderLayer":
+    def init(config: RQwenConfig, *, key) -> "RQwenDecoderLayer":
         k_attn, k_mlp = jrandom.split(key, 2)
 
-        attn = RStarcoderAttention.init(config, key=k_attn)
-        mlp = RStarcoderMlp.init(
+        attn = RQwenAttention.init(config, key=k_attn)
+        mlp = RQwenMlp.init(
             config,
             config.Embed,
             config.Mlp,
@@ -314,10 +324,10 @@ class RStarcoderDecoderLayer(eqx.Module):
             key=k_mlp,
             use_bias=config.use_bias,
         )
-        ln_1 = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_epsilon, use_weight=True, use_bias=True)
-        ln_2 = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_epsilon, use_weight=True, use_bias=True)
+        ln_1 = config.mk_LayerNorm(config.Embed)
+        ln_2 = config.mk_LayerNorm(config.Embed)
 
-        return RStarcoderDecoderLayer(config, attn, mlp, ln_1, ln_2)
+        return RQwenDecoderLayer(config, attn, mlp, ln_1, ln_2)
 
     @named_call
     def __call__(
@@ -337,24 +347,24 @@ class RStarcoderDecoderLayer(eqx.Module):
         return output
 
 
-# Modified transformer for Starcoder
-class RStarcoderTransformer(eqx.Module):
-    config: RStarcoderConfig = eqx.static_field()
-    layers: Stacked[RStarcoderDecoderLayer]
-    norm: hnn.LayerNorm
+# Modified transformer for Qwen
+class RQwenTransformer(eqx.Module):
+    config: RQwenConfig = eqx.static_field()
+    layers: Stacked[RQwenDecoderLayer]
+    norm: LlamaRMSNorm
 
     @staticmethod
-    def init(config: RStarcoderConfig, *, key) -> "RStarcoderTransformer":
+    def init(config: RQwenConfig, *, key) -> "RQwenTransformer":
         S = Stacked
 
         # Initialize layers with their indices
-        layers = S.init(config.Layers, RStarcoderDecoderLayer, gradient_checkpointing=config.gradient_checkpointing)(
+        layers = S.init(config.Layers, RQwenDecoderLayer, gradient_checkpointing=config.gradient_checkpointing)(
             config,
             key=shaped_rng_split(key, config.num_layers),
         )
 
-        ln_f = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_epsilon, use_weight=True, use_bias=True)
-        return RStarcoderTransformer(config, layers, ln_f)
+        ln_f = config.mk_LayerNorm(config.Embed)
+        return RQwenTransformer(config, layers, ln_f)
 
     @named_call
     def __call__(
@@ -367,23 +377,25 @@ class RStarcoderTransformer(eqx.Module):
         return x
 
 
-class RStarcoderLMHeadModel(RoutableLmHeadModel, ModuleWithStateDictSerialization):
+class RQwenLMHeadModel(RoutableLmHeadModel, ModuleWithStateDictSerialization):
     router: Router
-    transformer: RStarcoderTransformer
+    transformer: RQwenTransformer
     embeddings: LlamaEmbedding  # Can reuse Llama embeddings
-    lm_head: hnn.Linear
+    lm_head: Optional[hnn.Linear]
 
     @classmethod
-    def init(cls, Vocab: Axis, config: RStarcoderConfig, *, key) -> "RStarcoderLMHeadModel":
+    def init(cls, Vocab: Axis, config: RQwenConfig, *, key) -> "RQwenLMHeadModel":
         k_t, k_emb, k_rout = jrandom.split(key, 3)
-        transformer = RStarcoderTransformer.init(config, key=k_t)
+        transformer = RQwenTransformer.init(config, key=k_t)
         embeddings = LlamaEmbedding.init(Vocab, config, key=k_emb)
-        assert not config.tie_word_embeddings
-        lm_head = hnn.Linear.init(In=config.Embed, Out=Vocab, key=k_emb, use_bias=False, out_first=True)
+        if config.tie_word_embeddings:
+            lm_head = None
+        else:
+            lm_head = hnn.Linear.init(In=config.Embed, Out=Vocab, key=k_emb, use_bias=False, out_first=True)
 
         router = Router.init(In=config.Embed, Out=config.RouterOut, key=k_rout, use_bias=False, out_first=True)
 
-        return RStarcoderLMHeadModel(router, transformer, embeddings, lm_head)
+        return RQwenLMHeadModel(router, transformer, embeddings, lm_head)
 
     def get_router(self) -> Router:
         return self.router

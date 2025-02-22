@@ -21,10 +21,7 @@ from levanter.checkpoint import EpochCheckpointer, load_checkpoint
 from levanter.data.text import FIMUrlSourceConfig, mk_fim_dataset
 from levanter.models.lm_model import Extras, LmExample, RoutableLmExample
 from levanter.models.loss import maybe_fused_next_token_loss
-from levanter.optim import AdamConfig, OptimizerConfig
-from levanter.optim.util import filter_embedding_grads
-from levanter.routed_models.qwen import RQwenConfig, RQwenLMHeadModel
-from levanter.routed_models.routed import (
+from levanter.models.routed.comon import (
     ExpertBiasTracker,
     RoutableLmConfig,
     base_weights_mask,
@@ -32,6 +29,9 @@ from levanter.routed_models.routed import (
     routed_experts_mask,
     routed_experts_trainable_params_filter,
 )
+from levanter.models.routed.qwen import RQwenConfig, RQwenLMHeadModel
+from levanter.optim import AdamConfig, OptimizerConfig
+from levanter.optim.util import filter_embedding_grads
 from levanter.trainer import Trainer, TrainerConfig
 from levanter.utils.jax_utils import parameter_count
 from levanter.utils.stat_utils import MeanScalar

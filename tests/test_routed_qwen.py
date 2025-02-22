@@ -14,8 +14,7 @@ from haliax.partitioning import ResourceAxis
 
 from levanter.models.attention import AttentionMask
 from levanter.models.lm_model import RoutableLmExample
-from levanter.routed_models.qwen import RQwenConfig, RQwenLMHeadModel
-from levanter.routed_models.routed import (
+from levanter.models.routed.comon import (
     ExpertBiasTracker,
     ExpertInit,
     ExpertType,
@@ -27,6 +26,7 @@ from levanter.routed_models.routed import (
     routed_experts_mask,
     routed_experts_trainable_params_filter,
 )
+from levanter.models.routed.qwen import RQwenConfig, RQwenLMHeadModel
 from levanter.utils.stat_utils import IndexCountHistogram, IndexCountUnique
 from levanter.utils.types import Extras
 from test_utils import skip_if_no_torch

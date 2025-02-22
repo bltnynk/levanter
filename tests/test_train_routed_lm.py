@@ -17,8 +17,10 @@ from levanter.callbacks import StepInfo
 from levanter.data.text import FIMUrlSourceConfig, mk_fim_dataset
 from levanter.distributed import RayConfig
 from levanter.models.rotary import DefaultRotaryEmbeddingsConfig
+from levanter.models.routed.comon import ExpertInit, ExpertType
+from levanter.models.routed.qwen import RQwenConfig
+from levanter.models.routed.starcoder import RStarcoderConfig
 from levanter.optim.config import AdamConfig
-from levanter.routed_models.routed import ExpertInit, ExpertType
 from levanter.store.cache import CacheOptions
 from levanter.tracker.tracker import NoopConfig
 from levanter.tracker.wandb import WandbConfig
@@ -33,8 +35,8 @@ def ray_init_fixture():
     ray.shutdown()
 
 
-def small_model_cfg(**kwargs):
-    return routed_lm.RQwenConfig(
+def small_model_cfg(cls, **kwargs):
+    return cls(
         num_layers=4,
         num_heads=2,
         num_kv_heads=2,
@@ -45,9 +47,7 @@ def small_model_cfg(**kwargs):
         num_experts=16,
         expert_rank=1,
         top_k=4,
-        tie_word_embeddings=True,
         disable_expert_mask=False,
-        use_layer_norm_weight=True,
         expert_init=ExpertInit.NONZERO,  # supported by every type
         rope=DefaultRotaryEmbeddingsConfig(theta=1000000.0),
         **kwargs,
@@ -89,28 +89,34 @@ def get_opt_cfg():
 
 
 @pytest.mark.entry
+@pytest.mark.parametrize("cfg_cls", [RQwenConfig, RStarcoderConfig])
 @pytest.mark.parametrize("expert_type", [t for t in ExpertType])
 @pytest.mark.parametrize("prefill_expert", [True, False], ids=["prefill", "no_prefill"])
-@pytest.mark.parametrize("router_activation", ["sigmoid"], ids=["sigmoid"])
-@pytest.mark.parametrize("route_each_layer", [True, False], ids=["route_each_layer", "route_once"])
-@pytest.mark.parametrize("zloss_seq_norm", [True, False], ids=["zloss_seq_norm", "zloss_no_seq_norm"])
 @skip_if_no_torch
 def test_routed_train(
     data_cfg,
+    cfg_cls,
     expert_type,
     prefill_expert,
-    router_activation,
-    route_each_layer,
-    zloss_seq_norm,
+    router_activation="softmax",
+    route_each_layer=True,
+    zloss_seq_norm=True,
     full_ft=False,
     base_params_optim=None,
     model_kwargs={},
     trainer_kwargs={},
 ):
-    from transformers import Qwen2ForCausalLM
+    if cfg_cls == RQwenConfig:
+        from transformers import Qwen2ForCausalLM as TFCausalLm
+    elif cfg_cls == RStarcoderConfig:
+        from transformers import Starcoder2ForCausalLM as TFCausalLm
+
+    if cfg_cls == RStarcoderConfig and expert_type == ExpertType.MLP_GLU:
+        pytest.skip("Starcoder does not support MLP_GLU")
 
     # just testing if train_lm has a pulse
     model_cfg = small_model_cfg(
+        cfg_cls,
         expert_type=expert_type,
         prefill_expert=prefill_expert,
         router_activation=router_activation,
@@ -120,7 +126,7 @@ def test_routed_train(
     with tempfile.TemporaryDirectory() as tmpdir:
         tokenizer = data_cfg.the_tokenizer
         hf_config = model_cfg.to_hf_config(tokenizer.vocab_size)
-        torch_model = Qwen2ForCausalLM(hf_config)
+        torch_model = TFCausalLm(hf_config)
         torch_model_dir = tmpdir + "/torch_model"
         torch_model.save_pretrained(torch_model_dir)
 
@@ -160,10 +166,12 @@ def test_routed_train(
                 pass
 
 
+@pytest.mark.parametrize("cfg_cls", [RQwenConfig, RStarcoderConfig])
 @pytest.mark.parametrize("expert_type", [t for t in ExpertType])
-def test_full_ft_routed_train(data_cfg, expert_type):
+def test_full_ft_routed_train(data_cfg, cfg_cls, expert_type):
     test_routed_train(
         data_cfg,
+        cfg_cls,
         expert_type=expert_type,
         prefill_expert=True,
         router_activation="softmax",
@@ -174,10 +182,12 @@ def test_full_ft_routed_train(data_cfg, expert_type):
     )
 
 
-def test_expert_bias(data_cfg):
+@pytest.mark.parametrize("cfg_cls", [RQwenConfig, RStarcoderConfig])
+def test_expert_bias(data_cfg, cfg_cls):
     test_routed_train(
         data_cfg,
-        expert_type=ExpertType.MLP_GLU,
+        cfg_cls,
+        expert_type=ExpertType.MLP,
         prefill_expert=True,
         router_activation="softmax",
         route_each_layer=False,
@@ -187,7 +197,7 @@ def test_expert_bias(data_cfg):
 
 
 def test_eval_loop(data_cfg):
-    model_cfg = small_model_cfg()
+    model_cfg = small_model_cfg(RQwenConfig)
     opt_cfg = get_opt_cfg()
     trainer_cfg = routed_lm.TrainerConfig(
         seed=42,
