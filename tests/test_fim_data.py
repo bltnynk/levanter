@@ -66,8 +66,8 @@ async def test_fim_url_data(flattened, predict_prefix, predict_fim_token):
             # hs idxs testing
             assert (elem0.router_hs_idxs.array[m:e] == m - 1).all().item()
             assert (elem0.completion_first_token_mask.array[m] == 1).item()
-            assert (elem0.completion_first_token_mask.array[s:m] == 0).item()
-            assert (elem0.completion_first_token_mask.array[m + 1 : e] == 0).item()
+            assert (elem0.completion_first_token_mask.array[s:m] == 0).all().item()
+            assert (elem0.completion_first_token_mask.array[m + 1 : e] == 0).all().item()
 
 
 @pytest.mark.slow
@@ -106,7 +106,7 @@ def test_large_prefetch():
 
 
 def test_replace_illegal_chars():
-    cfg = FIMUrlSourceConfig()
+    cfg = FIMUrlSourceConfig(middle_token="<|middle|>", eos_token="<eos>", replacer_trim_chars="<>|")
 
     illegal_str = f"some {cfg.middle_token} illegal {cfg.eos_token} chars"
     cleaned_str = cfg.replace_illegal_chars(illegal_str)
@@ -115,3 +115,5 @@ def test_replace_illegal_chars():
     assert "some" in cleaned_str
     assert "illegal" in cleaned_str
     assert "chars" in cleaned_str
+    assert "<|cleaned_middle|>" in cleaned_str
+    assert "<cleaned_eos>" in cleaned_str

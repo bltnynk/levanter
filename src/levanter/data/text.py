@@ -1382,6 +1382,7 @@ class FIMUrlSourceConfig:
     repo_name_token: str = "<|repo_name|>"
     file_sep_token: str = "<|file_sep|>"
     eos_token: str = "<|endoftext|>"
+    pad_token: str = "<|padding|>"
     router_token: str = "<|router|>"
     """The overall prompt format is:
     <|repo_name|>repo name\n
@@ -1390,11 +1391,13 @@ class FIMUrlSourceConfig:
     <|file_sep|>target_file.py\n
     <|fim_prefix|>all of the code goes here now except for<|fim_suffix|>which is pretty neat<|fim_middle|>the middle
     """
+    replacer_trim_chars: str = "<>|"
 
     def __post_init__(self):
         if not self.add_router_token:
             assert not self.predict_router_token, "Can't predict router token if it's not in the data"
         assert self.data_format in ["flattened", "repo_level"]
+        assert self.pad_token != self.eos_token
 
     def get_flattened_source(self, split: str) -> Optional[ShardedDataSource[str]]:
         urls = self.train_urls if split == "train" else self.validation_urls
@@ -1479,18 +1482,36 @@ class FIMUrlSourceConfig:
         tokenizer = load_tokenizer(self.tokenizer)
         if self.add_router_token:
             tokenizer.add_special_tokens({"additional_special_tokens": [self.router_token]})
-        pad_token = tokenizer.pad_token
-        eos_token = tokenizer.eos_token
-        if pad_token is None or pad_token == eos_token:
-            pad_token = "<|padding|>"
-            tokenizer.add_special_tokens({"pad_token": pad_token})
+        if tokenizer.pad_token is None or tokenizer.pad_token != self.pad_token:
+            if self.pad_token in tokenizer.all_special_tokens:
+                tokenizer.pad_token = self.pad_token
+            else:
+                tokenizer.add_special_tokens({"pad_token": self.pad_token})
+        assert tokenizer.pad_token == self.pad_token
+        assert tokenizer.eos_token == self.eos_token
+        assert tokenizer.pad_token != tokenizer.eos_token
         return tokenizer
 
     @cached_property
     def _replacer(self) -> FastReplacer:
+        def _count_margin_chars(text: str) -> int:
+            """Counts special chars at start of string."""
+            for i, c in enumerate(text):
+                if c not in self.replacer_trim_chars:
+                    return i
+            return len(text)
+
+        def _update_token(token: str) -> str:
+            """Wraps token content with special chars and 'cleaned_' prefix."""
+            left_margin = token[: _count_margin_chars(token)]
+            right_margin = token[-_count_margin_chars(token[::-1]) :]
+            inner_content = token[len(left_margin) : len(token) - len(right_margin)]
+
+            return f"{left_margin}cleaned_{inner_content}{right_margin}"
+
         return FastReplacer(
             {
-                k: k[:2] + "cleaned_" + k[2:]
+                k: _update_token(k)
                 for k in [
                     self.prefix_token,
                     self.middle_token,
@@ -1499,7 +1520,7 @@ class FIMUrlSourceConfig:
                     self.file_sep_token,
                     self.eos_token,
                     self.router_token,
-                    "<|padding|>",
+                    self.pad_token,
                 ]
             }
         )

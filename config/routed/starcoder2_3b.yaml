@@ -15,6 +15,13 @@ data:
   add_router_token: false
   pack: true
   data_format: "flattened"
+  prefix_token: "<fim_prefix>"
+  middle_token: "<fim_middle>"
+  suffix_token: "<fim_suffix>"
+  repo_name_token: "<repo_name>"
+  file_sep_token: "<file_sep>"
+  eos_token: "<|endoftext|>"
+  pad_token: "<fim_pad>"
 model:
   type: rstarcoder
   seq_len: 4096
@@ -27,6 +34,7 @@ model:
   rope:
     type: default
     theta: 999999.4420358813
+  tie_word_embeddings: true
 
   use_flash_attention: true
   attn_backend: splash

@@ -43,7 +43,6 @@ from transformers import Starcoder2Config as HfStarcoderConfig  # noqa: E402
 class RStarcoderConfig(LlamaConfig, RoutableLmConfig):
     """Extends LlamaConfig with Starcoder specific features"""
 
-    tie_word_embeddings: bool = False
     use_bias: bool = True
 
     def hf_checkpoint_converter(self) -> HFCheckpointConverter["RStarcoderConfig"]:  # type: ignore
@@ -69,9 +68,9 @@ class RStarcoderConfig(LlamaConfig, RoutableLmConfig):
             activation_function=hf_config.hidden_act,
             initializer_range=hf_config.initializer_range,
             layer_norm_epsilon=hf_config.norm_epsilon,
-            tie_word_embeddings=False,
+            tie_word_embeddings=hf_config.tie_word_embeddings,
             rope=rope_config,
-            use_bias=hf_config.use_bias,
+            use_bias=True,
         )
 
     def to_hf_config(self, vocab_size: int, config_overrides: Optional[Dict] = None) -> HfStarcoderConfig:
@@ -116,9 +115,6 @@ class RStarcoderConfig(LlamaConfig, RoutableLmConfig):
 
     def __post_init__(self):
         assert self.expert_type != ExpertType.MLP_GLU, "MLP_GLU is not supported in Starcoder"
-        assert (
-            not self.tie_word_embeddings
-        ), "Tied word embeddings are not supported in Starcodertests/test_routed_qwen.py"
         return super().__post_init__()
 
 
@@ -371,15 +367,17 @@ class RStarcoderLMHeadModel(RoutableLmHeadModel, ModuleWithStateDictSerializatio
     router: Router
     transformer: RStarcoderTransformer
     embeddings: LlamaEmbedding  # Can reuse Llama embeddings
-    lm_head: hnn.Linear
+    lm_head: Optional[hnn.Linear]
 
     @classmethod
     def init(cls, Vocab: Axis, config: RStarcoderConfig, *, key) -> "RStarcoderLMHeadModel":
         k_t, k_emb, k_rout = jrandom.split(key, 3)
         transformer = RStarcoderTransformer.init(config, key=k_t)
         embeddings = LlamaEmbedding.init(Vocab, config, key=k_emb)
-        assert not config.tie_word_embeddings
-        lm_head = hnn.Linear.init(In=config.Embed, Out=Vocab, key=k_emb, use_bias=False, out_first=True)
+        if config.tie_word_embeddings:
+            lm_head = None
+        else:
+            lm_head = hnn.Linear.init(In=config.Embed, Out=Vocab, key=k_emb, use_bias=False, out_first=True)
 
         router = Router.init(In=config.Embed, Out=config.RouterOut, key=k_rout, use_bias=False, out_first=True)
 
