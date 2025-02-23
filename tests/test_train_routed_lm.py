@@ -17,7 +17,7 @@ from levanter.callbacks import StepInfo
 from levanter.data.text import FIMUrlSourceConfig, mk_fim_dataset
 from levanter.distributed import RayConfig
 from levanter.models.rotary import DefaultRotaryEmbeddingsConfig
-from levanter.models.routed.comon import ExpertInit, ExpertType
+from levanter.models.routed.common import ExpertInit, ExpertType
 from levanter.models.routed.qwen import RQwenConfig
 from levanter.models.routed.starcoder import RStarcoderConfig
 from levanter.optim.config import AdamConfig

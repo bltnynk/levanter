@@ -21,7 +21,7 @@ from levanter.checkpoint import EpochCheckpointer, load_checkpoint
 from levanter.data.text import FIMUrlSourceConfig, mk_fim_dataset
 from levanter.models.lm_model import Extras, LmExample, RoutableLmExample
 from levanter.models.loss import maybe_fused_next_token_loss
-from levanter.models.routed.comon import (
+from levanter.models.routed.common import (
     ExpertBiasTracker,
     RoutableLmConfig,
     base_weights_mask,

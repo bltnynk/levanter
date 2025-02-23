@@ -1490,6 +1490,17 @@ class FIMUrlSourceConfig:
         assert tokenizer.pad_token == self.pad_token
         assert tokenizer.eos_token == self.eos_token
         assert tokenizer.pad_token != tokenizer.eos_token
+
+        for token in [
+            self.prefix_token,
+            self.middle_token,
+            self.suffix_token,
+            self.repo_name_token,
+            self.file_sep_token,
+            self.eos_token,
+            self.pad_token,
+        ]:
+            assert token in tokenizer.all_special_tokens
         return tokenizer
 
     @cached_property

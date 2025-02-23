@@ -14,7 +14,7 @@ from haliax.partitioning import ResourceAxis
 
 from levanter.models.attention import AttentionMask
 from levanter.models.lm_model import RoutableLmExample
-from levanter.models.routed.comon import (
+from levanter.models.routed.common import (
     ExpertBiasTracker,
     ExpertInit,
     ExpertType,

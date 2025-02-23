@@ -19,7 +19,7 @@ from levanter.models.gpt2 import ACT2FN
 from levanter.models.llama import LlamaConfig, LlamaEmbedding, LlamaRMSNorm
 from levanter.models.lm_model import LmHeadModel
 from levanter.models.rotary import RotaryEmbeddingsConfig
-from levanter.models.routed.comon import (
+from levanter.models.routed.common import (
     ExpertType,
     MaybeRoutedLinear,
     RLoraLinear,

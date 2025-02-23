@@ -6,7 +6,7 @@ data:
     - gs://usc-stack-v2/20250122-flattened-shuffled/shard-{00..58}.jsonl.gz
   validation_urls:
     - gs://usc-stack-v2/20250122-flattened-shuffled/shard-{59..60}.jsonl.gz
-  cache_dir: "gs://usc2-datacache/20250122-flattened-shuffled/starcoder"
+  cache_dir: "gs://usc2-datacache/20250122-flattened-shuffled/starcoder-shortseq"
   tokenizer: "bigcode/starcoder2-3b"
   shuffle: false
   predict_prefix: false
@@ -45,25 +45,29 @@ model:
   ident_expert_mask: false
 
   prefill_expert: true
+  expert_type: "mlp"
+  expert_init: "mlp_zero_down"
+  expert_init_scale: 0.01
 
-  num_experts: 512
-  expert_rank: 4
-  top_k: 64
+  num_experts: 32
+  expert_rank: 128
+  top_k: 4
   scale: 1.0
 
 trainer:
   wandb:
     project: "levanter-seqmoe"
-  mp: p=f32,c=bfloat16
+  mp: p=bfloat16,c=bfloat16
   train_batch_size: 256
-  per_device_parallelism: 4
+  per_device_parallelism: 1
   num_train_steps: 200
   steps_per_eval: 10
   max_eval_samples: 512
-  per_device_eval_parallelism: 4
+  per_device_eval_parallelism: 1
   tensor_parallel_axes: ["mlp", "heads"]
   fsdp_axis: "embed"
   batch_axis: "batch"
+  model_axis_size: 4
   checkpointer:
     base_path: gs://usc2-ckpt/starcoder2-3b-misc
     save_interval: 15m

@@ -14,7 +14,7 @@ from haliax.partitioning import ResourceAxis
 
 from levanter.models.attention import AttentionMask
 from levanter.models.lm_model import RoutableLmExample
-from levanter.models.routed.comon import (
+from levanter.models.routed.common import (
     ExpertBiasTracker,
     ExpertInit,
     ExpertType,
@@ -27,6 +27,7 @@ from levanter.models.routed.comon import (
     routed_experts_trainable_params_filter,
 )
 from levanter.models.routed.starcoder import RStarcoderConfig, RStarcoderLMHeadModel
+from levanter.utils.jax_utils import parameter_count
 from levanter.utils.stat_utils import IndexCountHistogram, IndexCountUnique
 from levanter.utils.types import Extras
 from test_utils import skip_if_no_torch
@@ -430,3 +431,33 @@ def test_weight_masks():
     exp_vals, base_vals = manual_expert_values(base_mask)
     assert all([t is False for t in exp_vals])
     assert all([f is True for f in base_vals])
+
+
+def test_param_distribution():
+    config = RStarcoderConfig(
+        seq_len=4096,
+        num_layers=1,
+        hidden_dim=3072,
+        intermediate_dim=12288,
+        num_kv_heads=2,
+        num_heads=24,
+        num_experts=512,
+        expert_rank=4,
+        top_k=64,
+        expert_type=ExpertType.MLP,
+        expert_init=ExpertInit.NONZERO,
+        tie_word_embeddings=True,
+    )
+    Vocab = hax.Axis("vocab", 1000)
+    model: RStarcoderLMHeadModel = config.build(Vocab, key=jax.random.PRNGKey(0))
+    emb_weights = parameter_count(model.embeddings)
+    transformer_weights = parameter_count(model.transformer)
+    mlp_weights = parameter_count(model.transformer.layers.stacked.mlp)
+    expert_weights = parameter_count(model.transformer.layers.stacked.mlp.experts)
+    attn_weights = parameter_count(model.transformer.layers.stacked.self_attn)
+    print(f"Embeddings: {emb_weights/1e6}M")
+    print(f"Transformer: {transformer_weights/1e6}M")
+    print(f"MLP: {mlp_weights/1e6}M")
+    print(f"Experts: {expert_weights/1e6}M")
+    print(f"Attention: {attn_weights/1e6}M")
+    assert False
