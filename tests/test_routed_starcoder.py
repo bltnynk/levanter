@@ -87,6 +87,7 @@ def test_rstarcoder_consistent_with_base_starcoder(expert_type, expert_init):
         disable_expert_mask=True,  # disable expert mask to keep consistency
         expert_type=expert_type,
         expert_init=expert_init,
+        tie_word_embeddings=True,
     )
     Vocab = hax.Axis("vocab", 1000)
     hf_config = config.to_hf_config(Vocab.size)

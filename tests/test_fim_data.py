@@ -117,3 +117,35 @@ def test_replace_illegal_chars():
     assert "chars" in cleaned_str
     assert "<|cleaned_middle|>" in cleaned_str
     assert "<cleaned_eos>" in cleaned_str
+
+
+@pytest.mark.asyncio
+async def test_sanity():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_data_jsonl = "file://" + write_fim_data(tmpdir + "/test_data.jsonl", flattened=True, len=4)
+        cfg = FIMUrlSourceConfig(
+            cache_dir=tmpdir + "/cache",
+            tokenizer="bigcode/starcoder2-3b",
+            train_urls=[test_data_jsonl],
+            predict_prefix=False,
+            predict_fim_token=False,
+            add_router_token=False,
+            predict_router_token=False,
+            shuffle=True,
+            pack=True,
+            data_format="flattened",
+            prefix_token="<fim_prefix>",
+            middle_token="<fim_middle>",
+            suffix_token="<fim_suffix>",
+            repo_name_token="<repo_name>",
+            file_sep_token="<file_sep>",
+            eos_token="<|endoftext|>",
+            pad_token="<fim_pad>",
+            cache_options=CacheOptions(final_copy_cpus=1, final_copy_memory=6 * 1024 * 1024),
+        )
+        tokenizer = cfg.the_tokenizer
+        Pos = hax.Axis("Pos", 512)
+        dataset = mk_fim_dataset(cfg, "train", tokenizer, Pos, key=PRNGKey(0))
+        ex = await dataset.get_batch([0])
+        deto = tokenizer.decode(ex[0].tokens.array)
+        print(deto)

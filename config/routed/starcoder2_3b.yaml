@@ -3,10 +3,10 @@ full_ft: false
 embedding_router_token_ft: false
 data:
   train_urls:
-    - gs://usc-stack-v2/20250122-flattened-shuffled/shard-{00..58}.jsonl.gz
+    - gs://usc-stack-v2/20250122-flattened-shuffled/shard-00.jsonl.gz
   validation_urls:
-    - gs://usc-stack-v2/20250122-flattened-shuffled/shard-{59..60}.jsonl.gz
-  cache_dir: "gs://usc2-datacache/20250122-flattened-shuffled/starcoder-shortseq"
+    - gs://usc-stack-v2/20250122-flattened-shuffled/shard-59.jsonl.gz
+  cache_dir: "gs://usc2-datacache/20250122-flattened-shuffled/starcoder-1shard-fix-file-sep"
   tokenizer: "bigcode/starcoder2-3b"
   shuffle: false
   predict_prefix: false
@@ -36,6 +36,7 @@ model:
     theta: 999999.4420358813
   tie_word_embeddings: true
 
+  activation_function: "gelu_new"
   use_flash_attention: true
   attn_backend: splash
   flash_attention_block_size: 512
@@ -58,20 +59,19 @@ trainer:
   wandb:
     project: "levanter-seqmoe"
   mp: p=bfloat16,c=bfloat16
-  train_batch_size: 256
+  train_batch_size: 4
   per_device_parallelism: 1
   num_train_steps: 200
   steps_per_eval: 10
-  max_eval_samples: 512
+  max_eval_samples: 4
   per_device_eval_parallelism: 1
   tensor_parallel_axes: ["mlp", "heads"]
   fsdp_axis: "embed"
   batch_axis: "batch"
-  model_axis_size: 4
   checkpointer:
     base_path: gs://usc2-ckpt/starcoder2-3b-misc
     save_interval: 15m
-  abort_if_loss_above: 2.0
+  abort_if_loss_above: 8.0
 
 optimizer:
   type: adam

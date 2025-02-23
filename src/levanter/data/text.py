@@ -1370,6 +1370,7 @@ class FIMUrlSourceConfig:
 
     data_format: str = "flattened"
     repo_level_percentage = 0.0
+    always_include_file_sep: bool = False
     repo_name_field: str = CANONICAL_REPO_NAME_FIELD
     files_field: str = CANONICAL_FILES_FIELD
     file_path_field: str = CANONICAL_FILE_PATH_FIELD
@@ -1422,6 +1423,8 @@ class FIMUrlSourceConfig:
             middle = content[i0:i1]
             suffix = content[i1:]
             to_join = []
+            if self.always_include_file_sep:
+                to_join.extend([self.file_sep_token, x[self.file_path_field], "\n"])
             to_join.extend([self.prefix_token, prefix, self.suffix_token, suffix])
             if self.add_router_token:
                 to_join.extend([self.router_token])
@@ -1469,6 +1472,8 @@ class FIMUrlSourceConfig:
                         ]
                     )
 
+            if self.always_include_file_sep:
+                to_join.extend([self.file_sep_token, file[self.file_path_field], "\n"])
             to_join.extend([self.prefix_token, prefix, self.suffix_token, suffix])
             if self.add_router_token:
                 to_join.extend([self.router_token])
@@ -1491,6 +1496,7 @@ class FIMUrlSourceConfig:
         assert tokenizer.eos_token == self.eos_token
         assert tokenizer.pad_token != tokenizer.eos_token
 
+        valid_added_tokens = [a.content for a in tokenizer.added_tokens_decoder.values()]
         for token in [
             self.prefix_token,
             self.middle_token,
@@ -1500,7 +1506,7 @@ class FIMUrlSourceConfig:
             self.eos_token,
             self.pad_token,
         ]:
-            assert token in tokenizer.all_special_tokens
+            assert token in valid_added_tokens, f"{token} not in {valid_added_tokens}"
         return tokenizer
 
     @cached_property
