@@ -1,21 +1,28 @@
 import abc
 import dataclasses
+import logging
+import os
+import tempfile
 import warnings
 from enum import Enum
-from typing import Callable, Dict, Generic, Optional, TypeVar, Union
+from typing import Any, Callable, Dict, Generic, Optional, TypeVar, Union
 
 import equinox as eqx
+import fsspec
 import jax
 import jax.numpy as jnp
 import numpy as np
+from fsspec import AbstractFileSystem
+from jax.experimental.multihost_utils import sync_global_devices
 from jaxtyping import PyTree
+from jmp import Policy
 
 import haliax as hax
 import haliax.nn as hnn
 from haliax import Axis, AxisSpec, NamedArray
 from haliax.jax_utils import maybe_rng_split, named_call
 from haliax.quantization import DotGeneralOp
-from haliax.state_dict import ModuleWithStateDictSerialization
+from haliax.state_dict import ModuleWithStateDictSerialization, to_torch_compatible_state_dict
 
 from levanter.models.attention import AttentionMask
 from levanter.models.gpt2 import ACT2FN
@@ -24,6 +31,8 @@ from levanter.utils.jax_utils import key_iterator
 from levanter.utils.stat_utils import IndexCountHistogram, IndexCountUnique, LogitHistogram
 from levanter.utils.types import Extras
 
+
+logger = logging.getLogger(__name__)
 
 LmT = TypeVar("LmT", bound="LmHeadModel")
 LmConfigT = TypeVar("LmConfigT", bound="RoutableLmConfig")
@@ -529,6 +538,10 @@ def is_routed_experts_param(x):
     return isinstance(x, (RoutedMlpExperts, Router, LowRankLinear))
 
 
+def _expert_or_named_array(x):
+    return isinstance(x, (RoutedMlpExperts, Router, LowRankLinear, NamedArray))
+
+
 def routed_experts_trainable_params_filter(model: eqx.Module) -> Dict[str, jnp.ndarray]:
     return jax.tree_util.tree_map(is_routed_experts_param, model, is_leaf=is_routed_experts_param)
 
@@ -537,7 +550,7 @@ def routed_experts_mask(model_shape: PyTree) -> PyTree:
     return jax.tree.map(
         is_routed_experts_param,
         model_shape,
-        is_leaf=lambda x: is_routed_experts_param(x) or isinstance(x, hax.NamedArray),
+        is_leaf=_expert_or_named_array,
     )
 
 
@@ -545,8 +558,43 @@ def base_weights_mask(model_shape: PyTree) -> PyTree:
     return jax.tree.map(
         lambda x: not is_routed_experts_param(x),
         model_shape,
-        is_leaf=lambda x: is_routed_experts_param(x) or isinstance(x, hax.NamedArray),
+        is_leaf=_expert_or_named_array,
     )
+
+
+def routed_experts_state_dict(params: PyTree) -> Dict[str, Any]:
+    filtered = eqx.filter(
+        params,
+        is_routed_experts_param,
+        is_leaf=lambda x: is_routed_experts_param(x) or isinstance(x, hnn.Linear),
+    )
+    state_dict = to_torch_compatible_state_dict(filtered)
+    return {k: v for k, v in state_dict.items() if v is not None}
+
+
+_sync_count = 0
+
+
+def save_routed_experts_state_dict(mp: Policy, params: PyTree, path: str, filename: str):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        params = mp.cast_to_compute(params)
+        state_dict = routed_experts_state_dict(params)
+        local_path = os.path.join(tmpdir, filename)
+        remote_path = os.path.join(path, filename)
+        logger.info("Saving routed experts state dict")
+        hax.state_dict.save_state_dict(state_dict, local_path)
+        if jax.process_index() == 0:
+            logger.info(f"Saving as rank 0 routed experts state dict to {remote_path}")
+            fs: AbstractFileSystem
+            fs, _, (plain_path,) = fsspec.get_fs_token_paths(str(path))
+            fs.makedirs(plain_path, exist_ok=True)
+            fs.put(local_path, remote_path)
+            logger.info(f"Finished saving as rank 0 routed experts state dict to {remote_path}")
+        else:
+            logger.info(f"Finished waiting for rank 0 to save routed experts state dict to {path}/{filename}")
+    global _sync_count
+    sync_global_devices(f"upload? {path}, {filename}, {_sync_count}")
+    _sync_count += 1
 
 
 def re_init_linear(x: hnn.Linear, init_scale=1.0, *, key):

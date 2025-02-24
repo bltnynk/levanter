@@ -28,6 +28,7 @@ from levanter.models.routed.common import (
     reinit_expert_weights,
     routed_experts_mask,
     routed_experts_trainable_params_filter,
+    save_routed_experts_state_dict,
 )
 from levanter.models.routed.qwen import RQwenConfig, RQwenLMHeadModel
 from levanter.optim import AdamConfig, OptimizerConfig
@@ -49,6 +50,7 @@ class TrainLmConfig:
     optimizer: OptimizerConfig = field(default_factory=AdamConfig)
     initialize_from_hf: Optional[str] = None
     initialize_from_checkpoint_path: Optional[str] = None
+    save_torch_state_path: Optional[str] = None
 
     # if provided, will initialize from this checkpoint, used for llama style data mixture
     epoch: int = 0
@@ -361,6 +363,17 @@ def main(config: TrainLmConfig):
             trainer.run_hooks(last_info, force=True)
             checkpointer = trainer.config.checkpointer.create(trainer.run_id)
             checkpointer.wait_until_finished()
+
+        is_aborted = (
+            config.trainer.abort_if_loss_above is not None and last_info.loss > config.trainer.abort_if_loss_above
+        )
+        if not is_aborted and config.save_torch_state_path is not None:
+            save_routed_experts_state_dict(
+                trainer.mp,
+                last_info.model,
+                config.save_torch_state_path,
+                f"{trainer.run_id}_state_dict.safetensors",
+            )
 
     # This isn't necessary except when Levanter is run in a subprocess (as happens w/ ray)
     trainer.tracker.finish()

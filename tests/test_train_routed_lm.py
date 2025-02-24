@@ -196,6 +196,27 @@ def test_expert_bias(data_cfg, cfg_cls):
     )
 
 
+@skip_if_no_torch
+def test_save_state_dict(data_cfg, cfg_cls=RQwenConfig):
+    import safetensors
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_routed_train(
+            data_cfg,
+            cfg_cls,
+            expert_type=ExpertType.MLP,
+            prefill_expert=True,
+            router_activation="softmax",
+            route_each_layer=False,
+            zloss_seq_norm=True,
+            trainer_kwargs={"save_torch_state_path": str(tmpdir)},
+        )
+        for f in os.listdir(tmpdir):
+            with safetensors.safe_open(f"{tmpdir}/{f}", framework="flax") as f:
+                assert "router.weight" in f.keys()
+                assert str(f.get_tensor("router.weight").dtype) == "bfloat16"
+
+
 def test_eval_loop(data_cfg):
     model_cfg = small_model_cfg(RQwenConfig)
     opt_cfg = get_opt_cfg()
