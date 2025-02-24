@@ -6,7 +6,7 @@ data:
     - gs://usc-stack-v2/20250122-flattened-shuffled/shard-{00..58}.jsonl.gz
   validation_urls:
     - gs://usc-stack-v2/20250122-flattened-shuffled/shard-{59..60}.jsonl.gz
-  cache_dir: "gs://usc2-datacache/20250122-flattened-shuffled"
+  cache_dir: "gs://usc2-datacache/20250122-flattened-shuffled/qwen"
   tokenizer: "Qwen/Qwen2.5-Coder-1.5B"
   shuffle: false
   predict_prefix: false
@@ -53,18 +53,18 @@ trainer:
     project: "levanter-seqmoe"
   mp: p=f32,c=bfloat16
   train_batch_size: 4
-  per_device_parallelism: 1
+  per_device_parallelism: 4
   num_train_steps: 200
   steps_per_eval: 10
   max_eval_samples: 512
-  per_device_eval_parallelism: 1
+  per_device_eval_parallelism: 4
   tensor_parallel_axes: ["mlp", "heads"]
   fsdp_axis: "embed"
   batch_axis: "batch"
   checkpointer:
     base_path: gs://usc2-ckpt/qwen-1b-misc
     save_interval: 15m
-  abort_if_loss_above: 2.0
+  abort_if_loss_above: 8.0
 
 optimizer:
   type: adam

@@ -1732,6 +1732,8 @@ def mk_fim_dataset(
         split += "_with_router"
     if config.pack:
         split += "_packed"
+    if config.always_include_file_sep:
+        split += "_with_file_sep"
     split_cache_dir = os.path.join(config.cache_dir, split)
     cached_dataset: AsyncDataset[dict] = dataset.build_or_load_cache(
         split_cache_dir, await_finished=await_finished, options=config.cache_options
