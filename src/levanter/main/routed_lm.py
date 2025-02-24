@@ -131,6 +131,7 @@ def compute_next_token_loss(
     activations, rlogits, expert_mask, extras = model.routed_forward(
         example,
         key=key,
+        activations=True,
         router_stop_grad=stop_grad,
         expert_bias=expert_bias,
     )
