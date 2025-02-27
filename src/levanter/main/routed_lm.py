@@ -28,7 +28,7 @@ from levanter.models.routed.common import (
     reinit_expert_weights,
     routed_experts_mask,
     routed_experts_trainable_params_filter,
-    save_routed_experts_state_dict,
+    save_routed_model_state_dict,
 )
 from levanter.models.routed.qwen import RQwenConfig, RQwenLMHeadModel
 from levanter.optim import AdamConfig, OptimizerConfig
@@ -368,11 +368,12 @@ def main(config: TrainLmConfig):
             config.trainer.abort_if_loss_above is not None and last_info.loss > config.trainer.abort_if_loss_above
         )
         if not is_aborted and config.save_torch_state_path is not None:
-            save_routed_experts_state_dict(
+            save_routed_model_state_dict(
                 trainer.mp,
                 last_info.model,
                 config.save_torch_state_path,
                 f"{trainer.run_id}_state_dict.safetensors",
+                save_experts_only=not config.full_ft
             )
 
     # This isn't necessary except when Levanter is run in a subprocess (as happens w/ ray)

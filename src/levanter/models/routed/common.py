@@ -562,36 +562,36 @@ def base_weights_mask(model_shape: PyTree) -> PyTree:
     )
 
 
-def routed_experts_state_dict(params: PyTree) -> Dict[str, Any]:
-    filtered = eqx.filter(
+def routed_model_state_dict(params: PyTree, save_experts_only) -> Dict[str, Any]:
+    model = eqx.filter(
         params,
         is_routed_experts_param,
         is_leaf=lambda x: is_routed_experts_param(x) or isinstance(x, hnn.Linear),
-    )
-    state_dict = to_torch_compatible_state_dict(filtered)
+    ) if save_experts_only else params
+    state_dict = to_torch_compatible_state_dict(model)
     return {k: v for k, v in state_dict.items() if v is not None}
 
 
 _sync_count = 0
 
 
-def save_routed_experts_state_dict(mp: Policy, params: PyTree, path: str, filename: str):
+def save_routed_modelS_state_dict(mp: Policy, params: PyTree, path: str, filename: str, save_experts_only=True):
     with tempfile.TemporaryDirectory() as tmpdir:
         params = mp.cast_to_compute(params)
-        state_dict = routed_experts_state_dict(params)
+        state_dict = routed_model_state_dict(params, save_experts_only)
         local_path = os.path.join(tmpdir, filename)
         remote_path = os.path.join(path, filename)
-        logger.info("Saving routed experts state dict")
+        logger.info("Saving routed model state dict")
         hax.state_dict.save_state_dict(state_dict, local_path)
         if jax.process_index() == 0:
-            logger.info(f"Saving as rank 0 routed experts state dict to {remote_path}")
+            logger.info(f"Saving as rank 0 routed model state dict to {remote_path}")
             fs: AbstractFileSystem
             fs, _, (plain_path,) = fsspec.get_fs_token_paths(str(path))
             fs.makedirs(plain_path, exist_ok=True)
             fs.put(local_path, remote_path)
-            logger.info(f"Finished saving as rank 0 routed experts state dict to {remote_path}")
+            logger.info(f"Finished saving as rank 0 routed model state dict to {remote_path}")
         else:
-            logger.info(f"Finished waiting for rank 0 to save routed experts state dict to {path}/{filename}")
+            logger.info(f"Finished waiting for rank 0 to save routed model state dict to {path}/{filename}")
     global _sync_count
     sync_global_devices(f"upload? {path}, {filename}, {_sync_count}")
     _sync_count += 1

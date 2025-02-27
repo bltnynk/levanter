@@ -78,3 +78,5 @@ optimizer:
   learning_rate: 6e-3
   weight_decay: 0.0
   warmup: 0.01
+
+save_torch_state_path: gs://usc2-ckpt/starcoder2-3b-state-dicts
